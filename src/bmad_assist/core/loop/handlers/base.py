@@ -381,22 +381,23 @@ class BaseHandler(ABC):
             return prompt
 
         except CompilerError as e:
-            # Compilation failed - log and return None to trigger clear error message
             logger.warning("Workflow compilation failed for %s: %s", workflow_name, e)
-            return None
+            raise ConfigError(f"Failed to compile workflow: {workflow_name}\n\n{e}") from e
         except FileNotFoundError as e:
             # Workflow files not found
             logger.warning("Workflow files not found for %s: %s", workflow_name, e)
             return None
         except Exception as e:
-            # Unexpected error - log with full traceback for debugging
             logger.error(
                 "Unexpected error compiling %s: %s",
                 workflow_name,
                 e,
                 exc_info=True,
             )
-            return None
+            raise ConfigError(
+                f"Failed to compile workflow: {workflow_name}\n\n"
+                f"Unexpected compiler error: {type(e).__name__}: {e}"
+            ) from e
 
     def _inject_git_intelligence(
         self,

@@ -384,7 +384,7 @@ class DevStoryCompiler:
             total_tokens,
             DEV_STORY_CONTEXT_HARD_CAP_TOKENS,
         )
-        pruned_files, pruned_tokens, dropped_sections = self._prune_context_files(
+        pruned_files, pruned_tokens, dropped_sections, dropped_source_files = self._prune_context_files(
             strategic_files,
             antipattern_files,
             epic_files,
@@ -395,17 +395,22 @@ class DevStoryCompiler:
             story_files,
         )
         if pruned_tokens > DEV_STORY_CONTEXT_HARD_CAP_TOKENS:
+            dropped_source_summary = ", ".join(dropped_source_files) or "none"
             raise CompilerError(
                 "dev-story context still exceeds the operational cap after pruning "
                 f"optional sections ({', '.join(dropped_sections) or 'none'}): "
                 f"{pruned_tokens} tokens > {DEV_STORY_CONTEXT_HARD_CAP_TOKENS}. "
+                f"Dropped source files: {dropped_source_summary}. "
                 "Reduce source context or trim story-linked files before invoking the provider."
             )
 
+        dropped_source_summary = ", ".join(dropped_source_files) or "none"
         logger.info(
-            "Dev story context pruned to %d tokens after dropping optional sections: %s",
+            "Dev story context pruned to %d tokens after dropping optional sections: %s; "
+            "dropped source files: %s",
             pruned_tokens,
-            ", ".join(dropped_sections),
+            ", ".join(dropped_sections) or "none",
+            dropped_source_summary,
         )
         return pruned_files
 
@@ -430,7 +435,7 @@ class DevStoryCompiler:
         tea_atdd_files: dict[str, str],
         source_files: dict[str, str],
         story_files: dict[str, str],
-    ) -> tuple[dict[str, str], int, list[str]]:
+    ) -> tuple[dict[str, str], int, list[str], list[str]]:
         """Prune low-value duplicate context before provider invocation."""
         optional_sections: list[tuple[str, dict[str, str]]] = [
             ("antipatterns", antipattern_files),
@@ -438,6 +443,7 @@ class DevStoryCompiler:
             ("tea-test-design", tea_test_design_files),
         ]
         dropped_sections: list[str] = []
+        dropped_source_files: list[str] = []
 
         candidate_files = self._merge_context_sections(
             strategic_files,
@@ -451,7 +457,7 @@ class DevStoryCompiler:
         )
         candidate_tokens = self._estimate_context_tokens(candidate_files)
         if candidate_tokens <= DEV_STORY_CONTEXT_HARD_CAP_TOKENS:
-            return candidate_files, candidate_tokens, dropped_sections
+            return candidate_files, candidate_tokens, dropped_sections, dropped_source_files
 
         for section_name, _ in optional_sections:
             dropped_sections.append(section_name)
@@ -467,9 +473,27 @@ class DevStoryCompiler:
             )
             candidate_tokens = self._estimate_context_tokens(candidate_files)
             if candidate_tokens <= DEV_STORY_CONTEXT_HARD_CAP_TOKENS:
-                return candidate_files, candidate_tokens, dropped_sections
+                return candidate_files, candidate_tokens, dropped_sections, dropped_source_files
 
-        return candidate_files, candidate_tokens, dropped_sections
+        remaining_source_items = list(source_files.items())
+        while remaining_source_items and candidate_tokens > DEV_STORY_CONTEXT_HARD_CAP_TOKENS:
+            dropped_path, _ = remaining_source_items.pop()
+            dropped_source_files.append(dropped_path)
+            candidate_files = self._merge_context_sections(
+                strategic_files,
+                {} if "antipatterns" in dropped_sections else antipattern_files,
+                epic_files,
+                {} if "tea-test-design" in dropped_sections else tea_test_design_files,
+                {} if "tea-other" in dropped_sections else tea_other_files,
+                tea_atdd_files,
+                dict(remaining_source_items),
+                story_files,
+            )
+            candidate_tokens = self._estimate_context_tokens(candidate_files)
+            if candidate_tokens <= DEV_STORY_CONTEXT_HARD_CAP_TOKENS:
+                return candidate_files, candidate_tokens, dropped_sections, dropped_source_files
+
+        return candidate_files, candidate_tokens, dropped_sections, dropped_source_files
 
     def _split_tea_files(
         self,
