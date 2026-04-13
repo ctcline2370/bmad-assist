@@ -33,6 +33,11 @@ logger = logging.getLogger(__name__)
 
 # Minimum budget allocation per resolver (prevents starvation)
 MIN_BUDGET_ALLOCATION = 500
+DEV_STORY_ARTIFACT_PRIORITY: dict[str, int] = {
+    "atdd": 0,
+    "test-design": 1,
+}
+DEV_STORY_ATDD_MAX_FILES = 1
 
 
 class TEAContextService:
@@ -142,6 +147,26 @@ class TEAContextService:
 
         return result
 
+    def _ordered_artifact_types(self, artifact_types: list[str]) -> list[str]:
+        """Return workflow-aware artifact ordering.
+
+        dev_story benefits from newest ATDD evidence first, then broader test
+        design context. Other workflows preserve configured order.
+        """
+        if self._workflow_name != "dev_story":
+            return list(artifact_types)
+
+        return sorted(
+            artifact_types,
+            key=lambda artifact_type: (
+                DEV_STORY_ARTIFACT_PRIORITY.get(
+                    artifact_type,
+                    len(DEV_STORY_ARTIFACT_PRIORITY),
+                ),
+                artifact_types.index(artifact_type),
+            ),
+        )
+
     def _get_base_path(self) -> Path:
         """Get base path for TEA artifacts.
 
@@ -229,7 +254,8 @@ class TEAContextService:
             return result
 
         # F1: Allocate budgets proportionally
-        budgets = self._allocate_budgets(wf_config.include)
+        ordered_artifact_types = self._ordered_artifact_types(wf_config.include)
+        budgets = self._allocate_budgets(ordered_artifact_types)
 
         # Get context variables (F2: handles int|str epic IDs)
         epic_id = self._get_epic_id()
@@ -240,7 +266,7 @@ class TEAContextService:
         total_tokens = 0
 
         # Resolve each artifact type
-        for artifact_type in wf_config.include:
+        for artifact_type in ordered_artifact_types:
             if artifact_type not in RESOLVER_REGISTRY:
                 logger.warning("Unknown artifact type: %s", artifact_type)
                 continue
@@ -254,10 +280,13 @@ class TEAContextService:
             # ATDDResolver needs special handling for max_files
             resolver: BaseResolver
             if resolver_cls is ATDDResolver:
+                max_files = config.max_files_per_resolver
+                if self._workflow_name == "dev_story":
+                    max_files = min(max_files, DEV_STORY_ATDD_MAX_FILES)
                 resolver = ATDDResolver(
                     base_path,
                     artifact_budget,
-                    max_files=config.max_files_per_resolver,
+                    max_files=max_files,
                 )
             else:
                 resolver = resolver_cls(base_path, artifact_budget)

@@ -46,6 +46,25 @@ def should_commit_phase(phase: Phase | None) -> bool:
     return phase in COMMIT_PHASES
 
 
+def _get_git_timeout_seconds() -> int:
+    """Get git subprocess timeout from env with a safe fallback."""
+    raw_timeout = os.environ.get("BMAD_GIT_TIMEOUT")
+    if raw_timeout is None:
+        return 30
+
+    try:
+        timeout = int(raw_timeout)
+    except ValueError:
+        logger.warning("Ignoring invalid BMAD_GIT_TIMEOUT value: %s", raw_timeout)
+        return 30
+
+    if timeout <= 0:
+        logger.warning("Ignoring non-positive BMAD_GIT_TIMEOUT value: %s", raw_timeout)
+        return 30
+
+    return timeout
+
+
 def _run_git(args: list[str], cwd: Path) -> tuple[int, str, str]:
     """Run a git command and return exit code, stdout, stderr.
 
@@ -57,13 +76,14 @@ def _run_git(args: list[str], cwd: Path) -> tuple[int, str, str]:
         Tuple of (exit_code, stdout, stderr).
 
     """
+    timeout_seconds = _get_git_timeout_seconds()
     try:
         result = subprocess.run(
             ["git", *args],
             cwd=cwd,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=timeout_seconds,
         )
         return result.returncode, result.stdout, result.stderr
     except subprocess.TimeoutExpired:

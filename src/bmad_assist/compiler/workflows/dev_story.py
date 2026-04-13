@@ -17,6 +17,7 @@ from bmad_assist.compiler.output import generate_output
 from bmad_assist.compiler.shared_utils import (
     apply_post_process,
     context_snapshot,
+    estimate_tokens,
     find_epic_file,
     find_file_in_output_folder,
     find_sprint_status_file,
@@ -35,6 +36,8 @@ from bmad_assist.core.exceptions import CompilerError
 from bmad_assist.testarch.context import collect_tea_context, is_tea_context_enabled
 
 logger = logging.getLogger(__name__)
+
+DEV_STORY_CONTEXT_HARD_CAP_TOKENS = 28000
 
 
 class DevStoryCompiler:
@@ -293,19 +296,25 @@ class DevStoryCompiler:
             Dictionary mapping file paths to content, ordered by recency-bias.
 
         """
-        files: dict[str, str] = {}
         project_root = context.project_root
+        strategic_files: dict[str, str] = {}
+        antipattern_files: dict[str, str] = {}
+        epic_files: dict[str, str] = {}
+        tea_test_design_files: dict[str, str] = {}
+        tea_other_files: dict[str, str] = {}
+        tea_atdd_files: dict[str, str] = {}
+        source_files: dict[str, str] = {}
+        story_files: dict[str, str] = {}
 
         # 1. Strategic docs (project-context, PRD, UX, Architecture) via service
         # Default config for dev_story: project-context only (other docs rarely cited)
         strategic_service = StrategicContextService(context, "dev_story")
-        strategic_files = strategic_service.collect()
-        files.update(strategic_files)
+        strategic_files.update(strategic_service.collect())
 
         # 1b. Include code antipatterns from previous code reviews (if exists)
         from bmad_assist.compiler.strategic_context import load_antipatterns
 
-        files.update(load_antipatterns(context, "code"))
+        antipattern_files.update(load_antipatterns(context, "code"))
 
         # 2. Epic file (current epic)
         epic_num = resolved.get("epic_num")
@@ -314,7 +323,7 @@ class DevStoryCompiler:
             if epic_path:
                 content = safe_read_file(epic_path, project_root)
                 if content:
-                    files[str(epic_path)] = content
+                    epic_files[str(epic_path)] = content
 
         # 3. TEA Context (test-design, ATDD checklists) via TEAContextService
         # F4 Fix: Backward compatible - uses TEA config if available, falls back to legacy
@@ -322,7 +331,9 @@ class DevStoryCompiler:
 
         if is_tea_context_enabled(context):
             # New TEA context loader (includes test-design + ATDD)
-            files.update(collect_tea_context(context, "dev_story", resolved))
+            tea_test_design_files, tea_other_files, tea_atdd_files = self._split_tea_files(
+                collect_tea_context(context, "dev_story", resolved)
+            )
         elif story_id:
             # F4 BACKWARD COMPATIBILITY: Legacy hardcoded ATDD for projects without TEA config
             # This preserves existing behavior until project migrates to TEA config
@@ -331,7 +342,7 @@ class DevStoryCompiler:
             if atdd_path:
                 content = safe_read_file(atdd_path, project_root)
                 if content:
-                    files[str(atdd_path)] = content
+                    tea_atdd_files[str(atdd_path)] = content
                     logger.info("ATDD checklist loaded (legacy mode): %s", atdd_path)
 
         # 4. Source files from story's File List using SourceContextService
@@ -344,17 +355,145 @@ class DevStoryCompiler:
                 file_list_paths = extract_file_paths_from_story(story_content)
 
             service = SourceContextService(context, "dev_story")
-            source_files = service.collect_files(file_list_paths, None)
-            files.update(source_files)
+            source_files.update(service.collect_files(file_list_paths, None))
 
         # 5. Story file (LAST - closest to instructions per recency-bias)
         if story_path_str:
             story_path = Path(story_path_str)
             content = safe_read_file(story_path, project_root)
             if content:
-                files[str(story_path)] = content
+                story_files[str(story_path)] = content
 
-        return files
+        files = self._merge_context_sections(
+            strategic_files,
+            antipattern_files,
+            epic_files,
+            tea_test_design_files,
+            tea_other_files,
+            tea_atdd_files,
+            source_files,
+            story_files,
+        )
+
+        total_tokens = self._estimate_context_tokens(files)
+        if total_tokens <= DEV_STORY_CONTEXT_HARD_CAP_TOKENS:
+            return files
+
+        logger.warning(
+            "Dev story context exceeded hard cap: %d tokens (cap=%d). Pruning optional context.",
+            total_tokens,
+            DEV_STORY_CONTEXT_HARD_CAP_TOKENS,
+        )
+        pruned_files, pruned_tokens, dropped_sections = self._prune_context_files(
+            strategic_files,
+            antipattern_files,
+            epic_files,
+            tea_test_design_files,
+            tea_other_files,
+            tea_atdd_files,
+            source_files,
+            story_files,
+        )
+        if pruned_tokens > DEV_STORY_CONTEXT_HARD_CAP_TOKENS:
+            raise CompilerError(
+                "dev-story context still exceeds the operational cap after pruning "
+                f"optional sections ({', '.join(dropped_sections) or 'none'}): "
+                f"{pruned_tokens} tokens > {DEV_STORY_CONTEXT_HARD_CAP_TOKENS}. "
+                "Reduce source context or trim story-linked files before invoking the provider."
+            )
+
+        logger.info(
+            "Dev story context pruned to %d tokens after dropping optional sections: %s",
+            pruned_tokens,
+            ", ".join(dropped_sections),
+        )
+        return pruned_files
+
+    def _merge_context_sections(self, *sections: dict[str, str]) -> dict[str, str]:
+        """Merge ordered context sections while preserving recency-bias."""
+        merged: dict[str, str] = {}
+        for section in sections:
+            merged.update(section)
+        return merged
+
+    def _estimate_context_tokens(self, files: dict[str, str]) -> int:
+        """Estimate total token count for assembled context files."""
+        return sum(estimate_tokens(content) for content in files.values())
+
+    def _prune_context_files(
+        self,
+        strategic_files: dict[str, str],
+        antipattern_files: dict[str, str],
+        epic_files: dict[str, str],
+        tea_test_design_files: dict[str, str],
+        tea_other_files: dict[str, str],
+        tea_atdd_files: dict[str, str],
+        source_files: dict[str, str],
+        story_files: dict[str, str],
+    ) -> tuple[dict[str, str], int, list[str]]:
+        """Prune low-value duplicate context before provider invocation."""
+        optional_sections: list[tuple[str, dict[str, str]]] = [
+            ("antipatterns", antipattern_files),
+            ("tea-other", tea_other_files),
+            ("tea-test-design", tea_test_design_files),
+        ]
+        dropped_sections: list[str] = []
+
+        candidate_files = self._merge_context_sections(
+            strategic_files,
+            antipattern_files,
+            epic_files,
+            tea_test_design_files,
+            tea_other_files,
+            tea_atdd_files,
+            source_files,
+            story_files,
+        )
+        candidate_tokens = self._estimate_context_tokens(candidate_files)
+        if candidate_tokens <= DEV_STORY_CONTEXT_HARD_CAP_TOKENS:
+            return candidate_files, candidate_tokens, dropped_sections
+
+        for section_name, _ in optional_sections:
+            dropped_sections.append(section_name)
+            candidate_files = self._merge_context_sections(
+                strategic_files,
+                {} if "antipatterns" in dropped_sections else antipattern_files,
+                epic_files,
+                {} if "tea-test-design" in dropped_sections else tea_test_design_files,
+                {} if "tea-other" in dropped_sections else tea_other_files,
+                tea_atdd_files,
+                source_files,
+                story_files,
+            )
+            candidate_tokens = self._estimate_context_tokens(candidate_files)
+            if candidate_tokens <= DEV_STORY_CONTEXT_HARD_CAP_TOKENS:
+                return candidate_files, candidate_tokens, dropped_sections
+
+        return candidate_files, candidate_tokens, dropped_sections
+
+    def _split_tea_files(
+        self,
+        tea_files: dict[str, str],
+    ) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+        """Split TEA files into test-design, other, and ATDD buckets.
+
+        This keeps ATDD story evidence closest to the prompt while allowing
+        broader TEA context to be pruned first under pressure.
+        """
+        test_design_files: dict[str, str] = {}
+        other_files: dict[str, str] = {}
+        atdd_files: dict[str, str] = {}
+
+        for path, content in tea_files.items():
+            lower_path = path.lower()
+            if "atdd-checklist" in lower_path:
+                atdd_files[path] = content
+            elif "test-design" in lower_path or "test_design" in lower_path or "test-plan" in lower_path:
+                test_design_files[path] = content
+            else:
+                other_files[path] = content
+
+        return test_design_files, other_files, atdd_files
 
     def _build_mission(
         self,
