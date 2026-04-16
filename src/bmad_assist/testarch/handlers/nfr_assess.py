@@ -144,7 +144,7 @@ class NFRAssessHandler(TestarchBaseHandler):
 
         # Invoke workflow with generic method
         result = self._invoke_generic_workflow(
-            workflow_name="testarch-nfr",
+            workflow_name="testarch-nfr-assess",
             state=state,
             extractor_fn=lambda output: extract_nfr_overall_status(output),
             report_dir=report_dir,

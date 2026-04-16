@@ -211,6 +211,9 @@ class ValidationPhaseResult:
 
 def _calculate_evidence_aggregate(
     anonymized: list[AnonymizedValidation],
+    *,
+    reject_threshold: float = 6.0,
+    major_rework_threshold: float = 4.0,
 ) -> "EvidenceScoreAggregate | None":
     """Calculate Evidence Score aggregate from anonymized validations.
 
@@ -219,6 +222,8 @@ def _calculate_evidence_aggregate(
 
     Args:
         anonymized: List of anonymized validation outputs.
+        reject_threshold: Score at or above which aggregate verdict is REJECT.
+        major_rework_threshold: Score at or above which aggregate verdict is MAJOR_REWORK.
 
     Returns:
         EvidenceScoreAggregate if at least one report could be parsed, None otherwise.
@@ -242,7 +247,11 @@ def _calculate_evidence_aggregate(
                 )
 
         if evidence_reports:
-            aggregate = aggregate_evidence_scores(evidence_reports)
+            aggregate = aggregate_evidence_scores(
+                evidence_reports,
+                reject_threshold=reject_threshold,
+                major_rework_threshold=major_rework_threshold,
+            )
             logger.info(
                 "Evidence Score aggregate: total=%.1f, verdict=%s, validators=%d",
                 aggregate.total_score,
@@ -947,7 +956,17 @@ async def run_validation_phase(
     )
 
     # TIER 2: Calculate Evidence Score aggregate from anonymized validations
-    evidence_aggregate = _calculate_evidence_aggregate(anonymized)
+    # Use configurable thresholds from loop config (defaults to ADR-5: 6.0/4.0)
+    reject_thresh = 6.0
+    major_rework_thresh = 4.0
+    if config.loop is not None:
+        reject_thresh = config.loop.evidence_reject_threshold
+        major_rework_thresh = config.loop.evidence_major_rework_threshold
+    evidence_aggregate = _calculate_evidence_aggregate(
+        anonymized,
+        reject_threshold=reject_thresh,
+        major_rework_threshold=major_rework_thresh,
+    )
 
     logger.debug(
         "HANG_DEBUG: Building ValidationPhaseResult with %d validations, %d eval records, dv_result=%s",

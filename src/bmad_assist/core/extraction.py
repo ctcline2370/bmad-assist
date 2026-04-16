@@ -20,6 +20,21 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
+# Thresholds used to detect "tiny marker-extracted content in a large raw
+# output" — a signal that the LLM echoed markers it saw in the prompt context
+# rather than wrapping a real report. When both conditions are true, we fall
+# through to pattern-based / raw-output fallback instead of trusting the blob.
+#
+# Both must hold:
+#   1) marker content is absolutely short (< _MARKER_CONTENT_ABS_MIN)
+#   2) marker content is a tiny fraction of raw output (raw is >= N× longer)
+#
+# This protects legitimate short reports (common in unit tests, e.g. ~40 chars)
+# while catching real-world silent-failure cases where the LLM produced
+# thousands of chars of narrative but only a 5-char marker-bracketed blob.
+_MARKER_CONTENT_ABS_MIN = 40
+_MARKER_CONTENT_RATIO_MIN = 10
+
 __all__ = [
     "ReportMarkers",
     "extract_report",
@@ -169,37 +184,62 @@ def extract_report(
         '# Story Validation Report\\nContent here...'
 
     """
+    stripped_raw_len = len(raw_output.strip())
+
     # Stage 1: Try marker-based extraction (PRIMARY - this should work!)
     content = _extract_by_markers(raw_output, markers)
     if content is not None:
-        logger.debug(
-            "Extracted %s report using markers (%d chars)",
-            markers.name,
-            len(content),
+        content_len = len(content.strip())
+        # Detect suspicious extraction: LLM likely echoed markers from prompt
+        # context rather than wrapping real content. Requires BOTH absolute
+        # shortness AND massive gap vs raw output, so legitimate short
+        # reports aren't misclassified.
+        suspicious = (
+            content_len < _MARKER_CONTENT_ABS_MIN
+            and stripped_raw_len >= content_len * _MARKER_CONTENT_RATIO_MIN
+            and stripped_raw_len > _MARKER_CONTENT_ABS_MIN
         )
-        return content
+        if not suspicious:
+            logger.debug(
+                "Extracted %s report using markers (%d chars)",
+                markers.name,
+                content_len,
+            )
+            return content
+        logger.warning(
+            "%s: marker extraction yielded only %d chars out of %d raw; "
+            "markers likely echoed from prompt context — falling through to "
+            "pattern fallback",
+            markers.name,
+            content_len,
+            stripped_raw_len,
+        )
 
     # Stage 2: Fallback to pattern-based extraction
     logger.debug(
-        "Markers not found for %s report, trying fallback patterns",
+        "Markers not found (or unreliable) for %s report, trying fallback patterns",
         markers.name,
     )
-    content = _extract_by_patterns(raw_output, markers, stop_at_markers)
-    if content is not None:
+    fallback = _extract_by_patterns(raw_output, markers, stop_at_markers)
+    if fallback is not None and len(fallback.strip()) >= _MARKER_CONTENT_ABS_MIN:
         logger.debug(
             "Extracted %s report using fallback pattern (%d chars)",
             markers.name,
-            len(content),
+            len(fallback),
         )
-        return content
+        return fallback
 
-    # Stage 3: Last resort - return stripped original
+    # Stage 3: Last resort - return the longest available candidate so the
+    # caller (and any min-length guard it applies) sees the maximum salvage.
+    stripped_raw = raw_output.strip()
+    candidates = [c for c in (content, fallback, stripped_raw) if c]
+    best = max(candidates, key=lambda s: len(s.strip())) if candidates else ""
     logger.warning(
         "Could not extract structured %s report, using raw content (%d chars)",
         markers.name,
-        len(raw_output.strip()),
+        len(best),
     )
-    return raw_output.strip()
+    return best
 
 
 def _extract_by_markers(

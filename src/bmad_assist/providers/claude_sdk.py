@@ -327,16 +327,23 @@ class ClaudeSDKProvider(BaseProvider):
         response_parts: list[str] = []
         terminated_early = False  # Flag for clean async loop exit
 
-        # Early termination markers (same as claude.py for consistency)
-        end_markers = [
-            "<!-- VALIDATION_REPORT_END -->",
-            "<!-- CODE_REVIEW_REPORT_END -->",
-            "<!-- CODE_REVIEW_SYNTHESIS_END -->",
-            "<!-- VALIDATION_SYNTHESIS_END -->",
-            "<!-- RETROSPECTIVE_REPORT_END -->",
-            "<!-- SECURITY_REPORT_END -->",
-            "<!-- QA_PLAN_END -->",
-            "<!-- REMEDIATE_ESCALATIONS_END -->",
+        # Early termination markers (same as claude.py for consistency).
+        # Structured END markers are only honored once the matching START
+        # marker has been observed in accumulated assistant text — this
+        # prevents premature termination when the LLM echoes markers that
+        # appear in prior-work context embedded in the prompt.
+        paired_markers = [
+            ("<!-- VALIDATION_REPORT_START -->", "<!-- VALIDATION_REPORT_END -->"),
+            ("<!-- CODE_REVIEW_REPORT_START -->", "<!-- CODE_REVIEW_REPORT_END -->"),
+            ("<!-- CODE_REVIEW_SYNTHESIS_START -->", "<!-- CODE_REVIEW_SYNTHESIS_END -->"),
+            ("<!-- VALIDATION_SYNTHESIS_START -->", "<!-- VALIDATION_SYNTHESIS_END -->"),
+            ("<!-- RETROSPECTIVE_REPORT_START -->", "<!-- RETROSPECTIVE_REPORT_END -->"),
+            ("<!-- SECURITY_REPORT_START -->", "<!-- SECURITY_REPORT_END -->"),
+            ("<!-- QA_PLAN_START -->", "<!-- QA_PLAN_END -->"),
+            ("<!-- REMEDIATE_ESCALATIONS_START -->", "<!-- REMEDIATE_ESCALATIONS_END -->"),
+        ]
+        # Unpaired markers still terminate on first occurrence (no START required).
+        unpaired_end_markers = [
             "BMAD Method Quality Competition v1.0",
         ]
 
@@ -421,12 +428,36 @@ class ClaudeSDKProvider(BaseProvider):
                             text_lower = text.lower()
                             should_terminate = False
 
-                            # Check end markers
-                            for marker in end_markers:
-                                if marker in text:
-                                    logger.info("Early termination: detected end marker %s", marker)
-                                    should_terminate = True
-                                    break
+                            # Accumulated stream — needed to check if the
+                            # matching START marker has already been emitted
+                            # before an END marker triggers termination.
+                            accumulated = "".join(response_parts)
+
+                            # Check paired end markers (require matching START)
+                            for start_marker, end_marker in paired_markers:
+                                if end_marker in text:
+                                    if start_marker in accumulated:
+                                        logger.info(
+                                            "Early termination: detected end marker %s",
+                                            end_marker,
+                                        )
+                                        should_terminate = True
+                                        break
+                                    logger.debug(
+                                        "Ignoring end marker %s — matching start "
+                                        "marker not yet seen (likely echoed from prompt context)",
+                                        end_marker,
+                                    )
+
+                            # Check unpaired end markers (terminate unconditionally)
+                            if not should_terminate:
+                                for marker in unpaired_end_markers:
+                                    if marker in text:
+                                        logger.info(
+                                            "Early termination: detected end marker %s", marker
+                                        )
+                                        should_terminate = True
+                                        break
 
                             # Check completion phrases
                             if not should_terminate:

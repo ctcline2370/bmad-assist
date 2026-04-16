@@ -293,27 +293,39 @@ def calculate_evidence_score(
     return round(total, 1)
 
 
-def determine_verdict(score: float) -> Verdict:
+def determine_verdict(
+    score: float,
+    *,
+    reject_threshold: float = 6.0,
+    major_rework_threshold: float = 4.0,
+    excellent_threshold: float = -3.0,
+) -> Verdict:
     """Determine verdict from Evidence Score.
 
-    Thresholds (ADR-5):
+    Default thresholds (ADR-5):
     - >= 6.0: REJECT
     - 4.0 - 5.9: MAJOR_REWORK
     - -2.9 - 3.9: PASS (READY/APPROVE)
     - <= -3.0: EXCELLENT (EXCELLENT/EXEMPLARY)
 
+    Thresholds can be overridden via keyword arguments to tune sensitivity
+    for projects where reviewers consistently flag pre-existing patterns.
+
     Args:
         score: Evidence Score value.
+        reject_threshold: Score at or above which verdict is REJECT.
+        major_rework_threshold: Score at or above which verdict is MAJOR_REWORK.
+        excellent_threshold: Score at or below which verdict is EXCELLENT.
 
     Returns:
         Verdict enum value.
 
     """
-    if score >= 6.0:
+    if score >= reject_threshold:
         return Verdict.REJECT
-    elif score >= 4.0:
+    elif score >= major_rework_threshold:
         return Verdict.MAJOR_REWORK
-    elif score <= -3.0:
+    elif score <= excellent_threshold:
         return Verdict.EXCELLENT
     else:
         return Verdict.PASS
@@ -638,11 +650,16 @@ def _deduplicate_findings(
 
 def aggregate_evidence_scores(
     reports: list[EvidenceScoreReport],
+    *,
+    reject_threshold: float = 6.0,
+    major_rework_threshold: float = 4.0,
 ) -> EvidenceScoreAggregate:
     """Aggregate Evidence Score across multiple validators.
 
     Args:
         reports: List of EvidenceScoreReport from each validator.
+        reject_threshold: Score at or above which aggregate verdict is REJECT.
+        major_rework_threshold: Score at or above which aggregate verdict is MAJOR_REWORK.
 
     Returns:
         EvidenceScoreAggregate with combined metrics.
@@ -692,8 +709,12 @@ def aggregate_evidence_scores(
     # Calculate aggregate score (average of validator scores)
     avg_score = round(sum(per_validator_scores.values()) / len(per_validator_scores), 1)
 
-    # Determine aggregate verdict
-    aggregate_verdict = determine_verdict(avg_score)
+    # Determine aggregate verdict (using configurable thresholds)
+    aggregate_verdict = determine_verdict(
+        avg_score,
+        reject_threshold=reject_threshold,
+        major_rework_threshold=major_rework_threshold,
+    )
 
     # Calculate consensus ratio
     total_findings = len(deduped_findings)

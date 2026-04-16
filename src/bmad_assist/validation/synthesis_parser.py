@@ -72,11 +72,11 @@ def extract_synthesis_metrics(raw_output: str) -> SynthesisMetrics | None:
     end_idx = raw_output.find(_METRICS_END)
 
     if start_idx == -1 or end_idx == -1:
-        excerpt = raw_output[:500]
-        logger.warning(
-            "Markers not found in synthesis output (len=%d): %s...",
+        # METRICS_JSON markers are not yet emitted by synthesis prompts — this is expected.
+        # Downgraded from WARNING to DEBUG to avoid log noise until prompt integration is added.
+        logger.debug(
+            "METRICS_JSON markers not found in synthesis output (len=%d), skipping metrics extraction",
             len(raw_output),
-            excerpt,
         )
         return None
 

@@ -91,7 +91,10 @@ class TestHandlerExecute:
         state = State(current_epic=1)
         result = handler.execute(state)
 
-        assert result.success is True
+        # Mock LLM produces no FILE markers → 0 files modified, 0 escalated →
+        # status=unresolved → phase result must be failure (needs human review).
+        assert result.success is False
+        assert result.outputs["status"] == "unresolved"
         assert mock_invoke.called
         # Check prompt contains the issue and safety cap
         prompt = mock_invoke.call_args[0][0]
@@ -136,7 +139,11 @@ src/auth.py needs complete rewrite
         state = State(current_epic=1)
         result = handler.execute(state)
 
-        assert result.success is True
+        # Escalations present → status=escalated → phase result must be failure
+        # so the runner does not report the epic as cleanly completed.
+        assert result.success is False
+        assert result.error is not None
+        assert "escalated" in result.error
         assert result.outputs["issues_escalated"] == 1
         assert result.outputs["status"] == "escalated"
         # Verify escalation report written to disk
@@ -163,7 +170,10 @@ src/auth.py needs complete rewrite
         state = State(current_epic=1)
         result = handler.execute(state)
 
-        assert result.success is True
+        # Mock LLM output has no FILE markers → 0 files modified, 0 escalated →
+        # status=unresolved → success=False (needs human review).
+        assert result.success is False
+        assert result.outputs["status"] == "unresolved"
         report_path = result.outputs.get("report_path")
         assert report_path is not None
         assert Path(report_path).exists()
@@ -208,7 +218,9 @@ src/auth.py needs complete rewrite
         state = State(current_epic=1)
         result = handler.execute(state)
 
-        assert result.success is True
+        # Mock produces no FILE markers → status=unresolved → success=False.
+        # But the accounting we care about here is cumulative issue count.
+        assert result.success is False
         # Should accumulate issues from first iteration
         assert result.outputs["issues_found"] >= 2
 
@@ -232,7 +244,9 @@ src/auth.py needs complete rewrite
         state = State(current_epic=1)
         result = handler.execute(state)
 
-        assert result.success is True
+        # Mock produces no FILE markers → status=unresolved → success=False.
+        # The dedup behavior we assert below is orthogonal to success.
+        assert result.success is False
         # LLM should be called once (first iter finds issues, second iter deduped → empty → break)
         assert mock_invoke.call_count == 1
 
@@ -254,7 +268,10 @@ src/auth.py needs complete rewrite
         state = State(current_epic=1)
         result = handler.execute(state)
 
-        assert result.success is True
+        # Default handler + mock with no FILE markers → status=unresolved → success=False.
+        # What this test actually validates is that config.qa=None doesn't crash and
+        # the LLM is still invoked with fallback defaults.
+        assert result.success is False
         assert mock_invoke.called
 
     @patch.object(QaRemediateHandler, "invoke_provider")
@@ -284,6 +301,96 @@ src/auth.py needs complete rewrite
         if mock_invoke.call_count > 1:
             prompt2 = mock_invoke.call_args_list[1][0][0]
             assert "Already Fixed Files" in prompt2
+
+
+class TestPhaseResultSemantics:
+    """Regression guard for Epic 8 exit-gate fix.
+
+    The original qa_remediate handler returned PhaseResult.ok for every
+    terminating status — including `escalated`, `unresolved`, and `partial`.
+    The runner then reported the phase as successful and the downstream
+    "Project complete!" log fired despite thousands of unresolved issues.
+
+    These tests pin the correct mapping from status → success flag so the
+    regression cannot silently return.
+    """
+
+    @patch.object(QaRemediateHandler, "invoke_provider")
+    def test_clean_status_returns_success(
+        self,
+        mock_invoke: MagicMock,
+        handler: QaRemediateHandler,
+        tmp_path: Path,
+    ) -> None:
+        """No issues found → status=clean → success=True."""
+        # Intentionally do NOT create qa failure fixtures — no issues to remediate.
+        state = State(current_epic=1)
+        result = handler.execute(state)
+
+        assert result.success is True
+        assert result.outputs["status"] == "clean"
+        # LLM must not be invoked when there are no issues.
+        assert not mock_invoke.called
+
+    @patch.object(QaRemediateHandler, "invoke_provider")
+    def test_escalated_status_returns_failure(
+        self,
+        mock_invoke: MagicMock,
+        handler: QaRemediateHandler,
+        tmp_path: Path,
+    ) -> None:
+        """Escalated findings → status=escalated → success=False.
+
+        Escalation means the LLM could not fix the issues and flagged them
+        for human review. Surfacing this as phase success would cause the
+        epic-completion log to misreport the state.
+        """
+        _setup_qa_failures(tmp_path)
+        mock_result = MagicMock()
+        mock_result.stdout = f"""
+{REMEDIATE_ESCALATIONS_START}
+## Escalated Issues
+### Issue 1: Needs architecture change
+**Source:** qa_results
+**Severity:** high
+**Problem:** Can't fix in-place.
+**Proposals:**
+1. Rewrite the module.
+{REMEDIATE_ESCALATIONS_END}
+"""
+        mock_invoke.return_value = mock_result
+
+        state = State(current_epic=1)
+        result = handler.execute(state)
+
+        assert result.success is False
+        assert result.outputs["status"] == "escalated"
+        assert result.outputs["issues_escalated"] >= 1
+        # The error message must explicitly mention human review so callers
+        # can detect this state without parsing the outputs dict.
+        assert result.error is not None
+        assert "human review" in result.error.lower()
+
+    @patch.object(QaRemediateHandler, "invoke_provider")
+    def test_unresolved_status_returns_failure(
+        self,
+        mock_invoke: MagicMock,
+        handler: QaRemediateHandler,
+        tmp_path: Path,
+    ) -> None:
+        """Issues found but 0 fixes and 0 escalations → unresolved → success=False."""
+        _setup_qa_failures(tmp_path)
+        mock_result = MagicMock()
+        mock_result.stdout = "Acknowledged the issues but did not produce any fixes."
+        mock_invoke.return_value = mock_result
+
+        state = State(current_epic=1)
+        result = handler.execute(state)
+
+        assert result.success is False
+        assert result.outputs["status"] == "unresolved"
+        assert result.outputs["files_modified"] == 0
+        assert result.outputs["issues_escalated"] == 0
 
 
 class TestRunRetest:

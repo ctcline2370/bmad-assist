@@ -275,6 +275,10 @@ class State(BaseModel):
     epic_setup_complete: bool = False  # Reset to False on epic change
     # Code review rework loop: tracks rework attempts per story
     code_review_rework_count: int = 0  # Reset to 0 on story change
+    # Standalone TEA workflow fields (set by standalone runner, read by handlers)
+    nfr_category: str | None = None  # NFR category override (performance|security|reliability|maintainability|all)
+    ci_platform_override: str | None = None  # CI platform override for standalone ci workflow
+    automation_component: str | None = None  # Component override for standalone automate workflow
 
 
 def save_state(state: State, path: str | Path) -> None:

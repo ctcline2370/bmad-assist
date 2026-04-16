@@ -81,6 +81,15 @@ class LoopConfig(BaseModel):
         le=5,
         description="Maximum rework cycles before continuing despite negative verdict (1-5)",
     )
+    evidence_reject_threshold: float = Field(
+        default=6.0,
+        description="Evidence Score at or above which code review verdict is REJECT (ADR-5 default: 6.0). "
+        "Raise for projects where reviewers consistently flag pre-existing patterns.",
+    )
+    evidence_major_rework_threshold: float = Field(
+        default=4.0,
+        description="Evidence Score at or above which verdict is MAJOR_REWORK (ADR-5 default: 4.0).",
+    )
 
     @field_validator("epic_setup", "story", "epic_teardown", mode="before")
     @classmethod

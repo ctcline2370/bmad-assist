@@ -331,7 +331,7 @@ class QaRemediateHandler(BaseHandler):
                 files_modified, issues_escalated,
             )
 
-            return PhaseResult.ok({
+            outputs = {
                 "status": status,
                 "report_path": str(report_path),
                 "escalation_path": last_esc_path,
@@ -341,7 +341,26 @@ class QaRemediateHandler(BaseHandler):
                 "issues_escalated": issues_escalated,
                 "files_modified": files_modified,
                 "retest_pass_rate": final_pass_rate if final_pass_rate is not None else 0.0,
-            })
+            }
+
+            # Only treat as a successful phase when the code was either clean
+            # from the start or the handler actually resolved every finding.
+            # `escalated` with zero fixes, `unresolved`, and `partial` all
+            # leave real work for a human — surfacing them as success=True
+            # causes the runner (and any downstream "project complete" log)
+            # to misreport the epic as done.
+            success_statuses = {"clean", "fixed"}
+            if status in success_statuses:
+                return PhaseResult.ok(outputs)
+
+            error_msg = (
+                f"QA remediation needs human review: status={status}, "
+                f"issues_found={total_issues_accumulated}, "
+                f"files_modified={files_modified}, "
+                f"escalated={issues_escalated}. "
+                f"See escalation report: {last_esc_path}"
+            )
+            return PhaseResult(success=False, error=error_msg, outputs=outputs)
 
         except Exception as e:
             logger.error("QA remediation failed for epic %s: %s", epic_id, e, exc_info=True)

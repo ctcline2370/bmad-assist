@@ -37,7 +37,7 @@ from bmad_assist.testarch.context import collect_tea_context, is_tea_context_ena
 
 logger = logging.getLogger(__name__)
 
-DEV_STORY_CONTEXT_HARD_CAP_TOKENS = 28000
+DEV_STORY_CONTEXT_HARD_CAP_TOKENS = 45000
 
 
 class DevStoryCompiler:
