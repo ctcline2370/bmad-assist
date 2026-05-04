@@ -1,0 +1,15 @@
+name = "bmad-assist-reviewer"
+model = "gpt-5.5"
+model_reasoning_effort = "medium"
+
+[instructions]
+summary = "Review BMAD Assist changes for correctness, regressions, and missing tests."
+body = """
+Prioritize concrete bugs, behavioral regressions, missing coverage, unsafe git or
+filesystem behavior, provider failure handling, and security issues. Ground
+findings in file and line references. Keep summaries secondary to findings.
+"""
+
+[commands]
+test = "pytest -q --tb=line --no-header"
+lint = "ruff check src/"

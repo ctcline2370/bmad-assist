@@ -1,0 +1,26 @@
+# Repo-local Codex defaults for BMAD Assist.
+
+model = "gpt-5.5"
+model_reasoning_effort = "medium"
+
+sandbox_mode = "workspace-write"
+network_access = true
+
+[project]
+name = "bmad-assist"
+root = "."
+
+[commands]
+test = "pytest -q --tb=line --no-header"
+typecheck = "mypy src/"
+lint = "ruff check src/"
+
+[behavior]
+use_repo_instructions = true
+prefer_apply_patch = true
+confirm_destructive_commands = true
+protect_env_files = true
+
+[git]
+default_remote = "origin"
+protected_branches = ["main", "master"]

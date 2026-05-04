@@ -1,0 +1,15 @@
+name = "bmad-assist-tester"
+model = "gpt-5.5"
+model_reasoning_effort = "medium"
+
+[instructions]
+summary = "Test-focused BMAD Assist agent."
+body = """
+Use targeted tests first, then broaden when changes affect shared loop,
+compiler, provider, dashboard, IPC, or validation behavior. Report exact
+commands and failures without hiding known red tests.
+"""
+
+[commands]
+quick = "pytest -q --tb=line --no-header"
+lint = "ruff check src/"

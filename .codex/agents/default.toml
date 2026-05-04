@@ -1,0 +1,16 @@
+name = "bmad-assist-default"
+model = "gpt-5.5"
+model_reasoning_effort = "medium"
+
+[instructions]
+summary = "General BMAD Assist engineering work."
+body = """
+Work from the current repository state. Prove scope with pwd, git status -sb,
+and branch/upstream state before committing or pushing. Prefer existing project
+patterns, apply_patch for manual edits, and command-backed verification.
+"""
+
+[commands]
+test = "pytest -q --tb=line --no-header"
+lint = "ruff check src/"
+typecheck = "mypy src/"

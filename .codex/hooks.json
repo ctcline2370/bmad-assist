@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "hooks": {
+    "pre_commit": [
+      {
+        "name": "lint",
+        "command": "ruff check src/"
+      },
+      {
+        "name": "tests",
+        "command": "pytest -q --tb=line --no-header"
+      }
+    ],
+    "pre_push": [
+      {
+        "name": "status",
+        "command": "git status -sb"
+      },
+      {
+        "name": "divergence",
+        "command": "git rev-list --left-right --count HEAD...@{u}"
+      }
+    ]
+  }
+}
