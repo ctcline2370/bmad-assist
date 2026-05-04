@@ -20,6 +20,29 @@ logger = logging.getLogger(__name__)
 # Pattern to match < that should be escaped (not part of XML tags)
 # Matches < followed by: digit, space, =, or other comparison context
 _UNESCAPED_LT_PATTERN = re.compile(r"<(\d|[=\s])")
+_INSTRUCTIONS_XML_RE = re.compile(
+    r"(<instructions-xml>\s*)(.*?)(\s*</instructions-xml>)",
+    re.DOTALL,
+)
+
+
+def _mask_markdown_instruction_sections(content: str) -> str:
+    """Mask markdown instruction bodies before XML parsing.
+
+    Compiled workflow patches wrap both XML and markdown instructions in an
+    <instructions-xml> container. Markdown bodies may contain raw ampersands or
+    angle brackets that are valid markdown but invalid XML, so they should not
+    trigger entity-repair warnings.
+    """
+
+    def replace_body(match: re.Match[str]) -> str:
+        prefix, body, suffix = match.groups()
+        body_without_comments = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL).lstrip()
+        if body_without_comments.startswith("<"):
+            return match.group(0)
+        return f"{prefix}{suffix}"
+
+    return _INSTRUCTIONS_XML_RE.sub(replace_body, content)
 
 
 def fix_xml_entities(content: str) -> str:
@@ -39,10 +62,13 @@ def fix_xml_entities(content: str) -> str:
         Content with problematic < characters escaped to &lt;
 
     """
-    # First check if XML is already valid
+    # First check if XML is already valid. Markdown instructions are masked
+    # because they are embedded inside <instructions-xml> for transport, but
+    # they are not parsed as XML by workflow loading.
+    parse_content = _mask_markdown_instruction_sections(content)
     try:
         # Wrap in root element for parsing (content may have multiple roots)
-        ET.fromstring(f"<root>{content}</root>")
+        ET.fromstring(f"<root>{parse_content}</root>")
         return content  # Already valid, no fix needed
     except ET.ParseError:
         pass  # Need to fix
@@ -50,10 +76,11 @@ def fix_xml_entities(content: str) -> str:
     # Fix < characters that appear to be in text content
     # Pattern: < followed by digit, space, or = (comparison operators)
     fixed = _UNESCAPED_LT_PATTERN.sub(r"&lt;\1", content)
+    parse_fixed = _mask_markdown_instruction_sections(fixed)
 
     # Verify fix worked
     try:
-        ET.fromstring(f"<root>{fixed}</root>")
+        ET.fromstring(f"<root>{parse_fixed}</root>")
         logger.info("Fixed unescaped < characters in XML content")
         return fixed
     except ET.ParseError as e:

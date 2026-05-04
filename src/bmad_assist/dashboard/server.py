@@ -33,6 +33,7 @@ from bmad_assist.core.exceptions import DashboardError
 # Story 22.9: Dashboard event marker for stdout parsing
 # Model tracking: MODEL_STARTED marker for terminal tabs
 from bmad_assist.core.loop.dashboard_events import DASHBOARD_EVENT_MARKER
+from bmad_assist.core.loop.locking import _is_pid_alive, _read_lock_file
 
 if TYPE_CHECKING:
     from bmad_assist.dashboard.loop_controller import LoopController
@@ -989,6 +990,58 @@ class DashboardServer:
             logger.warning("Failed to load state from %s: %s", state_path, e)
             return None
 
+    def _get_active_run_context(self) -> dict[str, Any] | None:
+        """Get active run context from the latest running run log."""
+        import yaml
+
+        lock_path = self.project_root / ".bmad-assist" / "running.lock"
+        if not lock_path.exists():
+            return None
+
+        pid, _timestamp = _read_lock_file(lock_path)
+        if pid is None or not _is_pid_alive(pid):
+            return None
+
+        runs_dir = self.project_root / ".bmad-assist" / "runs"
+        if not runs_dir.exists():
+            return None
+
+        run_files = sorted(runs_dir.glob("run-*.yaml"), reverse=True)
+
+        for run_file in run_files:
+            try:
+                with open(run_file, encoding="utf-8") as f:
+                    data = yaml.safe_load(f)
+            except Exception as e:
+                logger.debug("Failed to read run log %s: %s", run_file, e)
+                continue
+
+            if not data or data.get("status") != "running":
+                continue
+
+            current_phase = data.get("current_phase") or {}
+            if not isinstance(current_phase, dict):
+                continue
+
+            started_at = current_phase.get("started_at")
+            parsed_started_at: datetime | None = None
+            if isinstance(started_at, str):
+                parsed_started_at = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+            elif isinstance(started_at, datetime):
+                parsed_started_at = started_at
+
+            epic = data.get("epic")
+            story = data.get("story")
+            story_key = f"{epic}.{story}" if epic is not None and story is not None else None
+
+            return {
+                "story_key": story_key,
+                "phase": current_phase.get("phase"),
+                "started_at": parsed_started_at,
+            }
+
+        return None
+
     def get_phase_started_at(self) -> datetime | None:
         """Get the start time of the current phase from the latest running run log.
 
@@ -999,36 +1052,10 @@ class DashboardServer:
             Phase start datetime if found, None otherwise.
 
         """
-        import yaml
-
-        runs_dir = self.project_root / ".bmad-assist" / "runs"
-        if not runs_dir.exists():
+        active_run = self._get_active_run_context()
+        if not active_run:
             return None
-
-        # Find all run log YAML files, sorted by name (newest first due to timestamp)
-        run_files = sorted(runs_dir.glob("run-*.yaml"), reverse=True)
-
-        for run_file in run_files:
-            try:
-                with open(run_file, encoding="utf-8") as f:
-                    data = yaml.safe_load(f)
-
-                if data and data.get("status") == "running":
-                    current_phase = data.get("current_phase")
-                    if current_phase and current_phase.get("started_at"):
-                        started_at_str = current_phase["started_at"]
-                        # Parse ISO format datetime
-                        if isinstance(started_at_str, str):
-                            return datetime.fromisoformat(started_at_str.replace("Z", "+00:00"))
-                        elif isinstance(started_at_str, datetime):
-                            return started_at_str
-                    # Found running log but no current_phase - stop searching
-                    return None
-            except Exception as e:
-                logger.debug("Failed to read run log %s: %s", run_file, e)
-                continue
-
-        return None
+        return active_run.get("started_at")
 
     def get_sprint_status(self) -> dict[str, Any]:
         """Get current sprint status from project state.
@@ -1100,6 +1127,7 @@ class DashboardServer:
 
         # Load execution state for accurate phase status
         state = self.get_current_state()
+        active_run = self._get_active_run_context()
 
         epics = status.get("epics", [])
         result: dict[str, Any] = {"epics": []}
@@ -1121,7 +1149,11 @@ class DashboardServer:
                     "title": story.get("title"),
                     "status": story_status,
                     "phases": self._get_story_phases(
-                        epic.get("id"), story.get("id"), story_status, state
+                        epic.get("id"),
+                        story.get("id"),
+                        story_status,
+                        state,
+                        active_run,
                     ),
                 }
                 stories_list.append(story_data)
@@ -1706,17 +1738,19 @@ class DashboardServer:
         story_id: str | int,
         status: str,
         state: State | None = None,
+        active_run: dict[str, Any] | None = None,
     ) -> list[dict[str, str]]:
         """Get workflow phases for a story.
 
-        Uses state.yaml to determine current phase when available.
-        Falls back to inferring from story status if state not available.
+        Uses state.yaml plus active run evidence to determine current phase when available.
+        Falls back to inferring from story status if active execution is not confirmed.
 
         Args:
             epic_id: Epic identifier.
             story_id: Story identifier (just the number part).
             status: Story status from sprint-status.yaml.
             state: Optional execution state from state.yaml.
+            active_run: Optional active run context from run logs.
 
         Returns:
             List of phase dictionaries with status.
@@ -1731,8 +1765,16 @@ class DashboardServer:
         # Build story key for comparison with state (e.g., "22.3")
         story_key = f"{epic_id}.{story_id}"
 
-        # If we have state and this is the current story, use state for phase status
-        if state and state.current_story == story_key and state.current_phase:
+        # Only trust state.yaml for an in-progress phase when a matching running
+        # run log confirms the story and phase are actually active.
+        if (
+            state
+            and state.current_story == story_key
+            and state.current_phase
+            and active_run
+            and active_run.get("story_key") == story_key
+            and active_run.get("phase") == state.current_phase.value
+        ):
             current_phase_id = state.current_phase.value
             phase_order = [p["id"] for p in phases]
 

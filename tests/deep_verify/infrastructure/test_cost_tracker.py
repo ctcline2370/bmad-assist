@@ -18,11 +18,6 @@ from bmad_assist.deep_verify.infrastructure.cost_tracker import (
     estimate_tokens,
     get_model_pricing,
 )
-from bmad_assist.deep_verify.infrastructure.types import (
-    CostSummary,
-    MethodCost,
-    ModelCost,
-)
 
 
 # =============================================================================
@@ -49,6 +44,14 @@ class TestCalculateCost:
         # Expected: (1000/1M * 15) + (500/1M * 75) = 0.015 + 0.0375 = 0.0525
         expected = (1000 / 1_000_000 * 15.0) + (500 / 1_000_000 * 75.0)
         assert cost == pytest.approx(expected, abs=1e-9)
+
+    def test_calculate_cost_gpt_5_5(self):
+        """Test cost calculation for GPT-5.5 model."""
+        cost = calculate_cost(input_tokens=1000, output_tokens=500, model="gpt-5.5")
+
+        # GPT-5.5: $5.00 per 1M input, $30.00 per 1M output.
+        expected = (1000 / 1_000_000 * 5.0) + (500 / 1_000_000 * 30.0)
+        assert cost == pytest.approx(expected, abs=1e-9)
     
     def test_calculate_cost_zero_tokens(self):
         """Test cost calculation with zero tokens."""
@@ -74,6 +77,9 @@ class TestGetModelPricing:
         
         pricing = get_model_pricing("opus")
         assert pricing == (15.0, 75.0)
+
+        pricing = get_model_pricing("gpt-5.5")
+        assert pricing == (5.0, 30.0)
     
     def test_get_unknown_model_pricing(self):
         """Test getting pricing for unknown model returns defaults."""
@@ -385,7 +391,7 @@ class TestModelPricing:
     
     def test_all_models_have_two_prices(self):
         """Test that all models have input and output prices."""
-        for model, pricing in MODEL_PRICING.items():
+        for _model, pricing in MODEL_PRICING.items():
             assert len(pricing) == 2
             assert pricing[0] >= 0  # input
             assert pricing[1] >= 0  # output
@@ -394,7 +400,7 @@ class TestModelPricing:
         """Test that haiku is the cheapest Claude model."""
         haiku_input, haiku_output = MODEL_PRICING["haiku"]
         
-        for model, (input_price, output_price) in MODEL_PRICING.items():
+        for model, (input_price, _output_price) in MODEL_PRICING.items():
             # Only check Claude models (not GPT models)
             if model.startswith(("claude-", "haiku", "sonnet", "opus")) and model != "haiku":
                 assert input_price >= haiku_input, f"{model} is cheaper than haiku"

@@ -48,9 +48,10 @@ STORY_FILENAME_PATTERN = re.compile(
 )
 
 # Code review synthesis: synthesis-{epic}-{story}[-timestamp].md
-# Examples: synthesis-20-4.md, synthesis-16-13-20260107_1112.md
+# Examples: synthesis-20-4.md, synthesis-16-13-20260107_1112.md,
+# synthesis-8-1-20260424T151047Z.md
 SYNTHESIS_PATTERN = re.compile(
-    r"^synthesis-(?P<epic>[a-z0-9-]+)-(?P<story>\d+)(?:-(?P<timestamp>[\dT_]+))?\.md$",
+    r"^synthesis-(?P<epic>[a-z0-9-]+)-(?P<story>\d+)(?:-(?P<timestamp>[\dT_Z-]+))?\.md$",
     re.IGNORECASE,
 )
 

@@ -60,6 +60,33 @@ _RENAME_WITH_CHANGES_PATTERN = re.compile(
     r"^\s*(?:\{[^}]+\}\s*=>\s*)?(.+?)\s*=>\s*(.+?)\s*\|\s*(\d+)", re.MULTILINE
 )
 
+_CONTROL_PLANE_FILENAMES = {"AGENTS.md", "AGENTS.override.md", "CLAUDE.md"}
+_CONTROL_PLANE_DIRS = {".agents", ".bmad-assist", ".claude", ".codex", "_bmad-output"}
+
+
+def _normalize_repo_path(path: str) -> str:
+    """Normalize git diff paths for deterministic filtering."""
+    normalized = path.strip().replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
+def _is_generated_or_control_plane_path(path: str) -> bool:
+    """Return True when a path points at generated or repo control-plane files."""
+    normalized = _normalize_repo_path(path)
+    if not normalized:
+        return False
+
+    parts = [part for part in normalized.split("/") if part]
+    if not parts:
+        return False
+
+    if parts[-1] in _CONTROL_PLANE_FILENAMES:
+        return True
+
+    return any(part in _CONTROL_PLANE_DIRS for part in parts)
+
 
 def _capture_git_diff(context: CompilerContext) -> str:
     """Capture git diff with intelligent filtering and validation.
@@ -159,7 +186,9 @@ def _extract_modified_files_from_stat(
     Args:
         stat_output: Raw output from git diff --stat.
         skip_docs: If True, skip files in docs/ directory.
-        skip_generated: If True, skip BMAD-generated files (_bmad-output, .bmad-assist).
+        skip_generated: If True, skip BMAD-generated and repo control-plane
+            files such as .bmad-assist, _bmad-output, .codex, and AGENTS/CLAUDE
+            instruction files.
 
     Returns:
         List of (path, change_count) tuples sorted by changes desc, path asc.
@@ -190,7 +219,7 @@ def _extract_modified_files_from_stat(
     # First, process renamed files (they have => in the line)
     for match in _RENAME_WITH_CHANGES_PATTERN.finditer(stat_output):
         # Group 2 is new path, group 3 is change count
-        new_path = match.group(2).strip()
+        new_path = _normalize_repo_path(match.group(2))
         try:
             changes = int(match.group(3))
         except ValueError:
@@ -204,13 +233,8 @@ def _extract_modified_files_from_stat(
         if skip_docs and new_path.startswith("docs/"):
             continue
 
-        # Skip BMAD-generated files (synthesis artifacts, cache, etc.)
-        if skip_generated and (
-            new_path.startswith("_bmad-output/") or
-            new_path.startswith(".bmad-assist/") or
-            "/_bmad-output/" in new_path or
-            "/.bmad-assist/" in new_path
-        ):
+        # Skip generated/control-plane files (synthesis artifacts, cache, etc.)
+        if skip_generated and _is_generated_or_control_plane_path(new_path):
             continue
 
         if new_path not in seen_paths:
@@ -219,7 +243,7 @@ def _extract_modified_files_from_stat(
 
     # Then, process regular files (no =>)
     for match in _STAT_PATTERN.finditer(stat_output):
-        path = match.group(1)
+        path = _normalize_repo_path(match.group(1))
         try:
             changes = int(match.group(2))
         except ValueError:
@@ -238,13 +262,8 @@ def _extract_modified_files_from_stat(
         if skip_docs and path.startswith("docs/"):
             continue
 
-        # Skip BMAD-generated files (synthesis artifacts, cache, etc.)
-        if skip_generated and (
-            path.startswith("_bmad-output/") or
-            path.startswith(".bmad-assist/") or
-            "/_bmad-output/" in path or
-            "/.bmad-assist/" in path
-        ):
+        # Skip generated/control-plane files (synthesis artifacts, cache, etc.)
+        if skip_generated and _is_generated_or_control_plane_path(path):
             continue
 
         if path not in seen_paths:

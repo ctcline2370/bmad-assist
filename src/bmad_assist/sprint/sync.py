@@ -25,13 +25,16 @@ Public API:
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from bmad_assist.core.retrospective_artifacts import has_durable_retrospective_artifact
 from bmad_assist.core.state import Phase
 from bmad_assist.sprint.models import SprintStatus, SprintStatusEntry, ValidStatus
+from bmad_assist.sprint.scanner import ArtifactIndex
 
 if TYPE_CHECKING:
     from bmad_assist.core.state import State
@@ -90,6 +93,7 @@ class SyncResult:
 
     synced_stories: int = 0
     synced_epics: int = 0
+    synced_story_files: int = 0
     skipped_keys: tuple[str, ...] = field(default_factory=tuple)
     errors: tuple[str, ...] = field(default_factory=tuple)
 
@@ -98,6 +102,7 @@ class SyncResult:
         return (
             f"SyncResult(synced_stories={self.synced_stories}, "
             f"synced_epics={self.synced_epics}, "
+            f"synced_story_files={self.synced_story_files}, "
             f"skipped={len(self.skipped_keys)}, errors={len(self.errors)})"
         )
 
@@ -114,6 +119,8 @@ class SyncResult:
 
         """
         parts = [f"Synced {self.synced_stories} stories, {self.synced_epics} epics"]
+        if self.synced_story_files:
+            parts.append(f"Synced {self.synced_story_files} story files")
         if self.skipped_keys:
             parts.append(f"Skipped {len(self.skipped_keys)} missing keys")
         if self.errors:
@@ -164,6 +171,102 @@ The "done" status is only set at RETROSPECTIVE because:
 2. TEST_REVIEW can also require changes
 3. Only at RETROSPECTIVE is the story truly complete
 """
+
+STATUS_LINE_PATTERN = re.compile(
+    r"^(?P<prefix>\s*Status\s*:\s*)(?P<status>[^\r\n]*)(?P<newline>\r?\n?)$",
+    re.IGNORECASE,
+)
+
+
+def _story_id_to_key(story_id: str) -> str:
+    """Convert state story ID format to artifact short key format."""
+    return story_id.replace(".", "-")
+
+
+def _story_status_targets(state: State) -> dict[str, ValidStatus]:
+    """Build story file status targets from runtime state.
+
+    This mirrors sync_state_to_sprint(): the current phase sets the current
+    story status, then completed stories override to done.
+    """
+    targets: dict[str, ValidStatus] = {}
+
+    if state.current_story is not None and state.current_phase is not None:
+        target_status = PHASE_TO_STATUS.get(state.current_phase)
+        if target_status is not None:
+            targets[_story_id_to_key(state.current_story)] = target_status
+
+    for story_id in state.completed_stories:
+        targets[_story_id_to_key(story_id)] = "done"
+
+    return targets
+
+
+def _replace_story_status(content: str, status: ValidStatus) -> tuple[str, bool]:
+    """Replace or insert the top-level BMAD story Status line."""
+    lines = content.splitlines(keepends=True)
+    for index, line in enumerate(lines[:50]):
+        match = STATUS_LINE_PATTERN.match(line)
+        if not match:
+            continue
+        if match.group("status").strip().lower() == status:
+            return content, False
+        lines[index] = f"{match.group('prefix')}{status}{match.group('newline')}"
+        return "".join(lines), True
+
+    if not lines:
+        return f"Status: {status}\n", True
+
+    newline = "\r\n" if lines[0].endswith("\r\n") else "\n"
+    insert_at = 1 if lines[0].lstrip().startswith("#") else 0
+    lines.insert(insert_at, f"Status: {status}{newline}")
+    if insert_at == 1 and (len(lines) == 2 or lines[2].strip()):
+        lines.insert(2, newline)
+    return "".join(lines), True
+
+
+def _sync_story_status_files(state: State, project_root: Path) -> SyncResult:
+    """Synchronize story markdown Status fields from runtime state.
+
+    Story files are part of BMAD's durable artifact surface, and sprint
+    validation treats explicit story Status fields as authoritative. Keeping
+    them synchronized from the same state source prevents stale story markdown
+    from creating false validation drift after autonomous phase transitions.
+    """
+    targets = _story_status_targets(state)
+    if not targets:
+        return SyncResult()
+
+    index = ArtifactIndex.scan(project_root)
+    synced = 0
+    skipped: list[str] = []
+    errors: list[str] = []
+
+    for story_key, status in targets.items():
+        artifact = index.get_story_artifact(story_key)
+        if artifact is None:
+            skipped.append(story_key.replace("-", ".", 1))
+            logger.warning("Story file for '%s' not found, skipping status sync", story_key)
+            continue
+
+        try:
+            original = artifact.path.read_text(encoding="utf-8")
+            updated, changed = _replace_story_status(original, status)
+            if not changed:
+                continue
+            artifact.path.write_text(updated, encoding="utf-8")
+            synced += 1
+            logger.debug("Updated story file %s Status: %s", artifact.path, status)
+        except OSError as exc:
+            message = f"{artifact.path}: {exc}"
+            errors.append(message)
+            logger.warning("Failed to update story file status for %s: %s", story_key, exc)
+
+    return SyncResult(
+        synced_story_files=synced,
+        skipped_keys=tuple(skipped),
+        errors=tuple(errors),
+    )
 
 
 # =============================================================================
@@ -275,6 +378,7 @@ def _build_story_prefix_map(
 def sync_state_to_sprint(
     state: State,
     sprint_status: SprintStatus,
+    project_path: Path | None = None,
 ) -> tuple[SprintStatus, SyncResult]:
     """Synchronize internal state to sprint-status.
 
@@ -285,10 +389,15 @@ def sync_state_to_sprint(
     1. Current story status based on current_phase (via PHASE_TO_STATUS)
     2. All completed_stories marked as "done"
     3. All completed_epics marked as "done"
+    4. Completed epic retrospectives marked as "done" only when backed by a
+       durable retrospective artifact.
 
     Args:
         state: Current State instance (source of truth).
         sprint_status: SprintStatus to update (will be copied, not mutated).
+        project_path: Optional project root used to verify durable retrospective
+            artifacts. When omitted, completed epics do not imply retrospective
+            completion.
 
     Returns:
         Tuple of (updated SprintStatus, SyncResult with statistics).
@@ -421,11 +530,16 @@ def sync_state_to_sprint(
             )
             skipped_keys.append(f"epic-{epic_id}")
 
-        # Step 3.5: Mark epic retrospective entry as done
-        retro_key = f"epic-{epic_id}-retrospective"
-        if retro_key in new_entries:
-            retro_entry = new_entries[retro_key]
-            if retro_entry.status != "done":
+    # Step 3.5: Mark completed epic retrospectives as done only with durable evidence.
+    # completed_epics alone is not sufficient; the retrospective artifact is the durable
+    # teardown proof used by resume validation.
+    if project_path is not None:
+        for epic_id in state.completed_epics:
+            retro_key = f"epic-{epic_id}-retrospective"
+            retro_entry = new_entries.get(retro_key)
+            if retro_entry is None or retro_entry.status == "done":
+                continue
+            if has_durable_retrospective_artifact(epic_id, project_path):
                 new_entries[retro_key] = SprintStatusEntry(
                     key=retro_entry.key,
                     status="done",
@@ -433,7 +547,11 @@ def sync_state_to_sprint(
                     source=retro_entry.source,
                     comment=retro_entry.comment,
                 )
-                logger.debug("Marked completed epic retrospective %s as done", retro_key)
+                logger.debug(
+                    "Marked completed epic retrospective %s as done from durable artifact",
+                    retro_key,
+                )
+                synced_epics += 1
 
     # Step 3.6: Mark current epic's retrospective as in-progress when in RETROSPECTIVE phase
     if (
@@ -444,7 +562,24 @@ def sync_state_to_sprint(
         retro_key = f"epic-{state.current_epic}-retrospective"
         if retro_key in new_entries:
             retro_entry = new_entries[retro_key]
-            if retro_entry.status not in ("done", "in-progress"):
+            if (
+                project_path is not None
+                and retro_entry.status != "done"
+                and has_durable_retrospective_artifact(state.current_epic, project_path)
+            ):
+                new_entries[retro_key] = SprintStatusEntry(
+                    key=retro_entry.key,
+                    status="done",
+                    entry_type=retro_entry.entry_type,
+                    source=retro_entry.source,
+                    comment=retro_entry.comment,
+                )
+                logger.debug(
+                    "Marked current epic retrospective %s as done from durable artifact",
+                    retro_key,
+                )
+                synced_epics += 1
+            elif retro_entry.status not in ("done", "in-progress"):
                 new_entries[retro_key] = SprintStatusEntry(
                     key=retro_entry.key,
                     status="in-progress",
@@ -542,10 +677,29 @@ def trigger_sync(state: State, project_root: Path) -> SyncResult:
         logger.info("Sprint-status not found, creating new: %s", sprint_path)
 
     # Sync
-    updated_status, result = sync_state_to_sprint(state, sprint_status)
+    updated_status, result = sync_state_to_sprint(state, sprint_status, project_root)
 
     # Write back atomically with comment preservation
     write_sprint_status(updated_status, sprint_path, preserve_comments=True)
+
+    story_file_result = _sync_story_status_files(state, project_root)
+    if story_file_result.errors:
+        result = SyncResult(
+            synced_stories=result.synced_stories,
+            synced_epics=result.synced_epics,
+            synced_story_files=story_file_result.synced_story_files,
+            skipped_keys=(*result.skipped_keys, *story_file_result.skipped_keys),
+            errors=(*result.errors, *story_file_result.errors),
+        )
+    else:
+        result = SyncResult(
+            synced_stories=result.synced_stories,
+            synced_epics=result.synced_epics,
+            synced_story_files=story_file_result.synced_story_files,
+            skipped_keys=(*result.skipped_keys, *story_file_result.skipped_keys),
+            errors=result.errors,
+        )
+
     logger.info("Sprint sync complete: %s", result.summary())
 
     return result

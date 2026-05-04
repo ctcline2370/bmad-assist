@@ -1567,3 +1567,115 @@ class TestSkipSourceFiles:
         assert "GIT_DIFF_END" in result.context
         assert "diff --git a/src/main.py" in result.context
         assert "++" in result.context or "Hello, World!" in result.context
+
+
+class TestSynthesisInputSanitization:
+    """Tests for synthesis input noise sanitization."""
+
+    def test_compile_strips_reviewer_environment_noise_but_keeps_findings(
+        self,
+        tmp_project: Path,
+    ) -> None:
+        """Reviewer environment failures are stripped without losing the actual finding."""
+        from bmad_assist.compiler.workflows.code_review_synthesis import (
+            CodeReviewSynthesisCompiler,
+        )
+
+        reviews = [
+            AnonymizedValidation(
+                validator_id="Reviewer A",
+                content=(
+                    "## Findings\n\n"
+                    "High: Missing tenant scoping in metrics query.\n"
+                    "Validation note: UnauthorizedAccessException: Access to the path is denied.\n"
+                    "That test run could not complete in this environment because the read-only "
+                    "sandbox blocked MSBuild temp directory creation.\n"
+                ),
+                original_ref="uuid-1",
+            ),
+            AnonymizedValidation(
+                validator_id="Reviewer B",
+                content="## Findings\n\nMedium: Add missing dashboard contract assertion.",
+                original_ref="uuid-2",
+            ),
+        ]
+
+        context = create_test_context(
+            tmp_project,
+            epic_num=14,
+            story_num=9,
+            reviews=reviews,
+        )
+        compiler = CodeReviewSynthesisCompiler()
+
+        with (
+            patch(
+                "bmad_assist.compiler.workflows.code_review_synthesis._capture_git_diff",
+                return_value="",
+            ),
+            patch(
+                "bmad_assist.compiler.strategic_context.load_antipatterns",
+                return_value={},
+            ),
+            patch(
+                "bmad_assist.compiler.source_context.SourceContextService.collect_files",
+                return_value={},
+            ),
+        ):
+            result = compiler.compile(context)
+
+        assert "Missing tenant scoping in metrics query." in result.context
+        assert "dashboard contract assertion" in result.context
+        assert "UnauthorizedAccessException" not in result.context
+        assert "read-only sandbox" not in result.context
+        assert "MSBuild temp directory" not in result.context
+        assert "could not complete in this environment" not in result.context
+
+    def test_compile_normalizes_antipattern_fix_cells_without_dropping_issue_rows(
+        self,
+        tmp_project: Path,
+        two_reviews: list[AnonymizedValidation],
+    ) -> None:
+        """Antipattern rows keep the finding while stale read-only fix text is normalized."""
+        from bmad_assist.compiler.workflows.code_review_synthesis import (
+            CodeReviewSynthesisCompiler,
+        )
+
+        antipatterns = {
+            "_bmad-output/implementation-artifacts/antipatterns/epic-7-code-antipatterns.md": (
+                "# Antipatterns\n\n"
+                "| severity | issue | fix status |\n"
+                "| --- | --- | --- |\n"
+                "| high | Missing metric tag guard | Not applied; workspace is read-only. |\n"
+                "Validation note: UnauthorizedAccessException: Access to the path is denied.\n"
+            )
+        }
+
+        context = create_test_context(
+            tmp_project,
+            epic_num=14,
+            story_num=9,
+            reviews=two_reviews,
+        )
+        compiler = CodeReviewSynthesisCompiler()
+
+        with (
+            patch(
+                "bmad_assist.compiler.workflows.code_review_synthesis._capture_git_diff",
+                return_value="",
+            ),
+            patch(
+                "bmad_assist.compiler.strategic_context.load_antipatterns",
+                return_value=antipatterns,
+            ),
+            patch(
+                "bmad_assist.compiler.source_context.SourceContextService.collect_files",
+                return_value={},
+            ),
+        ):
+            result = compiler.compile(context)
+
+        assert "Missing metric tag guard" in result.context
+        assert "Pending validation in current writable workspace." in result.context
+        assert "Not applied; workspace is read-only." not in result.context
+        assert "UnauthorizedAccessException" not in result.context

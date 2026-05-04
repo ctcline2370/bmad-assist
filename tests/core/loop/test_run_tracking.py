@@ -5,8 +5,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+import yaml
 
 from bmad_assist.core.loop.run_tracking import (
+    CurrentPhase,
     MAX_ARG_LENGTH,
     PhaseInvocation,
     PhaseStatus,
@@ -17,6 +19,8 @@ from bmad_assist.core.loop.run_tracking import (
     _format_datetime,
     _sanitize_csv_value,
     mask_cli_args,
+    reconcile_stale_running_run,
+    reconcile_stale_running_runs,
     save_run_log,
 )
 
@@ -107,6 +111,7 @@ class TestRunLog:
         """RunLog should accept all fields."""
         log = RunLog(
             run_id="test1234",
+            exit_reason="guardian_halt",
             cli_args=["--project", "."],
             cli_args_masked=["--project", "."],
             epic=22,
@@ -114,6 +119,7 @@ class TestRunLog:
             project_path="/path/to/project",
         )
         assert log.run_id == "test1234"
+        assert log.exit_reason == "guardian_halt"
         assert log.epic == 22
         assert log.story == "22.3"
 
@@ -184,6 +190,7 @@ class TestSaveRunLog:
             now = datetime.now(UTC)
             log = RunLog(
                 run_id="csv12345",
+                exit_reason="guardian_halt",
                 epic=1,
                 story="1.1",
                 phases=[
@@ -209,6 +216,7 @@ class TestSaveRunLog:
             csv_content = csv_path.read_text()
             assert "run_id" in csv_content  # Header
             assert "csv12345" in csv_content  # Data
+            assert "# Exit Reason: guardian_halt" in csv_content
 
     def test_detects_symlink_attack(self) -> None:
         """save_run_log should refuse to write through symlinks."""
@@ -226,6 +234,120 @@ class TestSaveRunLog:
 
             with pytest.raises(SecurityError, match="Symlink detected"):
                 save_run_log(log, project_path)
+
+
+class TestStaleRunReconciliation:
+    """Tests for stale running run reconciliation."""
+
+    def test_reconciles_newest_running_run(self, tmp_path: Path) -> None:
+        """Newest running run should be finalized as crashed."""
+        older_started_at = datetime(2026, 4, 20, 12, 0, tzinfo=UTC)
+        newer_started_at = datetime(2026, 4, 20, 12, 5, tzinfo=UTC)
+
+        older_run = RunLog(run_id="older001", started_at=older_started_at)
+        newer_run = RunLog(
+            run_id="newer001",
+            started_at=newer_started_at,
+            current_phase=CurrentPhase(
+                phase="DEV_STORY",
+                started_at=newer_started_at,
+                provider="openai",
+                model="gpt-5.4",
+            ),
+        )
+
+        older_yaml = save_run_log(older_run, tmp_path)
+        newer_yaml = save_run_log(newer_run, tmp_path, as_csv=True)
+
+        reconciled = reconcile_stale_running_run(tmp_path, "stale_lock_recovered_dead_pid")
+
+        assert reconciled == newer_yaml
+
+        newer_data = yaml.safe_load(newer_yaml.read_text())
+        assert newer_data["status"] == RunStatus.CRASHED.value
+        assert newer_data["exit_reason"] == "stale_lock_recovered_dead_pid"
+        assert newer_data["ended_at"] is not None
+        assert newer_data["current_phase"] is None
+
+        older_data = yaml.safe_load(older_yaml.read_text())
+        assert older_data["status"] == RunStatus.CRASHED.value
+        assert older_data["exit_reason"] == "stale_lock_recovered_dead_pid"
+        assert older_data["ended_at"] is not None
+        assert older_data["current_phase"] is None
+
+        csv_content = newer_yaml.with_suffix(".csv").read_text()
+        assert "# Status: crashed" in csv_content
+        assert "# Exit Reason: stale_lock_recovered_dead_pid" in csv_content
+
+    def test_reconciles_all_running_runs_newest_first(self, tmp_path: Path) -> None:
+        """Plural helper should finalize the full stale backlog in newest-first order."""
+        oldest_started_at = datetime(2026, 4, 20, 9, 0, tzinfo=UTC)
+        middle_started_at = datetime(2026, 4, 20, 9, 30, tzinfo=UTC)
+        newest_started_at = datetime(2026, 4, 20, 10, 0, tzinfo=UTC)
+
+        oldest_yaml = save_run_log(
+            RunLog(
+                run_id="oldest01",
+                started_at=oldest_started_at,
+                current_phase=CurrentPhase(
+                    phase="DEV_STORY",
+                    started_at=oldest_started_at,
+                    provider="openai",
+                    model="gpt-5.4",
+                ),
+            ),
+            tmp_path,
+        )
+        middle_yaml = save_run_log(
+            RunLog(
+                run_id="middle01",
+                started_at=middle_started_at,
+                current_phase=CurrentPhase(
+                    phase="DEV_STORY",
+                    started_at=middle_started_at,
+                    provider="openai",
+                    model="gpt-5.4",
+                ),
+            ),
+            tmp_path,
+        )
+        newest_yaml = save_run_log(
+            RunLog(
+                run_id="newest01",
+                started_at=newest_started_at,
+                current_phase=CurrentPhase(
+                    phase="DEV_STORY",
+                    started_at=newest_started_at,
+                    provider="openai",
+                    model="gpt-5.4",
+                ),
+            ),
+            tmp_path,
+        )
+
+        reconciled = reconcile_stale_running_runs(tmp_path, "stale_lock_recovered_dead_pid")
+
+        assert reconciled == [newest_yaml, middle_yaml, oldest_yaml]
+        for yaml_path in reconciled:
+            data = yaml.safe_load(yaml_path.read_text())
+            assert data["status"] == RunStatus.CRASHED.value
+            assert data["exit_reason"] == "stale_lock_recovered_dead_pid"
+            assert data["ended_at"] is not None
+            assert data["current_phase"] is None
+
+    def test_returns_none_when_no_running_run_exists(self, tmp_path: Path) -> None:
+        """No-op when every persisted run is already finalized."""
+        completed_run = RunLog(
+            run_id="done0001",
+            started_at=datetime(2026, 4, 20, 12, 0, tzinfo=UTC),
+            ended_at=datetime(2026, 4, 20, 12, 1, tzinfo=UTC),
+            status=RunStatus.COMPLETED,
+        )
+        save_run_log(completed_run, tmp_path)
+
+        reconciled = reconcile_stale_running_run(tmp_path, "stale_lock_recovered_dead_pid")
+
+        assert reconciled is None
 
 
 class TestHelperFunctions:

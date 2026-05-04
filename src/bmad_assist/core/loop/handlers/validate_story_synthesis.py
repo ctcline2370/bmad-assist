@@ -24,12 +24,13 @@ from typing import Any
 
 from bmad_assist.compiler import compile_workflow
 from bmad_assist.compiler.types import CompilerContext
-from bmad_assist.core.exceptions import ConfigError
+from bmad_assist.core.exceptions import ConfigError, ProviderTimeoutError
 from bmad_assist.core.io import get_original_cwd
 from bmad_assist.core.loop.handlers.base import BaseHandler, check_for_edit_failures
 from bmad_assist.core.loop.types import PhaseResult
 from bmad_assist.core.paths import get_paths
 from bmad_assist.core.state import State
+from bmad_assist.core.timeout_artifacts import save_provider_timeout_artifact
 from bmad_assist.core.types import EpicId
 from bmad_assist.validation.orchestrator import (
     ValidationError,
@@ -182,7 +183,11 @@ class ValidateStorySynthesisHandler(BaseHandler):
 
         synthesis_config = self.config.compiler.synthesis
         base_tokens = estimate_base_context_tokens(
-            self.project_path, self.config, "validate_story_synthesis"
+            self.project_path,
+            self.config,
+            "validate_story_synthesis",
+            epic_num=epic_num,
+            story_num=story_num,
         )
         total_tokens = estimate_synthesis_tokens(
             anonymized_validations, base_tokens, synthesis_config.safety_factor
@@ -245,6 +250,25 @@ class ValidateStorySynthesisHandler(BaseHandler):
                     synthesis_config.max_compression_timeout // max(expected_calls, 1),
                     30,
                 )
+                extraction_provider_id = (
+                    f"{getattr(ext_provider, 'provider_name', 'unknown')}-{ext_model}"
+                )
+
+                def save_timeout_attempt(
+                    error: ProviderTimeoutError,
+                    timeout_attempt: int,
+                    will_retry: bool,
+                ) -> None:
+                    save_provider_timeout_artifact(
+                        project_path=self.project_path,
+                        phase_name=f"{self.phase_name}_extraction",
+                        error=error,
+                        epic=epic_num,
+                        story=story_num,
+                        provider_id=extraction_provider_id,
+                        attempt=timeout_attempt,
+                        will_retry=will_retry,
+                    )
 
                 def invoke_fn(prompt: str) -> str:
                     res = invoke_with_timeout_retry(
@@ -254,6 +278,7 @@ class ValidateStorySynthesisHandler(BaseHandler):
                         prompt=prompt,
                         model=ext_model,
                         timeout=per_call_timeout,
+                        on_timeout=save_timeout_attempt,
                         disable_tools=True,
                         cwd=self.project_path,
                     )
@@ -433,7 +458,7 @@ class ValidateStorySynthesisHandler(BaseHandler):
             start_time = datetime.now(UTC)
 
             # Invoke Master LLM
-            result = self.invoke_provider(prompt)
+            result = self.invoke_provider(prompt, state=state)
 
             # Record end time for benchmarking
             end_time = datetime.now(UTC)
@@ -553,6 +578,20 @@ class ValidateStorySynthesisHandler(BaseHandler):
         except ConfigError as e:
             logger.error("Synthesis config error: %s", e)
             return PhaseResult.fail(str(e))
+
+        except ProviderTimeoutError as e:
+            artifact_path = self._save_timeout_artifact(state, e)
+            outputs: dict[str, Any] = {}
+            artifact_suffix = ""
+            if artifact_path is not None:
+                outputs["timeout_artifact"] = str(artifact_path)
+                artifact_suffix = f" (partial output: {artifact_path})"
+            logger.error("Synthesis provider timeout: %s", e)
+            return PhaseResult(
+                success=False,
+                error=f"Provider timeout: {e}{artifact_suffix}",
+                outputs=outputs,
+            )
 
         except Exception as e:
             logger.error("Synthesis handler failed: %s", e, exc_info=True)

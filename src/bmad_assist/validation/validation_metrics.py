@@ -57,10 +57,18 @@ LLM_OPTIMIZATION_PATTERN = re.compile(
 )
 
 # Evidence Score finding counts (Deep Verify format)
-CRITICAL_FINDING_PATTERN = re.compile(r"\|\s*🔴\s*CRITICAL\s*\|\s*(\d+)\s*\|", re.IGNORECASE)
-IMPORTANT_FINDING_PATTERN = re.compile(r"\|\s*🟠\s*IMPORTANT\s*\|\s*(\d+)\s*\|", re.IGNORECASE)
-MINOR_FINDING_PATTERN = re.compile(r"\|\s*🟡\s*MINOR\s*\|\s*(\d+)\s*\|", re.IGNORECASE)
-CLEAN_PASS_PATTERN = re.compile(r"\|\s*🟢\s*CLEAN PASS\s*\|\s*(\d+)\s*\|", re.IGNORECASE)
+CRITICAL_FINDING_PATTERN = re.compile(
+    r"\|\s*(?:🔴|:red_circle:)?\s*CRITICAL\s*\|\s*(\d+)\s*\|", re.IGNORECASE
+)
+IMPORTANT_FINDING_PATTERN = re.compile(
+    r"\|\s*(?:🟠|:orange_circle:)?\s*IMPORTANT\s*\|\s*(\d+)\s*\|", re.IGNORECASE
+)
+MINOR_FINDING_PATTERN = re.compile(
+    r"\|\s*(?:🟡|:yellow_circle:)?\s*MINOR\s*\|\s*(\d+)\s*\|", re.IGNORECASE
+)
+CLEAN_PASS_PATTERN = re.compile(
+    r"\|\s*(?:🟢|:green_circle:)?\s*CLEAN PASS\s*\|\s*(\d+)\s*\|", re.IGNORECASE
+)
 
 # Evidence Score patterns (Deep Verify format)
 EVIDENCE_SCORE_TABLE_PATTERN = re.compile(
@@ -222,8 +230,22 @@ def extract_validator_metrics(
     # Count INVEST violations (count bullet points after "### INVEST Violations")
     invest_violations = _count_invest_violations(content)
 
-    # Parse Evidence Score report using evidence_score.py module
+    # Parse Evidence Score report using evidence_score.py module. Detailed
+    # Evidence Score tables carry descriptions rather than count cells, so the
+    # regex count patterns above intentionally do not see them.
     evidence_report = parse_evidence_findings(content, validator_id)
+    if evidence_report is not None and evidence_report.findings:
+        critical_finding = sum(
+            1 for finding in evidence_report.findings if finding.severity.value == "CRITICAL"
+        )
+        important_finding = sum(
+            1 for finding in evidence_report.findings if finding.severity.value == "IMPORTANT"
+        )
+        minor_finding = sum(
+            1 for finding in evidence_report.findings if finding.severity.value == "MINOR"
+        )
+        clean_pass = evidence_report.clean_passes
+        evidence_score = evidence_report.total_score
 
     return ValidatorMetrics(
         validator_id=validator_id,

@@ -230,57 +230,19 @@ def advance_to_next_epic(
         stories = epic_stories_loader(next_epic)
 
         if not stories:
-            # Epic has no non-done stories - either it's fully completed or has no stories at all
-            # Skip it and continue searching for next epic with incomplete stories
-            logger.info(
-                "Skipping epic %s - no incomplete stories (already completed)",
-                next_epic,
+            raise StateError(
+                f"Cannot advance to epic {next_epic}: no stories are defined for that epic"
             )
-            candidate_epic = next_epic
-            next_epic = get_next_epic(candidate_epic, epic_list)
-            continue
 
-        # Check if ALL stories for this epic are already completed
-        # If so, skip directly to first epic_teardown phase (per ADR-006)
+        # Check if ALL stories for this epic are already completed.
+        # Do not infer epic completion from stories alone.
         incomplete_stories = [s for s in stories if s not in state.completed_stories]
 
         if not incomplete_stories:
-            # All stories done - go directly to first teardown phase
-            # Get first teardown phase from loop config
-            from bmad_assist.core.config import get_loop_config
-
-            loop_config = get_loop_config()
-            if loop_config.epic_teardown:
-                first_teardown_phase = Phase(loop_config.epic_teardown[0])
-            else:
-                # No teardown phases configured - skip directly to CREATE_STORY of next epic
-                # This is an edge case where someone has empty epic_teardown
-                logger.info(
-                    "All stories in epic %s already completed, no teardown phases configured",
-                    next_epic,
-                )
-                # Continue searching for next epic with incomplete stories
-                candidate_epic = next_epic
-                next_epic = get_next_epic(candidate_epic, epic_list)
-                continue
-
-            last_story = stories[-1]
-            logger.info(
-                "All stories in epic %s already completed, advancing to %s",
-                next_epic,
-                first_teardown_phase.name,
-            )
-
-            now = datetime.now(UTC).replace(tzinfo=None)
-            return state.model_copy(
-                update={
-                    "current_epic": next_epic,
-                    "current_story": last_story,
-                    "current_phase": first_teardown_phase,
-                    "epic_setup_complete": False,  # Reset for new epic
-                    "code_review_rework_count": 0,  # Reset rework counter
-                    "updated_at": now,
-                }
+            raise StateError(
+                "Cannot advance to epic "
+                f"{next_epic}: all stories are already completed but epic teardown "
+                "has not explicitly completed the epic"
             )
 
         # Found an epic with incomplete stories - break and use it

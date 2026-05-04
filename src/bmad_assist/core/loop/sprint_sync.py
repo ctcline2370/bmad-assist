@@ -12,6 +12,7 @@ import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
+from bmad_assist.core.exceptions import StateError
 from bmad_assist.core.state import State, save_state
 from bmad_assist.core.types import EpicId
 
@@ -87,8 +88,13 @@ def _validate_resume_against_sprint(
         logger.debug("Resume validation: no changes needed")
         return state, False
 
+    except StateError:
+        # Invalid lifecycle state must stop the loop so the operator sees the
+        # concrete teardown gap instead of silently continuing with drift.
+        raise
     except Exception as e:
-        # Resume validation is defensive - never crash the loop
+        # Unexpected validation failures stay non-fatal until their root cause is
+        # diagnosed; state-integrity failures are handled above.
         logger.warning("Resume validation failed (continuing): %s", e)
         return state, False
 

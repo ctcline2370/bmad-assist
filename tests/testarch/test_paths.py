@@ -9,6 +9,7 @@ from bmad_assist.testarch.paths import (
     VALID_ARTIFACT_TYPES,
     get_artifact_dir,
     get_artifact_patterns,
+    get_artifact_search_dirs,
     normalize_story_id,
     validate_artifact_path,
 )
@@ -72,6 +73,30 @@ class TestGetArtifactDir:
         assert get_artifact_dir("unknown") == ""
 
 
+class TestGetArtifactSearchDirs:
+    """Tests for artifact search directory fallbacks."""
+
+    def test_atdd_includes_legacy_locations(self) -> None:
+        """ATDD searches canonical and legacy output locations."""
+        assert get_artifact_search_dirs("atdd") == [
+            "atdd-checklists",
+            "test-artifacts",
+            "",
+        ]
+
+    def test_test_review_includes_legacy_locations(self) -> None:
+        """Test review searches canonical and legacy output locations."""
+        assert get_artifact_search_dirs("test-review") == [
+            "test-reviews",
+            "test-review",
+            "",
+        ]
+
+    def test_unknown_returns_empty_root(self) -> None:
+        """Unknown artifact types fall back to root search."""
+        assert get_artifact_search_dirs("unknown") == [""]
+
+
 class TestGetArtifactPatterns:
     """Tests for get_artifact_patterns function."""
 
@@ -91,6 +116,12 @@ class TestGetArtifactPatterns:
         patterns = get_artifact_patterns("atdd", epic_id=25, story_id="25-1")
         assert any("25.1" in p for p in patterns)
         assert any("25-1" in p for p in patterns)
+
+    def test_test_review_patterns_match_timestamped_reports(self) -> None:
+        """Test review patterns allow timestamped handler output files."""
+        patterns = get_artifact_patterns("test-review", epic_id=25, story_id="25.1")
+        assert "test-review*25.1*.md" in patterns
+        assert "test-review*25-1*.md" in patterns
 
     def test_string_epic_id(self) -> None:
         """Test pattern formatting with string epic ID (F2 Fix)."""
@@ -137,7 +168,7 @@ class TestArtifactConfigs:
 
     def test_all_configs_have_subdir_and_patterns(self) -> None:
         """Test all configs have required structure."""
-        for artifact_type, (subdir, patterns) in ARTIFACT_CONFIGS.items():
+        for _artifact_type, (subdir, patterns) in ARTIFACT_CONFIGS.items():
             assert isinstance(subdir, str)
             assert isinstance(patterns, list)
             assert len(patterns) > 0

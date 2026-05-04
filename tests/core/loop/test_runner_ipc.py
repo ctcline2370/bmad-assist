@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -29,14 +31,18 @@ import pytest
 
 
 @pytest.fixture()
-def sock_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def sock_dir(monkeypatch: pytest.MonkeyPatch) -> Path:
     """Create and monkeypatch socket directory for IPC tests."""
-    d = tmp_path / "sockets"
+    root = Path(tempfile.mkdtemp(prefix="bmad-ipc-", dir="/tmp"))
+    d = root / "sockets"
     d.mkdir(mode=0o700)
     monkeypatch.setattr("bmad_assist.ipc.server.get_socket_dir", lambda: d)
     monkeypatch.setattr("bmad_assist.ipc.discovery.SOCKET_DIR", d)
     monkeypatch.setattr("bmad_assist.ipc.cleanup.SOCKET_DIR", d)
-    return d
+    try:
+        yield d
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 @pytest.fixture()
@@ -92,13 +98,11 @@ class TestServerLifecycle:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """AC #1: _start_ipc_server() creates server that responds to ping."""
-        import tempfile
-
         from bmad_assist.core.loop.runner import _start_ipc_server
 
         # Use a short temp dir to stay under 107-byte sun_path limit.
         # tmp_path from pytest can be too long for Unix domain sockets.
-        with tempfile.TemporaryDirectory(prefix="ipc") as short_tmp:
+        with tempfile.TemporaryDirectory(prefix="ipc", dir="/tmp") as short_tmp:
             sock_dir = Path(short_tmp) / "s"
             sock_dir.mkdir(mode=0o700)
             # Patch get_socket_dir in BOTH server and protocol modules — _start_ipc_server

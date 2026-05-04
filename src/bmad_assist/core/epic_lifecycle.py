@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from bmad_assist.core.paths import get_paths
+from bmad_assist.core.retrospective_artifacts import find_durable_retrospective_artifacts
 from bmad_assist.core.state import Phase
 from bmad_assist.core.types import EpicId
 
@@ -101,48 +102,25 @@ class EpicLifecycleStatus:
         return "fully completed"
 
 
-def _check_retro_exists(epic_id: EpicId, project_path: Path) -> bool:
+def _check_retro_exists(epic_id: EpicId, _project_path: Path) -> bool:
     """Check if retrospective is completed for epic.
 
-    Checks BOTH:
-    1. Retrospective artifact file exists
-    2. OR epic-{id}-retrospective has status "done" in sprint-status.yaml
-
-    This dual check ensures we don't re-run retrospective when it's already
-    marked as done in sprint-status.yaml, even if the file check fails.
+    Epic completion must be backed by a durable retrospective artifact. Sprint
+    status alone is advisory and must not advance the lifecycle when the report
+    file is missing.
 
     Args:
         epic_id: Epic identifier.
         project_path: Project root directory.
 
     Returns:
-        True if retrospective is completed (file exists OR status is done).
+        True if a retrospective artifact exists for the epic.
 
     """
-    from bmad_assist.core.paths import get_paths
-
-    # Check 1: Retrospective file exists
-    paths = get_paths()
-    retro_pattern = f"epic-{epic_id}-retro-*.md"
-    retro_files = list(paths.retrospectives_dir.glob(retro_pattern))
+    retro_files = find_durable_retrospective_artifacts(epic_id, _project_path)
     if retro_files:
         logger.debug("Retro exists for epic %s: found file(s)", epic_id)
         return True
-
-    # Check 2: Sprint-status shows retrospective as done
-    try:
-        from bmad_assist.sprint.parser import parse_sprint_status
-
-        sprint_status_path = paths.sprint_status_file
-        if sprint_status_path.exists():
-            sprint_status = parse_sprint_status(sprint_status_path)
-            retro_key = f"epic-{epic_id}-retrospective"
-            retro_entry = sprint_status.entries.get(retro_key)
-            if retro_entry is not None and retro_entry.status == "done":
-                logger.debug("Retro exists for epic %s: sprint-status shows done", epic_id)
-                return True
-    except Exception as e:
-        logger.warning("Could not check sprint-status for retro: %s", e)
 
     return False
 

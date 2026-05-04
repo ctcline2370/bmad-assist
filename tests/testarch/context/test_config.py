@@ -70,10 +70,10 @@ class TestTEAContextConfig:
         assert review_config is not None
         assert "test-design" in review_config.include
 
-        # code_review_synthesis gets test-review
+        # code_review_synthesis gets prior ATDD, not future test-review
         synth_config = config.get_workflow_config("code_review_synthesis")
         assert synth_config is not None
-        assert "test-review" in synth_config.include
+        assert synth_config.include == ["atdd"]
 
         # retrospective gets trace
         retro_config = config.get_workflow_config("retrospective")

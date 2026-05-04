@@ -1,14 +1,10 @@
 """Tests for TEA context resolvers."""
 
 from pathlib import Path
-from typing import Any
-
-import pytest
 
 from bmad_assist.testarch.context.resolvers import (
     RESOLVER_REGISTRY,
     ATDDResolver,
-    BaseResolver,
     TestDesignResolver,
     TestReviewResolver,
     TraceResolver,
@@ -110,7 +106,7 @@ class TestTestDesignResolver:
         result = resolver.resolve(epic_id=25)
 
         assert len(result) == 1
-        assert any("epic-25" in path for path in result.keys())
+        assert any("epic-25" in path for path in result)
         assert "# Epic 25 plan" in list(result.values())[0]
 
     def test_resolve_fallback_to_system(self, tmp_path: Path) -> None:
@@ -180,6 +176,21 @@ class TestATDDResolver:
         assert len(result) == 1
         assert "# ATDD checklist" in list(result.values())[0]
 
+    def test_resolve_finds_legacy_test_artifacts_location(self, tmp_path: Path) -> None:
+        """Test resolve finds ATDD saved under output_folder/test-artifacts."""
+        impl_dir = tmp_path / "implementation-artifacts"
+        output_dir = tmp_path / "output"
+        atdd_dir = output_dir / "test-artifacts"
+        atdd_dir.mkdir(parents=True)
+        impl_dir.mkdir()
+        (atdd_dir / "atdd-checklist-25.1.md").write_text("# Legacy ATDD checklist")
+
+        resolver = ATDDResolver([impl_dir, output_dir], max_tokens=1000)
+        result = resolver.resolve(epic_id=25, story_id="25.1")
+
+        assert len(result) == 1
+        assert "# Legacy ATDD checklist" in list(result.values())[0]
+
     def test_resolve_respects_max_files(self, tmp_path: Path) -> None:
         """Test resolve respects max_files limit."""
         atdd_dir = tmp_path / "atdd-checklists"
@@ -228,6 +239,23 @@ class TestTestReviewResolver:
         assert len(result) == 1
         assert "# Test review" in list(result.values())[0]
 
+    def test_resolve_finds_timestamped_handler_output(self, tmp_path: Path) -> None:
+        """Test resolve finds timestamped test-review reports in output_folder."""
+        impl_dir = tmp_path / "implementation-artifacts"
+        output_dir = tmp_path / "output"
+        reviews_dir = output_dir / "test-reviews"
+        reviews_dir.mkdir(parents=True)
+        impl_dir.mkdir()
+        (reviews_dir / "test-review-25-25.1-20260424_1200.md").write_text(
+            "# Timestamped test review"
+        )
+
+        resolver = TestReviewResolver([impl_dir, output_dir], max_tokens=1000)
+        result = resolver.resolve(epic_id=25, story_id="25.1")
+
+        assert len(result) == 1
+        assert "# Timestamped test review" in list(result.values())[0]
+
     def test_resolve_not_found(self, tmp_path: Path) -> None:
         """Test resolve returns empty dict if no artifacts found."""
         resolver = TestReviewResolver(tmp_path, max_tokens=1000)
@@ -254,6 +282,36 @@ class TestTraceResolver:
 
         assert len(result) == 1
         assert "# Trace matrix" in list(result.values())[0]
+
+    def test_resolve_finds_handler_generated_trace_file(self, tmp_path: Path) -> None:
+        """Test resolve finds trace files saved by TraceHandler."""
+        trace_dir = tmp_path / "traceability"
+        trace_dir.mkdir()
+        (trace_dir / "trace-25-20260425_0821.md").write_text("# Handler trace matrix")
+
+        resolver = TraceResolver(tmp_path, max_tokens=1000)
+        result = resolver.resolve(epic_id=25)
+
+        assert len(result) == 1
+        assert "# Handler trace matrix" in list(result.values())[0]
+
+    def test_resolve_finds_handler_trace_from_output_folder_fallback(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Test resolve finds trace files outside implementation-artifacts."""
+        implementation_artifacts = tmp_path / "_bmad-output" / "implementation-artifacts"
+        output_folder = tmp_path / "_bmad-output"
+        trace_dir = output_folder / "traceability"
+        implementation_artifacts.mkdir(parents=True)
+        trace_dir.mkdir(parents=True)
+        (trace_dir / "trace-25-20260425_0821.md").write_text("# Output-folder trace matrix")
+
+        resolver = TraceResolver([implementation_artifacts, output_folder], max_tokens=1000)
+        result = resolver.resolve(epic_id=25)
+
+        assert len(result) == 1
+        assert "# Output-folder trace matrix" in list(result.values())[0]
 
     def test_resolve_string_epic_id(self, tmp_path: Path) -> None:
         """Test resolve handles string epic ID (F2 Fix)."""

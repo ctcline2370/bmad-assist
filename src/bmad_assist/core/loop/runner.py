@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import signal
 import sys
 import time
 from collections.abc import Callable
@@ -75,9 +76,11 @@ from bmad_assist.core.loop.run_tracking import (
 )
 from bmad_assist.core.loop.signals import (
     _get_interrupt_exit_reason,
+    register_pre_exit_cleanup,
     register_signal_handlers,
     reset_shutdown,
     shutdown_requested,
+    unregister_pre_exit_cleanup,
     unregister_signal_handlers,
 )
 from bmad_assist.core.loop.sprint_sync import (
@@ -111,6 +114,52 @@ logger = logging.getLogger(__name__)
 # Temp file suffix for atomic writes
 _EFFECTIVE_CONFIG_TEMP_SUFFIX = ".tmp"
 _REDACTED_VALUE = "***REDACTED***"
+
+
+def _get_unresolved_code_review_action_items(outputs: dict[str, Any] | None) -> int | None:
+    """Return unresolved review action-item count from phase outputs when explicit."""
+    if not outputs:
+        return None
+
+    raw_count = outputs.get("unresolved_code_review_action_items")
+    if raw_count is None or isinstance(raw_count, bool):
+        return None
+
+    try:
+        count = int(raw_count)
+    except (TypeError, ValueError):
+        return None
+
+    if count < 0:
+        return None
+    return count
+
+
+def _map_exit_reason_to_run_status(exit_reason: LoopExitReason) -> tuple[RunStatus, str]:
+    """Map loop exit reasons to persisted run-log status values."""
+    if exit_reason == LoopExitReason.COMPLETED:
+        return (RunStatus.COMPLETED, exit_reason.value)
+    if exit_reason == LoopExitReason.CANCELLED:
+        return (RunStatus.CANCELLED, exit_reason.value)
+    if exit_reason in (LoopExitReason.INTERRUPTED_SIGINT, LoopExitReason.INTERRUPTED_SIGTERM):
+        return (RunStatus.INTERRUPTED, exit_reason.value)
+    if exit_reason == LoopExitReason.GUARDIAN_HALT:
+        return (RunStatus.HALTED, exit_reason.value)
+    if exit_reason == LoopExitReason.ERROR:
+        return (RunStatus.CRASHED, exit_reason.value)
+    logger.error("Unknown loop exit reason %s; persisting as crashed", exit_reason)
+    return (RunStatus.CRASHED, LoopExitReason.ERROR.value)
+
+
+def _signal_to_exit_reason(signum: int) -> str:
+    """Return the persisted run-log exit reason for a hard signal."""
+    if signum == signal.SIGINT:
+        return LoopExitReason.INTERRUPTED_SIGINT.value
+    if signum == signal.SIGTERM:
+        return LoopExitReason.INTERRUPTED_SIGTERM.value
+    if hasattr(signal, "SIGHUP") and signum == signal.SIGHUP:
+        return "interrupted_sighup"
+    return f"interrupted_signal_{signum}"
 
 
 def _get_dangerous_field_paths(
@@ -382,6 +431,9 @@ def run_loop(
     skip_signal_handlers: bool = False,
     ipc_enabled: bool = True,
     plain: bool = False,
+    *,
+    lifecycle_epic_list: list[EpicId] | None = None,
+    lifecycle_epic_stories_loader: Callable[[EpicId], list[str]] | None = None,
 ) -> LoopExitReason:
     """Execute the main BMAD development loop.
 
@@ -413,6 +465,11 @@ def run_loop(
             clients. Set to False via --no-ipc CLI flag.
         plain: If True, force PlainRenderer regardless of TTY detection.
             Set via --plain CLI flag.
+        lifecycle_epic_list: Optional epic scope for lifecycle validation and
+            resume checks. Defaults to ``epic_list`` when omitted.
+        lifecycle_epic_stories_loader: Optional story loader for lifecycle
+            validation and resume checks. Defaults to ``epic_stories_loader``
+            when omitted.
 
     Returns:
         LoopExitReason indicating how the loop exited:
@@ -444,6 +501,11 @@ def run_loop(
     # AC1: Validate epic_list not empty
     if not epic_list:
         raise StateError("No epics found in project")
+
+    if lifecycle_epic_list is None:
+        lifecycle_epic_list = epic_list
+    if lifecycle_epic_stories_loader is None:
+        lifecycle_epic_stories_loader = epic_stories_loader
 
     # Propagate agent_teams config to providers via env var.
     # Providers strip all CLAUDE_CODE_EXPERIMENTAL_* from child env and only
@@ -479,20 +541,6 @@ def run_loop(
         # Story 20.10: Register sprint sync callback at loop startup
         _ensure_sprint_sync_callback()
 
-        # CLI Observability: Initialize run tracking
-        run_log = RunLog(
-            cli_args=sys.argv[1:],
-            cli_args_masked=mask_cli_args(sys.argv[1:]),
-            project_path=str(project_path),
-        )
-
-        # Initial save with status=RUNNING (crash resilience)
-        try:
-            csv_enabled = os.environ.get("BMAD_CSV_OUTPUT") == "1"
-            save_run_log(run_log, project_path, as_csv=csv_enabled)
-        except Exception as e:
-            logger.warning("Failed to save initial run log: %s", e)
-
         # Story 30.1: Create renderer based on TTY detection / --plain flag
         from bmad_assist.tui import get_renderer
 
@@ -501,6 +549,34 @@ def run_loop(
 
         # Dashboard: Create lock file for process detection
         with _running_lock(project_path):
+            # Persist RUNNING only after lock acquisition succeeds so stale-lock
+            # recovery and active-lock failures cannot poison run tracking.
+            run_log = RunLog(
+                cli_args=sys.argv[1:],
+                cli_args_masked=mask_cli_args(sys.argv[1:]),
+                project_path=str(project_path),
+            )
+
+            try:
+                csv_enabled = os.environ.get("BMAD_CSV_OUTPUT") == "1"
+                save_run_log(run_log, project_path, as_csv=csv_enabled)
+            except Exception as e:
+                logger.warning("Failed to save initial run log: %s", e)
+
+            lock_path_for_signal = project_path / ".bmad-assist" / "running.lock"
+
+            def _finalize_interrupted_run(signum: int) -> None:
+                run_log.status = RunStatus.INTERRUPTED
+                run_log.exit_reason = _signal_to_exit_reason(signum)
+                run_log.ended_at = datetime.now(UTC)
+                csv_enabled = os.environ.get("BMAD_CSV_OUTPUT") == "1"
+                with contextlib.suppress(Exception):
+                    save_run_log(run_log, project_path, as_csv=csv_enabled)
+                with contextlib.suppress(FileNotFoundError, OSError):
+                    lock_path_for_signal.unlink()
+
+            register_pre_exit_cleanup(_finalize_interrupted_run)
+
             # Story 29.2: Start IPC socket server after lock acquired (PID stable)
             ipc_server = None
             if ipc_enabled:
@@ -508,19 +584,29 @@ def run_loop(
 
             try:
                 exit_reason = _run_loop_body(
-                    config, project_path, epic_list, epic_stories_loader, run_log, cancel_ctx,
+                    config,
+                    project_path,
+                    epic_list,
+                    epic_stories_loader,
+                    run_log,
+                    cancel_ctx,
+                    lifecycle_epic_list=lifecycle_epic_list,
+                    lifecycle_epic_stories_loader=lifecycle_epic_stories_loader,
                     ipc_server=ipc_server,
                 )
                 # Update run_log with final status
-                run_log.status = RunStatus.COMPLETED
+                run_log.status, run_log.exit_reason = _map_exit_reason_to_run_status(exit_reason)
                 run_log.ended_at = datetime.now(UTC)
                 return exit_reason
             except Exception:
                 # Mark run as crashed on unhandled exception
                 run_log.status = RunStatus.CRASHED
+                run_log.exit_reason = LoopExitReason.ERROR.value
                 run_log.ended_at = datetime.now(UTC)
                 raise
             finally:
+                unregister_pre_exit_cleanup(_finalize_interrupted_run)
+
                 # Story 29.2: Stop IPC server before lock release
                 if ipc_server is not None:
                     try:
@@ -595,6 +681,8 @@ def _run_loop_body(
     run_log: RunLog | None = None,
     cancel_ctx: CancellationContext | None = None,
     *,
+    lifecycle_epic_list: list[EpicId] | None = None,
+    lifecycle_epic_stories_loader: Callable[[EpicId], list[str]] | None = None,
     ipc_server: IPCServerThread | None = None,
 ) -> LoopExitReason:
     """Execute the main loop body with signal handling active.
@@ -610,6 +698,11 @@ def _run_loop_body(
         epic_stories_loader: Callable that returns story IDs for given epic.
         run_log: Optional RunLog for tracking phase invocations.
         cancel_ctx: Optional CancellationContext for dashboard integration.
+        lifecycle_epic_list: Optional epic scope for lifecycle validation and
+            resume checks. Defaults to ``epic_list`` when omitted.
+        lifecycle_epic_stories_loader: Optional story loader for lifecycle
+            validation and resume checks. Defaults to ``epic_stories_loader``
+            when omitted.
         ipc_server: Optional IPCServerThread for IPC event broadcasting.
 
     Returns:
@@ -622,6 +715,11 @@ def _run_loop_body(
 
     emitter = EventEmitter(ipc_server)
     ipc_log_handler: IPCLogHandler | None = None
+
+    if lifecycle_epic_list is None:
+        lifecycle_epic_list = epic_list
+    if lifecycle_epic_stories_loader is None:
+        lifecycle_epic_stories_loader = epic_stories_loader
 
     # Resolve state_path - stored in project directory
     state_path = get_state_path(config, project_root=project_path)
@@ -777,7 +875,11 @@ def _run_loop_body(
     # - project has existing sprint-status from previous runs (fresh start on existing project)
     # This must run AFTER fresh start initialization so we have a valid state
     state, is_project_complete = _validate_resume_against_sprint(
-        state, project_path, epic_list, epic_stories_loader, state_path
+        state,
+        project_path,
+        lifecycle_epic_list,
+        lifecycle_epic_stories_loader,
+        state_path,
     )
     if is_project_complete:
         logger.info("Project complete! All epics finished (detected on startup)")
@@ -1151,70 +1253,6 @@ def _run_loop_body(
                     message=result.error or "Unknown error",
                 )
 
-                # Check if this is a teardown phase failure (resume case)
-                # Teardown phases should warn and continue, not halt (per ADR-002)
-                teardown_phases = (
-                    [Phase(p) for p in loop_config.epic_teardown] if loop_config.epic_teardown else []
-                )
-                is_teardown_failure = state.current_phase in teardown_phases
-
-                if is_teardown_failure:
-                    # Teardown phase failure - log warning and advance to next epic
-                    logger.warning(
-                        "Teardown phase %s failed for epic %s: %s. Continuing to next epic.",
-                        state.current_phase.name if state.current_phase else "None",
-                        state.current_epic,
-                        result.error,
-                    )
-                    save_state(state, state_path)
-                    _invoke_sprint_sync(state, project_path)
-
-                    # Calculate epic timing before handle_epic_completion modifies state
-                    epic_duration_ms = get_epic_duration_ms(state)
-                    epic_stories_count = _count_epic_stories(state)
-
-                    # Advance to next epic
-                    new_state, is_project_complete = handle_epic_completion(
-                        state, epic_list, epic_stories_loader, state_path
-                    )
-
-                    # Dispatch epic_completed event (even on teardown failure)
-                    _dispatch_event(
-                        "epic_completed",
-                        project_path,
-                        state,
-                        duration_ms=epic_duration_ms,
-                        stories_completed=epic_stories_count,
-                    )
-
-                    if is_project_complete:
-                        project_duration_ms = get_project_duration_ms(state)
-                        total_stories = len(state.completed_stories) if state.completed_stories else 0
-                        _dispatch_event(
-                            "project_completed",
-                            project_path,
-                            state,
-                            duration_ms=project_duration_ms,
-                            epics_completed=len(epic_list),
-                            stories_completed=total_stories,
-                        )
-                        _invoke_sprint_sync(new_state, project_path)
-                        logger.info(
-                            "Project complete after teardown failure. All %d epics finished.",
-                            len(epic_list),
-                        )
-                        return LoopExitReason.COMPLETED
-
-                    # Continue with next epic
-                    state = new_state
-                    start_epic_timing(state)
-                    start_story_timing(state)
-                    logger.info(
-                        "Advanced to epic %s after teardown failure",
-                        state.current_epic,
-                    )
-                    continue
-
                 # Story phase failure - goes through normal guardian flow
                 # AC5: Save state FIRST (before guardian call) to preserve position
                 save_state(state, state_path)
@@ -1350,8 +1388,20 @@ def _run_loop_body(
             if current_phase == Phase.CODE_REVIEW_SYNTHESIS and result.success:
                 # Rework loop: If verdict requires rework and feature is enabled, loop back to DEV_STORY
                 verdict = result.outputs.get("verdict", "UNKNOWN") if result.outputs else "UNKNOWN"
+                unresolved_action_items = _get_unresolved_code_review_action_items(
+                    result.outputs
+                )
                 rework_verdicts = {"REJECT", "MAJOR_REWORK"}
                 if (
+                    verdict in rework_verdicts
+                    and unresolved_action_items == 0
+                ):
+                    logger.info(
+                        "Code review %s produced zero unresolved synthesis action items; "
+                        "completing story without rework",
+                        verdict,
+                    )
+                elif (
                     verdict in rework_verdicts
                     and loop_config.code_review_rework
                     and state.code_review_rework_count < loop_config.max_rework_attempts
@@ -1373,12 +1423,38 @@ def _run_loop_body(
                     )
                     save_state(state, state_path)
                     continue
-                elif verdict in rework_verdicts and loop_config.code_review_rework:
-                    logger.warning(
-                        "Code review %s but max rework attempts (%d) reached, continuing",
-                        verdict,
-                        loop_config.max_rework_attempts,
-                    )
+                elif verdict in rework_verdicts:
+                    if loop_config.fail_on_unresolved_negative_code_review:
+                        if loop_config.code_review_rework:
+                            message = (
+                                "Code review "
+                                f"{verdict} remains unresolved after max rework attempts "
+                                f"({loop_config.max_rework_attempts}); stopping run."
+                            )
+                        else:
+                            message = (
+                                "Code review "
+                                f"{verdict} remains unresolved and "
+                                "loop.code_review_rework is disabled; stopping run."
+                            )
+                        logger.error(message)
+                        raise StateError(message)
+
+                    if loop_config.code_review_rework:
+                        logger.warning(
+                            "Code review %s but max rework attempts (%d) reached, "
+                            "continuing because "
+                            "loop.fail_on_unresolved_negative_code_review=false",
+                            verdict,
+                            loop_config.max_rework_attempts,
+                        )
+                    else:
+                        logger.warning(
+                            "Code review %s with loop.code_review_rework disabled, "
+                            "continuing because "
+                            "loop.fail_on_unresolved_negative_code_review=false",
+                            verdict,
+                        )
 
                 # Archive multi-LLM artifacts (idempotent - safe if LLM already ran it)
                 _run_archive_artifacts(project_path)
@@ -1446,10 +1522,41 @@ def _run_loop_body(
                 if is_epic_complete:
                     # Run all epic teardown phases (retrospective, qa_plan_*, etc.)
                     logger.info("Epic %s stories complete, running teardown phases", state.current_epic)
-                    state, _teardown_result = _execute_epic_teardown(
+                    state, teardown_success, teardown_result = _execute_epic_teardown(
                         new_state, state_path, project_path
                     )
                     _invoke_sprint_sync(state, project_path)
+
+                    if not teardown_success:
+                        teardown_phase = (
+                            state.current_phase.name if state.current_phase else "EPIC_TEARDOWN"
+                        )
+                        teardown_message = (
+                            teardown_result.error
+                            if teardown_result and teardown_result.error
+                            else f"Epic teardown failed during {teardown_phase}"
+                        )
+                        logger.error(
+                            "Epic %s teardown failed during %s: %s",
+                            state.current_epic,
+                            teardown_phase,
+                            teardown_message,
+                        )
+                        _dispatch_event(
+                            "error_occurred",
+                            project_path,
+                            state,
+                            error_type="phase_failure",
+                            message=teardown_message,
+                        )
+                        _dispatch_event(
+                            "queue_blocked",
+                            project_path,
+                            state,
+                            reason="guardian_halt",
+                            waiting_tasks=0,
+                        )
+                        return LoopExitReason.GUARDIAN_HALT
 
                     # Story 6.6: Check for shutdown after teardown
                     if shutdown_requested():

@@ -6,16 +6,16 @@ extends: common.yaml
 phase_commands:
   - name: "Recent Implementation Commits"
     description: "Recent commits (excluding tests/docs for implementation focus)"
-    command: "git log --oneline -15"
+    command: "git log --oneline -8"
 
-  - name: "Current Branch Status"
-    description: "Current git branch and status"
-    command: "git status --short"
+  - name: "Current Branch"
+    description: "Current git branch for implementation context"
+    command: "git branch --show-current"
 
   - name: "Uncommitted Changes"
-    description: "Modified source files (not docs/tests)"
-    command: "git diff --stat"
+    description: "Modified source files (implementation-focused, capped)"
+    command: "git diff --name-only | grep -E '\\.(py|js|ts|tsx|jsx|go|rs|java|kt|cs|fs|rb|php|c|cc|cpp|h|hpp|swift|scala)$' | head -n 40 || echo '(no source changes)'"
 
   - name: "Staged Changes"
-    description: "Files staged for commit"
-    command: "git diff --cached --stat"
+    description: "Staged source files (implementation-focused, capped)"
+    command: "git diff --cached --name-only | grep -E '\\.(py|js|ts|tsx|jsx|go|rs|java|kt|cs|fs|rb|php|c|cc|cpp|h|hpp|swift|scala)$' | head -n 40 || echo '(no staged source changes)'"

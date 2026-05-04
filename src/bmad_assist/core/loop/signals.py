@@ -21,8 +21,10 @@ __all__ = [
     "request_shutdown",
     "reset_shutdown",
     "get_received_signal",
+    "register_pre_exit_cleanup",
     "register_signal_handlers",
     "unregister_signal_handlers",
+    "unregister_pre_exit_cleanup",
 ]
 
 
@@ -49,6 +51,10 @@ _ipc_signal_safe_cleanup: Callable[[], None] | None = None
 # Avoids lazy import inside signal handlers (import lock deadlock risk).
 _kill_all_child_pgids: Callable[[], None] | None = None
 
+# Best-effort cleanup registered by the active runner after acquiring the
+# process lock. The callable must not import lazily from inside the handler.
+_pre_exit_cleanup: Callable[[int], None] | None = None
+
 
 def _register_ipc_cleanup(fn: Callable[[], None]) -> None:
     """Store a reference to the IPC signal-safe cleanup function.
@@ -61,6 +67,40 @@ def _register_ipc_cleanup(fn: Callable[[], None]) -> None:
     """
     global _ipc_signal_safe_cleanup
     _ipc_signal_safe_cleanup = fn
+
+
+def register_pre_exit_cleanup(fn: Callable[[int], None]) -> None:
+    """Register best-effort cleanup to run before hard signal exit.
+
+    The signal handlers intentionally call ``os._exit`` after killing child
+    process groups, so normal ``finally`` and ``atexit`` cleanup will not run.
+    The runner uses this hook to persist the active run as interrupted and
+    remove its lock before the hard exit path continues.
+    """
+    global _pre_exit_cleanup
+    _pre_exit_cleanup = fn
+
+
+def unregister_pre_exit_cleanup(fn: Callable[[int], None] | None = None) -> None:
+    """Clear the registered pre-exit cleanup callback.
+
+    Args:
+        fn: Optional callback identity guard. When provided, cleanup is cleared
+            only if it is still the currently registered callback.
+
+    """
+    global _pre_exit_cleanup
+    if fn is None or _pre_exit_cleanup is fn:
+        _pre_exit_cleanup = None
+
+
+def _run_pre_exit_cleanup(signum: int) -> None:
+    """Run the registered pre-exit cleanup without blocking hard shutdown."""
+    if _pre_exit_cleanup is None:
+        return
+
+    with contextlib.suppress(Exception):
+        _pre_exit_cleanup(signum)
 
 
 def shutdown_requested() -> bool:
@@ -170,12 +210,16 @@ def _handle_sigint(signum: int, frame: FrameType | None) -> None:
     """
     # Story 29.6: Best-effort socket cleanup via pre-stored reference (no import)
     if _ipc_signal_safe_cleanup is not None:
-        _ipc_signal_safe_cleanup()
+        with contextlib.suppress(Exception):
+            _ipc_signal_safe_cleanup()
+
+    _run_pre_exit_cleanup(signum)
 
     # Kill child processes in separate sessions (start_new_session=True)
     # Uses pre-stored reference — no import inside handler (import lock deadlock risk)
     if _kill_all_child_pgids is not None:
-        _kill_all_child_pgids()
+        with contextlib.suppress(Exception):
+            _kill_all_child_pgids()
     # Kill our own process group
     pid = os.getpid()
     with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
@@ -198,11 +242,15 @@ def _handle_sigterm(signum: int, frame: FrameType | None) -> None:
     """
     # Story 29.6: Best-effort socket cleanup via pre-stored reference (no import)
     if _ipc_signal_safe_cleanup is not None:
-        _ipc_signal_safe_cleanup()
+        with contextlib.suppress(Exception):
+            _ipc_signal_safe_cleanup()
+
+    _run_pre_exit_cleanup(signum)
 
     # Uses pre-stored reference — no import inside handler (import lock deadlock risk)
     if _kill_all_child_pgids is not None:
-        _kill_all_child_pgids()
+        with contextlib.suppress(Exception):
+            _kill_all_child_pgids()
     pid = os.getpid()
     with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
         os.killpg(os.getpgid(pid), signal.SIGKILL)
@@ -222,11 +270,15 @@ def _handle_sighup(signum: int, frame: FrameType | None) -> None:
     """
     # Story 29.6: Best-effort socket cleanup via pre-stored reference (no import)
     if _ipc_signal_safe_cleanup is not None:
-        _ipc_signal_safe_cleanup()
+        with contextlib.suppress(Exception):
+            _ipc_signal_safe_cleanup()
+
+    _run_pre_exit_cleanup(signum)
 
     # Uses pre-stored reference — no import inside handler (import lock deadlock risk)
     if _kill_all_child_pgids is not None:
-        _kill_all_child_pgids()
+        with contextlib.suppress(Exception):
+            _kill_all_child_pgids()
     pid = os.getpid()
     with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
         os.killpg(os.getpgid(pid), signal.SIGKILL)

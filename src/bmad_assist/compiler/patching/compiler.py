@@ -31,7 +31,11 @@ from bmad_assist.compiler.patching.session import PatchSession
 from bmad_assist.compiler.patching.transforms import post_process_compiled
 from bmad_assist.compiler.patching.validation import check_threshold, validate_output
 from bmad_assist.compiler.types import WorkflowIR
-from bmad_assist.core.exceptions import CompilerError, PatchError
+from bmad_assist.core.exceptions import (
+    CompilerError,
+    NonTransientProviderPatchError,
+    PatchError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -306,6 +310,20 @@ def compile_patch(
     max_validation_retries = 3
     compiled_workflow: str | None = None
     results: list[TransformResult] = []
+    last_validation_errors: list[str] | None = None
+    repeated_validation_failures = 0
+
+    def record_validation_failure(errors: list[str]) -> bool:
+        """Return True when validation is failing deterministically."""
+        nonlocal last_validation_errors, repeated_validation_failures
+
+        if errors == last_validation_errors:
+            repeated_validation_failures += 1
+        else:
+            last_validation_errors = list(errors)
+            repeated_validation_failures = 1
+
+        return repeated_validation_failures >= 2
 
     for validation_attempt in range(max_validation_retries):
         # Add retry hint to instructions on subsequent attempts
@@ -335,6 +353,8 @@ def compile_patch(
 
         try:
             compiled_workflow, results = session.run()
+        except NonTransientProviderPatchError:
+            raise
         except PatchError:
             if validation_attempt == max_validation_retries - 1:
                 raise
@@ -353,12 +373,19 @@ def compile_patch(
         # break XML parsing later in filter_instructions()
         xml_errors = _validate_instructions_xml(compiled_workflow)
         if xml_errors:
+            current_errors = [xml_errors]
             logger.warning(
                 "XML validation failed: %s. Retry %d/%d",
                 xml_errors,
                 validation_attempt + 1,
                 max_validation_retries,
             )
+            if record_validation_failure(current_errors):
+                msg = (
+                    f"Validation failed after {validation_attempt + 1} attempts with "
+                    f"repeated identical errors: {current_errors}"
+                )
+                raise PatchError(msg)
             if validation_attempt == max_validation_retries - 1:
                 msg = f"XML validation failed after {max_validation_retries} attempts: {xml_errors}"
                 raise PatchError(msg)
@@ -374,6 +401,12 @@ def compile_patch(
                     validation_attempt + 1,
                     max_validation_retries,
                 )
+                if record_validation_failure(errors):
+                    msg = (
+                        f"Validation failed after {validation_attempt + 1} attempts with "
+                        f"repeated identical errors: {errors}"
+                    )
+                    raise PatchError(msg)
                 if validation_attempt == max_validation_retries - 1:
                     msg = f"Validation failed after {max_validation_retries} attempts: {errors}"
                     raise PatchError(msg)

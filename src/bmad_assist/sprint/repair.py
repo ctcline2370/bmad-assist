@@ -431,7 +431,7 @@ def _repair_sprint_status_impl(
 
     # Step 5: Apply state sync if state provided
     if state is not None:
-        reconciled, sync_result = sync_state_to_sprint(state, reconciled)
+        reconciled, sync_result = sync_state_to_sprint(state, reconciled, project_root)
         # Add any additional changes from sync
         changes_count += sync_result.synced_stories + sync_result.synced_epics
 

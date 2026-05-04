@@ -6,8 +6,6 @@ Bug Fix: Retrospective Report Persistence
 from datetime import UTC, datetime
 from pathlib import Path
 
-import pytest
-
 from bmad_assist.retrospective.reports import (
     extract_retrospective_report,
     save_retrospective_report,
@@ -336,13 +334,15 @@ Test content
             # Mock the parent execute to return success with response
             parent_result = PhaseResult.ok({"response": llm_output})
 
-            with patch.object(RetrospectiveHandler, "execute", wraps=handler.execute):
-                # Mock parent's execute (BaseHandler.execute)
-                with patch(
+            # Mock parent's execute (BaseHandler.execute)
+            with (
+                patch.object(RetrospectiveHandler, "execute", wraps=handler.execute),
+                patch(
                     "bmad_assist.core.loop.handlers.base.BaseHandler.execute",
                     return_value=parent_result,
-                ):
-                    result = handler.execute(state)
+                ),
+            ):
+                result = handler.execute(state)
 
             # Verify report was saved
             assert result.success
@@ -353,8 +353,8 @@ Test content
         finally:
             _reset_paths()
 
-    def test_handler_graceful_on_save_failure(self, tmp_path: Path):
-        """Handler continues even if save fails (AC #5 graceful degradation)."""
+    def test_handler_fails_when_save_fails(self, tmp_path: Path):
+        """Handler fails closed when report persistence cannot be proven."""
         from unittest.mock import MagicMock, patch
 
         from bmad_assist.core.loop.handlers.retrospective import RetrospectiveHandler
@@ -379,26 +379,28 @@ Test content
 
             parent_result = PhaseResult.ok({"response": "some output"})
 
-            with patch(
-                "bmad_assist.core.loop.handlers.base.BaseHandler.execute",
-                return_value=parent_result,
-            ):
-                # Make save fail
-                with patch(
+            # Make save fail
+            with (
+                patch(
+                    "bmad_assist.core.loop.handlers.base.BaseHandler.execute",
+                    return_value=parent_result,
+                ),
+                patch(
                     "bmad_assist.retrospective.reports.atomic_write",
                     side_effect=OSError("Disk full"),
-                ):
-                    result = handler.execute(state)
+                ),
+            ):
+                result = handler.execute(state)
 
-            # Should still succeed (graceful degradation)
-            assert result.success
-            # report_file should NOT be in outputs since save failed
+            assert not result.success
+            assert "Failed to save retrospective report" in result.error
             assert "report_file" not in result.outputs
+            assert "report_persistence_error" in result.outputs
         finally:
             _reset_paths()
 
-    def test_handler_skips_save_when_no_response(self, tmp_path: Path):
-        """Handler skips save when no response in outputs."""
+    def test_handler_fails_when_no_response(self, tmp_path: Path):
+        """Handler fails closed when the retrospective response is missing."""
         from unittest.mock import MagicMock, patch
 
         from bmad_assist.core.loop.handlers.retrospective import RetrospectiveHandler
@@ -430,7 +432,9 @@ Test content
             ):
                 result = handler.execute(state)
 
-            assert result.success
+            assert not result.success
+            assert "did not produce a response payload" in result.error
             assert "report_file" not in result.outputs
+            assert "report_persistence_error" in result.outputs
         finally:
             _reset_paths()

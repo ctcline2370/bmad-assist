@@ -525,6 +525,40 @@ class TestFindEpicFileAC2:
         assert result is not None
         assert "testarch" in result.name
 
+    def test_find_epic_file_prefers_planning_artifacts_over_impl_glob(
+        self, tmp_path: Path
+    ) -> None:
+        """Initialized planning paths beat implementation-artifact glob fallbacks."""
+        from bmad_assist.compiler.shared_utils import find_epic_file
+        from bmad_assist.core.paths import init_paths
+
+        planning_artifacts = tmp_path / "_bmad-output" / "planning-artifacts"
+        implementation_artifacts = tmp_path / "_bmad-output" / "implementation-artifacts"
+        planning_artifacts.mkdir(parents=True)
+        implementation_artifacts.mkdir(parents=True)
+
+        epics_file = planning_artifacts / "epics.md"
+        epics_file.write_text("# Epic 7\n")
+        stale_retro = implementation_artifacts / "epic-1-retro-2026-03-06.md"
+        stale_retro.write_text("# Old retro\n")
+
+        init_paths(
+            tmp_path,
+            {
+                "planning_artifacts": planning_artifacts.as_posix(),
+                "implementation_artifacts": implementation_artifacts.as_posix(),
+            },
+        )
+
+        context = CompilerContext(
+            project_root=tmp_path,
+            output_folder=implementation_artifacts,
+        )
+
+        result = find_epic_file(context, 7)
+
+        assert result == epics_file
+
 
 class TestEstimateTokensAC2:
     """Test AC2: estimate_tokens() for token estimation.

@@ -104,7 +104,7 @@ class TEAContextConfig(BaseModel):
               code_review:
                 include: [test-design]
               code_review_synthesis:
-                include: [test-review]
+                include: [atdd]
               retrospective:
                 include: [trace]
         ```
@@ -146,7 +146,7 @@ class TEAContextConfig(BaseModel):
         default_factory=lambda: {
             "dev_story": TEAContextWorkflowConfig(include=["test-design", "atdd"]),
             "code_review": TEAContextWorkflowConfig(include=["test-design"]),
-            "code_review_synthesis": TEAContextWorkflowConfig(include=["test-review"]),
+            "code_review_synthesis": TEAContextWorkflowConfig(include=["atdd"]),
             "retrospective": TEAContextWorkflowConfig(include=["trace"]),
         },
         description="Per-workflow artifact configuration",

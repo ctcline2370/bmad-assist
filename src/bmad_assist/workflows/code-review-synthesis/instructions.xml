@@ -217,6 +217,11 @@
 [Final test run output summary]
 - Tests passed: X
 - Tests failed: 0 (required for completion)
+
+## Final Review Outcome
+- **Evidence Verdict:** [PASS | REJECT | UNCERTAIN]
+- **Review Outcome:** [Approved | Changes Requested | Approved with Reservations]
+- **Action Items Created:** [number of unresolved [AI-Review] follow-up tasks appended to the story file]
 &lt;!-- CODE_REVIEW_SYNTHESIS_END --&gt;
     </output-format>
 

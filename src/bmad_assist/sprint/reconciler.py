@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING
 
+from bmad_assist.bmad.parser import is_non_epic_section_id
 from bmad_assist.sprint.classifier import EntryType
 from bmad_assist.sprint.inference import (
     InferenceConfidence,
@@ -364,6 +365,20 @@ def _extract_epic_id_from_key(key: str) -> str | int | None:
         except ValueError:
             return epic_str
     return None
+
+
+def _extract_entry_epic_id(key: str) -> str | int | None:
+    """Extract epic ID from any sprint-status entry key."""
+    if key.startswith("epic-"):
+        epic_id = key[5:]
+        if epic_id.endswith("-retrospective"):
+            epic_id = epic_id[: -len("-retrospective")]
+        try:
+            return int(epic_id)
+        except ValueError:
+            return epic_id
+
+    return _extract_epic_id_from_key(key)
 
 
 def _normalize_story_key(key: str) -> str:
@@ -772,6 +787,11 @@ def reconcile(
     # Build lookup dicts
     generated_by_key: dict[str, SprintStatusEntry] = {e.key: e for e in from_epics.entries}
     generated_keys = set(generated_by_key.keys())
+    generated_epic_ids = {
+        epic_id
+        for entry in from_epics.entries
+        if (epic_id := _extract_entry_epic_id(entry.key)) is not None
+    }
 
     # Track which epic IDs we encounter for meta recalculation
     epic_ids_seen: set[str | int] = set()
@@ -786,6 +806,30 @@ def reconcile(
     existing_epic_meta: dict[str, SprintStatusEntry] = {}
 
     for key, entry in existing.entries.items():
+        epic_id = _extract_entry_epic_id(key)
+        if (
+            from_epics.entries
+            and epic_id not in generated_epic_ids
+            and is_non_epic_section_id(epic_id)
+            and entry.entry_type in (EntryType.EPIC_META, EntryType.RETROSPECTIVE)
+        ):
+            logger.warning(
+                "Removing stale non-epic section entry from sprint-status: %s",
+                key,
+            )
+            removed_count += 1
+            changes.append(
+                StatusChange(
+                    key=key,
+                    old_status=entry.status,
+                    new_status="deferred",
+                    reason="non_epic_section_heading",
+                    confidence=None,
+                    entry_type=entry.entry_type,
+                )
+            )
+            continue
+
         if _should_preserve_entry(entry.entry_type):
             existing_preserve[key] = entry
         elif entry.entry_type == EntryType.EPIC_STORY:

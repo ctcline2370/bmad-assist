@@ -34,6 +34,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -53,9 +54,10 @@ from bmad_assist.core.config.models.providers import (
     MultiProviderConfig,
     get_phase_provider_config,
 )
-from bmad_assist.core.exceptions import BmadAssistError
+from bmad_assist.core.exceptions import BmadAssistError, ProviderTimeoutError
 from bmad_assist.core.io import get_original_cwd, save_prompt
 from bmad_assist.core.retry import invoke_with_timeout_retry
+from bmad_assist.core.timeout_artifacts import save_provider_timeout_artifact
 
 # get_paths() NOT used - validations_dir derived from project_path directly
 # to ensure reports are saved to the correct project (not CLI working directory)
@@ -65,7 +67,7 @@ from bmad_assist.core.types import EpicId
 from bmad_assist.deep_verify.core.types import DeepVerifyValidationResult
 from bmad_assist.deep_verify.integration import run_deep_verify_validation
 from bmad_assist.providers import get_provider
-from bmad_assist.providers.base import BaseProvider
+from bmad_assist.providers.base import BaseProvider, kill_all_child_pgids
 from bmad_assist.validation.anonymizer import (
     AnonymizedValidation,
     ValidationOutput,
@@ -104,6 +106,7 @@ __all__ = [
 
 # Minimum validators required for synthesis
 _MIN_VALIDATORS = 2
+_VALIDATION_SWEEP_GRACE_SECONDS = 60
 
 
 # F7 FIX: Use shared delayed_invoke instead of local duplicate
@@ -283,6 +286,87 @@ def _estimate_tokens(text: str) -> int:
     return len(text) // 4
 
 
+def _calculate_validation_sweep_timeout(
+    *,
+    timeout: int,
+    timeout_retries: int | None,
+    task_count: int,
+    max_start_delay: float,
+) -> float:
+    """Calculate a bounded wall-clock timeout for validator collection.
+
+    Each validator already has a provider-level timeout. The collector timeout
+    is a phase-level safety net so a stuck task, thread, or subprocess cannot
+    block the whole validation phase indefinitely and discard completed output.
+    """
+    if task_count <= 0:
+        return 0.0
+
+    attempt_count = 1 if timeout_retries in (None, 0) else timeout_retries + 1
+    return max_start_delay + (timeout * attempt_count) + _VALIDATION_SWEEP_GRACE_SECONDS
+
+
+async def _collect_validation_task_results(
+    tracked_tasks: list[asyncio.Task[_GatherResult]],
+    task_names: list[str],
+    *,
+    timeout_seconds: float,
+) -> list[_GatherResult | BaseException]:
+    """Collect validation tasks with partial-result preservation.
+
+    Unlike ``asyncio.gather()``, this helper returns completed results when the
+    overall validation sweep times out. Pending provider children are killed so
+    autonomous runs can move to threshold handling instead of hanging forever.
+    """
+    if not tracked_tasks:
+        return []
+
+    done, pending = await asyncio.wait(tracked_tasks, timeout=timeout_seconds)
+    results: list[_GatherResult | BaseException] = []
+
+    for task in tracked_tasks:
+        if task not in done:
+            continue
+        try:
+            results.append(task.result())
+        except BaseException as exc:
+            results.append(exc)
+
+    if not pending:
+        return results
+
+    pending_names = [
+        task_names[idx]
+        for idx, task in enumerate(tracked_tasks)
+        if task in pending and idx < len(task_names)
+    ]
+    logger.warning(
+        "Validation sweep timed out after %.1fs; cancelling %d pending task(s): %s",
+        timeout_seconds,
+        len(pending),
+        ", ".join(pending_names) if pending_names else "<unknown>",
+    )
+
+    kill_all_child_pgids()
+    for task in pending:
+        task.cancel()
+
+    settled = await asyncio.gather(*pending, return_exceptions=True)
+    for idx, result in enumerate(settled):
+        name = pending_names[idx] if idx < len(pending_names) else "<unknown>"
+        if isinstance(result, asyncio.CancelledError):
+            error_msg = f"Validation task {name} exceeded phase timeout"
+            if name.startswith("DV:"):
+                results.append(TimeoutError(error_msg))
+            else:
+                provider_id = name.split(":", 1)[-1]
+                results.append((provider_id, None, None, error_msg))
+        elif isinstance(result, BaseException):
+            results.append(result)
+
+    return results
+
+
 async def _invoke_validator(
     provider: BaseProvider,
     prompt: str,
@@ -336,6 +420,26 @@ async def _invoke_validator(
         error_message or None).
 
     """
+    cancel_token = threading.Event()
+
+    def save_timeout_attempt(
+        error: ProviderTimeoutError,
+        timeout_attempt: int,
+        will_retry: bool,
+    ) -> None:
+        if cwd is None:
+            return
+        save_provider_timeout_artifact(
+            project_path=cwd,
+            phase_name="validate_story",
+            error=error,
+            epic=epic_num,
+            story=story_num,
+            provider_id=provider_id,
+            attempt=timeout_attempt,
+            will_retry=will_retry,
+        )
+
     try:
         start_time = datetime.now(UTC)
         # Use unified run timestamp for consistency across all validators
@@ -362,6 +466,7 @@ async def _invoke_validator(
             timeout_retries=timeout_retries,
             phase_name="validate_story",
             fallback_invoke_fn=fallback_invoke_fn,
+            on_timeout=save_timeout_attempt if cwd is not None else None,
             prompt=prompt,
             model=model,
             timeout=timeout,
@@ -371,6 +476,7 @@ async def _invoke_validator(
             cwd=cwd,
             display_model=display_model,
             thinking=thinking,
+            cancel_token=cancel_token,
             reasoning_effort=reasoning_effort,
             guard=guard,
         )
@@ -393,6 +499,7 @@ async def _invoke_validator(
                 timeout_retries=timeout_retries,
                 phase_name="validate_story",
                 fallback_invoke_fn=fallback_invoke_fn,
+                on_timeout=save_timeout_attempt if cwd is not None else None,
                 prompt=prompt,
                 model=model,
                 timeout=timeout,
@@ -402,6 +509,7 @@ async def _invoke_validator(
                 cwd=cwd,
                 display_model=display_model,
                 thinking=thinking,
+                cancel_token=cancel_token,
                 reasoning_effort=reasoning_effort,
                 guard=guard,
             )
@@ -471,6 +579,11 @@ async def _invoke_validator(
                 # deterministic remains None - AC6: continue without metrics
 
         return provider_id, output, deterministic, None
+
+    except asyncio.CancelledError:
+        cancel_token.set()
+        kill_all_child_pgids()
+        raise
 
     except TimeoutError:
         error_msg = f"Validator {provider_id} timed out after {timeout}s"
@@ -581,6 +694,7 @@ async def run_validation_phase(
 
     # Type now includes DeterministicMetrics as 3rd element (AC1)
     tasks: list[asyncio.Task[_ValidatorResult]] = []
+    task_start_delays: list[float] = []
 
     # Add multi providers (from phase_models if configured, else global providers.multi)
     # Restrict tools to prevent file modification (only TodoWrite allowed)
@@ -628,6 +742,7 @@ async def run_validation_phase(
         )
         task = asyncio.create_task(delayed_invoke(delay, coro))
         tasks.append(task)
+        task_start_delays.append(delay)
 
     # Add master as validator ONLY when using global providers.multi fallback
     # When phase_models.validate_story is defined, user has full control - no auto-add
@@ -658,6 +773,7 @@ async def run_validation_phase(
         )
         master_task = asyncio.create_task(delayed_invoke(master_delay, master_coro))
         tasks.append(master_task)
+        task_start_delays.append(master_delay)
     else:
         logger.debug("phase_models.validate_story defined - master NOT auto-added")
 
@@ -677,6 +793,7 @@ async def run_validation_phase(
         )
         dv_task = asyncio.create_task(delayed_invoke(dv_delay, dv_coro))
         tasks.append(dv_task)
+        task_start_delays.append(dv_delay)
         logger.info("Deep Verify enabled - will run in parallel with validators")
 
     validator_count = len(tasks) - (1 if dv_enabled else 0)
@@ -719,12 +836,29 @@ async def run_validation_phase(
             raise
 
     tracked_tasks = [
-        track_task(i, t, task_names[i]) for i, t in enumerate(tasks)
+        asyncio.create_task(track_task(i, t, task_names[i]), name=task_names[i])
+        for i, t in enumerate(tasks)
     ]
 
-    logger.debug("GATHER_DEBUG: Waiting for %d tasks: %s", len(tracked_tasks), task_names)
-    results = await asyncio.gather(*tracked_tasks, return_exceptions=True)
-    logger.debug("GATHER_DEBUG: All tasks completed")
+    max_start_delay = max(task_start_delays, default=0.0)
+    sweep_timeout = _calculate_validation_sweep_timeout(
+        timeout=timeout,
+        timeout_retries=timeout_retries,
+        task_count=len(tasks),
+        max_start_delay=max_start_delay,
+    )
+    logger.debug(
+        "GATHER_DEBUG: Waiting up to %.1fs for %d tasks: %s",
+        sweep_timeout,
+        len(tracked_tasks),
+        task_names,
+    )
+    results = await _collect_validation_task_results(
+        tracked_tasks,
+        task_names,
+        timeout_seconds=sweep_timeout,
+    )
+    logger.debug("GATHER_DEBUG: Validation task collection completed")
 
     # Step 4: Collect successful results (now includes deterministic metrics)
     successful_outputs: list[ValidationOutput] = []

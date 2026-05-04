@@ -18,8 +18,8 @@ Tests cover:
 """
 
 import concurrent.futures
+import signal
 from pathlib import Path
-from subprocess import TimeoutExpired
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -35,7 +35,8 @@ from bmad_assist.providers.gemini import (
     PROMPT_TRUNCATE_LENGTH,
     _truncate_prompt,
 )
-from .conftest import create_gemini_mock_process, make_gemini_json_output
+
+from .conftest import create_gemini_mock_process
 
 
 class TestGeminiProviderStructure:
@@ -289,6 +290,30 @@ class TestGeminiProviderErrors:
                 provider.invoke("Hello", timeout=5)
 
             assert "timeout" in str(exc_info.value).lower()
+
+    def test_timeout_kills_registered_process_group(self, provider: GeminiProvider) -> None:
+        """Timeout kills Gemini's isolated process group, not just the parent."""
+        with (
+            patch("bmad_assist.providers.gemini.Popen") as mock_popen,
+            patch("bmad_assist.providers.gemini.os.getpgid", return_value=4321),
+            patch("bmad_assist.providers.gemini.register_child_pgid") as register_mock,
+            patch("bmad_assist.providers.gemini.unregister_child_pgid") as unregister_mock,
+            patch("bmad_assist.providers.tool_guard.os.getpgid", return_value=4321),
+            patch("bmad_assist.providers.tool_guard.os.getpgrp", return_value=9999),
+            patch("bmad_assist.providers.tool_guard.os.killpg") as killpg_mock,
+        ):
+            mock_process = create_gemini_mock_process(never_finish=True)
+            mock_process.pid = 12345
+            mock_popen.return_value = mock_process
+
+            with pytest.raises(ProviderTimeoutError):
+                provider.invoke("Hello", timeout=5)
+
+        register_mock.assert_called_once_with(4321)
+        unregister_mock.assert_called_once_with(4321)
+        killpg_mock.assert_any_call(4321, signal.SIGTERM)
+        killpg_mock.assert_any_call(4321, signal.SIGKILL)
+        mock_process.kill.assert_not_called()
 
     def test_invoke_timeout_error_includes_truncated_prompt(self, provider: GeminiProvider) -> None:
         """Test AC7: Timeout error includes prompt (truncated if > 100 chars)."""
@@ -1029,10 +1054,10 @@ class TestGeminiProviderToolRestrictions:
             assert "Write" in written_prompt
             assert "Bash" in written_prompt
 
-    def test_restricted_tool_attempt_logs_warning(
+    def test_restricted_tool_attempt_fails_closed(
         self, provider: GeminiProvider, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Test AC1: Attempting Edit tool with restrictions logs warning."""
+        """Test AC1: Attempting a restricted tool terminates the invocation."""
         import json
 
         # Build custom stdout with Edit tool event
@@ -1065,8 +1090,25 @@ class TestGeminiProviderToolRestrictions:
                     allowed_tools=["TodoWrite"],
                 )
 
-            # Verify warning was logged for restricted tool
-            assert result.exit_code == 0
+            # Verify restricted tool attempts fail closed and cannot be counted as success.
+            assert result.exit_code == -15
+            assert "restricted tool" in result.stderr.lower()
+            assert result.termination_reason == "restricted_tool:edit_file->Edit"
+            assert result.termination_info == {
+                "raw_tool_name": "edit_file",
+                "normalized_tool_name": "Edit",
+                "allowed_tools": ["TodoWrite"],
+                "restricted_tools": [
+                    "Bash",
+                    "Edit",
+                    "Glob",
+                    "Grep",
+                    "Read",
+                    "WebFetch",
+                    "WebSearch",
+                    "Write",
+                ],
+            }
             warning_logs = [
                 record
                 for record in caplog.records

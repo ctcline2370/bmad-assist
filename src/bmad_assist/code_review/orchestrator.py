@@ -32,6 +32,7 @@ import asyncio
 import json
 import logging
 import re
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -51,7 +52,11 @@ from bmad_assist.core.config.models.providers import (
     MultiProviderConfig,
     get_phase_provider_config,
 )
-from bmad_assist.core.exceptions import BmadAssistError, CompilerError
+from bmad_assist.core.exceptions import (
+    BmadAssistError,
+    CompilerError,
+    ProviderTimeoutError,
+)
 from bmad_assist.core.extraction import CODE_REVIEW_MARKERS, extract_report
 from bmad_assist.core.io import get_original_cwd, save_prompt
 from bmad_assist.core.loop.dashboard_events import (
@@ -61,6 +66,7 @@ from bmad_assist.core.loop.dashboard_events import (
 )
 from bmad_assist.core.paths import get_paths
 from bmad_assist.core.retry import invoke_with_timeout_retry
+from bmad_assist.core.timeout_artifacts import save_provider_timeout_artifact
 from bmad_assist.core.types import EpicId
 from bmad_assist.deep_verify.core.types import DeepVerifyValidationResult
 from bmad_assist.deep_verify.integration import (
@@ -69,7 +75,7 @@ from bmad_assist.deep_verify.integration import (
     save_dv_findings_for_synthesis,
 )
 from bmad_assist.providers import get_provider
-from bmad_assist.providers.base import BaseProvider
+from bmad_assist.providers.base import BaseProvider, kill_all_child_pgids
 from bmad_assist.security.agent import run_security_review
 from bmad_assist.security.integration import save_security_findings_for_synthesis
 from bmad_assist.security.report import SecurityReport
@@ -99,6 +105,7 @@ CODE_REVIEW_SYNTHESIS_WORKFLOW_ID = "code-review-synthesis"
 
 # Type alias for reviewer invocation result (reviewer_id, output, deterministic, error)
 _ReviewerResult = tuple[str, ValidationOutput | None, DeterministicMetrics | None, str | None]
+_CodeReviewGatherResult = _ReviewerResult | dict[Path, DeepVerifyValidationResult] | SecurityReport
 
 __all__ = [
     "CodeReviewError",
@@ -113,6 +120,7 @@ __all__ = [
 
 # Minimum reviewers required for synthesis
 _MIN_REVIEWERS = 2
+_CODE_REVIEW_SWEEP_GRACE_SECONDS = 60
 
 
 # F7 FIX: Use shared delayed_invoke instead of local duplicate
@@ -271,6 +279,90 @@ def _estimate_tokens(text: str) -> int:
     return len(text) // 4
 
 
+def _calculate_code_review_sweep_timeout(
+    *,
+    timeout: int,
+    timeout_retries: int | None,
+    task_count: int,
+    max_start_delay: float,
+    security_timeout: int | None = None,
+) -> float:
+    """Calculate a bounded wall-clock timeout for code review collection."""
+    if task_count <= 0:
+        return 0.0
+
+    attempt_count = 1 if timeout_retries in (None, 0) else timeout_retries + 1
+    reviewer_timeout = max_start_delay + (timeout * attempt_count)
+    task_timeout = max(reviewer_timeout, float(security_timeout or 0))
+    return task_timeout + _CODE_REVIEW_SWEEP_GRACE_SECONDS
+
+
+async def _collect_code_review_task_results(
+    tracked_tasks: list[asyncio.Task[_CodeReviewGatherResult]],
+    task_names: list[str],
+    *,
+    timeout_seconds: float,
+) -> list[_CodeReviewGatherResult | BaseException]:
+    """Collect code review tasks while preserving completed partial results."""
+    if not tracked_tasks:
+        return []
+
+    done, pending = await asyncio.wait(tracked_tasks, timeout=timeout_seconds)
+    results: list[_CodeReviewGatherResult | BaseException | None] = [
+        None for _ in tracked_tasks
+    ]
+
+    for idx, task in enumerate(tracked_tasks):
+        if task not in done:
+            continue
+        try:
+            results[idx] = task.result()
+        except BaseException as exc:
+            results[idx] = exc
+
+    if pending:
+        pending_names = [
+            task_names[idx]
+            for idx, task in enumerate(tracked_tasks)
+            if task in pending and idx < len(task_names)
+        ]
+        logger.warning(
+            "Code review sweep timed out after %.1fs; cancelling %d pending task(s): %s",
+            timeout_seconds,
+            len(pending),
+            ", ".join(pending_names) if pending_names else "<unknown>",
+        )
+
+        kill_all_child_pgids()
+        for task in pending:
+            task.cancel()
+
+        settled = await asyncio.gather(*pending, return_exceptions=True)
+        pending_tasks = list(pending)
+        for pending_idx, result in enumerate(settled):
+            task = pending_tasks[pending_idx]
+            slot = tracked_tasks.index(task)
+            name = task_names[slot] if slot < len(task_names) else "<unknown>"
+            if isinstance(result, asyncio.CancelledError):
+                error_msg = f"Code review task {name} exceeded phase timeout"
+                if name.startswith("reviewer:"):
+                    reviewer_id = name.split(":", 1)[1]
+                    results[slot] = (reviewer_id, None, None, error_msg)
+                else:
+                    results[slot] = TimeoutError(error_msg)
+            elif isinstance(result, BaseException):
+                results[slot] = result
+            else:
+                results[slot] = result
+
+    for idx, result in enumerate(results):
+        if result is None:
+            name = task_names[idx] if idx < len(task_names) else "<unknown>"
+            results[idx] = TimeoutError(f"Code review task {name} did not produce a result")
+
+    return list(results)
+
+
 def _extract_code_review_report(raw_output: str) -> str:
     """Extract code review report from raw LLM output.
 
@@ -337,6 +429,26 @@ async def _invoke_reviewer(
         error_message or None).
 
     """
+    cancel_token = threading.Event()
+
+    def save_timeout_attempt(
+        error: ProviderTimeoutError,
+        timeout_attempt: int,
+        will_retry: bool,
+    ) -> None:
+        if cwd is None:
+            return
+        save_provider_timeout_artifact(
+            project_path=cwd,
+            phase_name="code_review",
+            error=error,
+            epic=epic_num,
+            story=story_num,
+            provider_id=reviewer_id,
+            attempt=timeout_attempt,
+            will_retry=will_retry,
+        )
+
     try:
         start_time = datetime.now(UTC)
         review_timestamp = run_timestamp or start_time
@@ -361,6 +473,7 @@ async def _invoke_reviewer(
             timeout_retries=timeout_retries,
             phase_name="code_review",
             fallback_invoke_fn=fallback_invoke_fn,
+            on_timeout=save_timeout_attempt if cwd is not None else None,
             prompt=prompt,
             model=model,
             timeout=timeout,
@@ -370,6 +483,7 @@ async def _invoke_reviewer(
             cwd=cwd,
             display_model=display_model,
             thinking=thinking,
+            cancel_token=cancel_token,
             reasoning_effort=reasoning_effort,
             guard=guard,
         )
@@ -392,6 +506,7 @@ async def _invoke_reviewer(
                 timeout_retries=timeout_retries,
                 phase_name="code_review",
                 fallback_invoke_fn=fallback_invoke_fn,
+                on_timeout=save_timeout_attempt if cwd is not None else None,
                 prompt=prompt,
                 model=model,
                 timeout=timeout,
@@ -401,6 +516,7 @@ async def _invoke_reviewer(
                 cwd=cwd,
                 display_model=display_model,
                 thinking=thinking,
+                cancel_token=cancel_token,
                 reasoning_effort=reasoning_effort,
                 guard=guard,
             )
@@ -469,6 +585,11 @@ async def _invoke_reviewer(
                 # deterministic remains None - continue without metrics
 
         return reviewer_id, output, deterministic, None
+
+    except asyncio.CancelledError:
+        cancel_token.set()
+        kill_all_child_pgids()
+        raise
 
     except TimeoutError:
         error_msg = f"Reviewer {reviewer_id} timed out after {timeout}s"
@@ -697,6 +818,8 @@ async def run_code_review_phase(
         logger.debug("Benchmarking enabled - will collect metrics")
 
     tasks: list[asyncio.Task[_ReviewerResult]] = []
+    task_names: list[str] = []
+    max_start_delay = 0.0
 
     # [NEW] Add Deep Verify tasks for code files
     dv_enabled = (
@@ -766,6 +889,7 @@ async def run_code_review_phase(
         # Staggered start: each task waits idx * delay before starting
         # Parse delay at runtime for each task (randomization per-call if range configured)
         delay = parse_parallel_delay(config.parallel_delay) * idx
+        max_start_delay = max(max_start_delay, delay)
         coro = _invoke_reviewer(
             provider,
             prompt,
@@ -788,6 +912,7 @@ async def run_code_review_phase(
         )
         task = asyncio.create_task(delayed_invoke(delay, coro))
         tasks.append(task)
+        task_names.append(f"reviewer:{reviewer_id}")
 
     # Add master as reviewer ONLY when using global providers.multi fallback
     # When phase_models.code_review is defined, user has full control - no auto-add
@@ -798,6 +923,7 @@ async def run_code_review_phase(
         master_color_index = len(multi_configs)
         # Staggered start for master: uses next index after all multi configs
         master_delay = parse_parallel_delay(config.parallel_delay) * master_color_index
+        max_start_delay = max(max_start_delay, master_delay)
         master_coro = _invoke_reviewer(
             master_provider,
             prompt,
@@ -818,11 +944,13 @@ async def run_code_review_phase(
         )
         master_task = asyncio.create_task(delayed_invoke(master_delay, master_coro))
         tasks.append(master_task)
+        task_names.append(f"reviewer:{master_id}")
     else:
         logger.debug("phase_models.code_review defined - master NOT auto-added")
 
     # [NEW] Add Security Agent task (parallel with reviewers and DV)
     security_task: asyncio.Task[SecurityReport] | None = None
+    security_timeout_for_sweep: int | None = None
     security_enabled = config.security_agent.enabled
     if security_enabled:
         try:
@@ -841,6 +969,7 @@ async def run_code_review_phase(
                 "patterns_loaded_count", 0
             )
             security_timeout = get_phase_timeout(config, "security_review")
+            security_timeout_for_sweep = security_timeout
             security_coro = run_security_review(
                 config=config,
                 project_path=project_path,
@@ -862,11 +991,31 @@ async def run_code_review_phase(
 
     # Step 3: Run all reviewers (and DV batch + security tasks) in parallel
     all_tasks: list[asyncio.Task[Any]] = list(tasks)
+    all_task_names = list(task_names)
     if dv_batch_task is not None:
         all_tasks.append(dv_batch_task)
+        all_task_names.append("DV:batch")
     if security_task is not None:
         all_tasks.append(security_task)
-    results = await asyncio.gather(*all_tasks, return_exceptions=True)
+        all_task_names.append("security:review")
+
+    sweep_timeout = _calculate_code_review_sweep_timeout(
+        timeout=timeout,
+        timeout_retries=timeout_retries,
+        task_count=len(all_tasks),
+        max_start_delay=max_start_delay,
+        security_timeout=security_timeout_for_sweep,
+    )
+    logger.info(
+        "Code review sweep timeout set to %.1fs for %d task(s)",
+        sweep_timeout,
+        len(all_tasks),
+    )
+    results = await _collect_code_review_task_results(
+        all_tasks,
+        all_task_names,
+        timeout_seconds=sweep_timeout,
+    )
 
     # Split results: regular reviewers vs DV batch vs security
     reviewer_results: list[_ReviewerResult | BaseException] = results[: len(tasks)]

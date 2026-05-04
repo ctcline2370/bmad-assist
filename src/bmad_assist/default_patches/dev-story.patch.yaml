@@ -208,6 +208,20 @@ post_process:
     replacement: ""
     flags: ""
 
+  # Normalize common LLM punctuation/case variants before exact phrase validation.
+  - pattern: '\bred\s*(?:[-/]\s*|\s+)green\s*(?:[-/]\s*|\s+)refactor\b'
+    replacement: "red-green-refactor"
+    flags: "IGNORECASE"
+
+  # Preserve the TDD cycle contract even when the LLM omits the exact marker.
+  - pattern: '(<step\s+n="2"\s+goal="(?![^"]*red-green-refactor)(?=[^"]*[Ii]mplement)[^"]*)(")'
+    replacement: '\1 following red-green-refactor cycle\2'
+    flags: ""
+
+  - pattern: '(<action>(?![^<]*red-green-refactor)(?=[^<]*[Pp]lan implementation)[^<]*)(</action>)'
+    replacement: '\1 following red-green-refactor cycle\2'
+    flags: ""
+
 validation:
   must_contain:
     - "<step"

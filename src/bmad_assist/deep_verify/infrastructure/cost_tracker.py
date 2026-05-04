@@ -24,8 +24,8 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 # Pricing per 1M tokens (input, output) in USD
-# Source: https://www.anthropic.com/pricing, https://openai.com/pricing
-# Last updated: 2026-02-04
+# Source: https://www.anthropic.com/pricing, https://openai.com/api/pricing/
+# Last updated: 2026-04-24
 MODEL_PRICING: dict[str, tuple[float, float]] = {
     # model_id: (input_price_per_1m, output_price_per_1m)
     # Anthropic Claude models
@@ -36,6 +36,9 @@ MODEL_PRICING: dict[str, tuple[float, float]] = {
     "sonnet": (3.00, 15.00),  # Alias for Claude 3 Sonnet
     "opus": (15.00, 75.00),  # Alias for Claude 3 Opus
     # OpenAI models
+    "gpt-5.5": (5.00, 30.00),  # GPT-5.5
+    "gpt-5.5-pro": (15.00, 120.00),  # GPT-5.5 pro
+    "gpt-5.4-mini": (0.20, 1.60),  # GPT-5.4 mini
     "gpt-4o": (5.00, 15.00),  # GPT-4o
     "gpt-4o-mini": (0.15, 0.60),  # GPT-4o Mini
     "gpt-4-turbo": (10.00, 30.00),  # GPT-4 Turbo

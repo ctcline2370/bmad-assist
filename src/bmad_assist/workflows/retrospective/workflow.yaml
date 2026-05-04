@@ -52,6 +52,6 @@ input_file_patterns:
 # Required files
 sprint_status_file: "{implementation_artifacts}/sprint-status.yaml"
 story_directory: "{implementation_artifacts}"
-retrospectives_folder: "{implementation_artifacts}"
+retrospectives_folder: "{implementation_artifacts}/retrospectives"
 
 standalone: true

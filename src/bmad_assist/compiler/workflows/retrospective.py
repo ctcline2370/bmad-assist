@@ -19,6 +19,7 @@ from bmad_assist.compiler.output import generate_output
 from bmad_assist.compiler.shared_utils import (
     apply_post_process,
     context_snapshot,
+    estimate_tokens,
     find_file_in_planning_dir,
     find_project_context_file,
     find_sprint_status_file,
@@ -28,7 +29,7 @@ from bmad_assist.compiler.shared_utils import (
 from bmad_assist.compiler.types import CompiledWorkflow, CompilerContext, WorkflowIR
 from bmad_assist.compiler.variable_utils import substitute_variables
 from bmad_assist.compiler.variables import resolve_variables
-from bmad_assist.core.exceptions import CompilerError
+from bmad_assist.core.exceptions import CompilerError, ConfigError
 from bmad_assist.testarch.context import collect_tea_context
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,8 @@ _WORKFLOW_RELATIVE_PATH = "_bmad/bmm/workflows/4-implementation/retrospective"
 
 # Pattern for story files
 _STORY_FILE_PATTERN = re.compile(r"^(\d+)-(\d+)-.+\.md$")
+
+RETROSPECTIVE_CONTEXT_HARD_CAP_TOKENS = 45000
 
 
 class RetrospectiveCompiler:
@@ -208,11 +211,6 @@ class RetrospectiveCompiler:
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug("Resolved %d variables", len(resolved))
 
-            context_files = self._build_context_files(context, resolved)
-
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("Built context with %d files", len(context_files))
-
             filtered_instructions = filter_instructions(workflow_ir)
             filtered_instructions = substitute_variables(filtered_instructions, resolved)
 
@@ -220,6 +218,15 @@ class RetrospectiveCompiler:
                 logger.debug("Filtered instructions: %d bytes", len(filtered_instructions))
 
             mission = self._build_mission(workflow_ir, resolved)
+            context_files = self._build_context_files(
+                context,
+                resolved,
+                mission=mission,
+                filtered_instructions=filtered_instructions,
+            )
+
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("Built context with %d files", len(context_files))
 
             compiled = CompiledWorkflow(
                 workflow_name=self.workflow_name,
@@ -247,13 +254,16 @@ class RetrospectiveCompiler:
                 variables=resolved,
                 instructions=filtered_instructions,
                 output_template="",
-                token_estimate=result.token_estimate,
+                token_estimate=estimate_tokens(final_xml),
             )
 
     def _build_context_files(
         self,
         context: CompilerContext,
         resolved: dict[str, Any],
+        *,
+        mission: str | None = None,
+        filtered_instructions: str | None = None,
     ) -> dict[str, str]:
         """Build context files dict with recency-bias ordering.
 
@@ -269,12 +279,110 @@ class RetrospectiveCompiler:
         Args:
             context: Compilation context with paths.
             resolved: Resolved variables containing epic_num.
+            mission: Compiled mission text when prompt-aware token estimation is needed.
+            filtered_instructions: Filtered workflow instructions for prompt-aware sizing.
 
         Returns:
             Dictionary mapping file paths to content, ordered by recency-bias.
 
         """
-        files: dict[str, str] = {}
+        (
+            project_context_files,
+            architecture_files,
+            prd_files,
+            epic_files,
+            sprint_status_files,
+            story_files,
+            tea_files,
+            previous_retro_files,
+        ) = self._build_context_sections(context, resolved)
+
+        files = self._merge_context_sections(
+            project_context_files,
+            architecture_files,
+            prd_files,
+            epic_files,
+            sprint_status_files,
+            story_files,
+            tea_files,
+            previous_retro_files,
+        )
+
+        token_cap = self._get_context_token_cap()
+        total_tokens = self._estimate_prompt_tokens(
+            context,
+            resolved,
+            files,
+            mission=mission,
+            filtered_instructions=filtered_instructions,
+        )
+        if total_tokens <= token_cap:
+            return files
+
+        logger.warning(
+            "Retrospective context exceeded operational cap: %d tokens (cap=%d). "
+            "Pruning optional context.",
+            total_tokens,
+            token_cap,
+        )
+        pruned_files, pruned_tokens, dropped_sections, dropped_story_files = self._prune_context_files(
+            project_context_files,
+            architecture_files,
+            prd_files,
+            epic_files,
+            sprint_status_files,
+            story_files,
+            tea_files,
+            previous_retro_files,
+            token_cap,
+            context=context,
+            resolved=resolved,
+            mission=mission,
+            filtered_instructions=filtered_instructions,
+        )
+        if pruned_tokens > token_cap:
+            dropped_story_summary = ", ".join(dropped_story_files) or "none"
+            raise CompilerError(
+                "retrospective context still exceeds the operational cap after pruning "
+                f"optional sections ({', '.join(dropped_sections) or 'none'}): "
+                f"{pruned_tokens} tokens > {token_cap}. "
+                f"Dropped story files: {dropped_story_summary}. "
+                "Reduce retrospective context or trim epic story artifacts before invoking the provider."
+            )
+
+        dropped_story_summary = ", ".join(dropped_story_files) or "none"
+        logger.info(
+            "Retrospective context pruned to %d tokens after dropping optional sections: %s; "
+            "dropped story files: %s",
+            pruned_tokens,
+            ", ".join(dropped_sections) or "none",
+            dropped_story_summary,
+        )
+        return pruned_files
+
+    def _build_context_sections(
+        self,
+        context: CompilerContext,
+        resolved: dict[str, Any],
+    ) -> tuple[
+        dict[str, str],
+        dict[str, str],
+        dict[str, str],
+        dict[str, str],
+        dict[str, str],
+        dict[str, str],
+        dict[str, str],
+        dict[str, str],
+    ]:
+        """Build ordered retrospective context sections before budget enforcement."""
+        project_context_files: dict[str, str] = {}
+        architecture_files: dict[str, str] = {}
+        prd_files: dict[str, str] = {}
+        epic_files: dict[str, str] = {}
+        sprint_status_files: dict[str, str] = {}
+        story_files: dict[str, str] = {}
+        tea_files: dict[str, str] = {}
+        previous_retro_files: dict[str, str] = {}
         project_root = context.project_root
 
         # 1. Project context (general)
@@ -282,21 +390,21 @@ class RetrospectiveCompiler:
         if project_context_path:
             content = safe_read_file(project_context_path, project_root)
             if content:
-                files[str(project_context_path)] = content
+                project_context_files[str(project_context_path)] = content
 
         # 2. Architecture (technical constraints)
         arch_path = find_file_in_planning_dir(context, "*architecture*.md")
         if arch_path:
             content = safe_read_file(arch_path, project_root)
             if content:
-                files[str(arch_path)] = content
+                architecture_files[str(arch_path)] = content
 
         # 3. PRD (product requirements)
         prd_path = find_file_in_planning_dir(context, "*prd*.md")
         if prd_path:
             content = safe_read_file(prd_path, project_root)
             if content:
-                files[str(prd_path)] = content
+                prd_files[str(prd_path)] = content
 
         # 4. Epic file
         epic_num = resolved.get("epic_num")
@@ -305,23 +413,22 @@ class RetrospectiveCompiler:
             if epic_path:
                 content = safe_read_file(epic_path, project_root)
                 if content:
-                    files[str(epic_path)] = content
+                    epic_files[str(epic_path)] = content
 
         # 5. Sprint status
         sprint_status_path = find_sprint_status_file(context)
         if sprint_status_path:
             content = safe_read_file(sprint_status_path, project_root)
             if content:
-                files[str(sprint_status_path)] = content
+                sprint_status_files[str(sprint_status_path)] = content
 
         # 6. Story files for this epic
         if epic_num is not None:
-            story_files = self._collect_story_files(context, epic_num)
-            files.update(story_files)
+            story_files.update(self._collect_story_files(context, epic_num))
 
         # 6b. TEA Context (trace matrix) for traceability review
         # F19 Fix: Trace matrix may not exist on first retrospective (created BY trace workflow)
-        files.update(collect_tea_context(context, "retrospective", resolved))
+        tea_files.update(collect_tea_context(context, "retrospective", resolved))
 
         # 7. Previous retrospective (LAST - closest to instructions)
         prev_epic_num = resolved.get("prev_epic_num")
@@ -330,9 +437,174 @@ class RetrospectiveCompiler:
             if prev_retro_path:
                 content = safe_read_file(prev_retro_path, project_root)
                 if content:
-                    files[str(prev_retro_path)] = content
+                    previous_retro_files[str(prev_retro_path)] = content
 
-        return files
+        return (
+            project_context_files,
+            architecture_files,
+            prd_files,
+            epic_files,
+            sprint_status_files,
+            story_files,
+            tea_files,
+            previous_retro_files,
+        )
+
+    def _merge_context_sections(self, *sections: dict[str, str]) -> dict[str, str]:
+        """Merge ordered context sections while preserving recency-bias."""
+        merged: dict[str, str] = {}
+        for section in sections:
+            merged.update(section)
+        return merged
+
+    def _estimate_context_tokens(self, files: dict[str, str]) -> int:
+        """Estimate total token count for assembled context files."""
+        return sum(estimate_tokens(content) for content in files.values())
+
+    def _estimate_prompt_tokens(
+        self,
+        context: CompilerContext,
+        resolved: dict[str, Any],
+        files: dict[str, str],
+        *,
+        mission: str | None = None,
+        filtered_instructions: str | None = None,
+    ) -> int:
+        """Estimate final retrospective prompt tokens for the assembled payload."""
+        if mission is None or filtered_instructions is None:
+            return self._estimate_context_tokens(files)
+
+        compiled = CompiledWorkflow(
+            workflow_name=self.workflow_name,
+            mission=mission,
+            context="",
+            variables=resolved,
+            instructions=filtered_instructions,
+            output_template="",
+            token_estimate=0,
+        )
+        result = generate_output(
+            compiled,
+            project_root=context.project_root,
+            context_files=files,
+            links_only=context.links_only,
+        )
+        final_xml = apply_post_process(result.xml, context)
+        return estimate_tokens(final_xml)
+
+    def _get_context_token_cap(self) -> int:
+        """Return the effective operational token cap for retrospective context."""
+        try:
+            from bmad_assist.core.config.loaders import get_config
+
+            config = get_config()
+            budgets = getattr(getattr(config, "compiler", None), "source_context", None)
+            budget_config = getattr(budgets, "budgets", None)
+            if budget_config is not None:
+                configured_budget = budget_config.get_budget("retrospective")
+                if isinstance(configured_budget, int) and configured_budget > 0:
+                    return min(configured_budget, RETROSPECTIVE_CONTEXT_HARD_CAP_TOKENS)
+        except ConfigError:
+            logger.debug(
+                "Falling back to retrospective hard cap because config could not be loaded."
+            )
+
+        return RETROSPECTIVE_CONTEXT_HARD_CAP_TOKENS
+
+    def _prune_context_files(
+        self,
+        project_context_files: dict[str, str],
+        architecture_files: dict[str, str],
+        prd_files: dict[str, str],
+        epic_files: dict[str, str],
+        sprint_status_files: dict[str, str],
+        story_files: dict[str, str],
+        tea_files: dict[str, str],
+        previous_retro_files: dict[str, str],
+        token_cap: int,
+        *,
+        context: CompilerContext,
+        resolved: dict[str, Any],
+        mission: str | None = None,
+        filtered_instructions: str | None = None,
+    ) -> tuple[dict[str, str], int, list[str], list[str]]:
+        """Prune low-value retrospective context before provider invocation."""
+        optional_sections: list[tuple[str, dict[str, str]]] = [
+            ("previous-retrospective", previous_retro_files),
+            ("project-context", project_context_files),
+            ("architecture", architecture_files),
+            ("prd", prd_files),
+        ]
+        dropped_sections: list[str] = []
+        dropped_story_files: list[str] = []
+
+        candidate_files = self._merge_context_sections(
+            project_context_files,
+            architecture_files,
+            prd_files,
+            epic_files,
+            sprint_status_files,
+            story_files,
+            tea_files,
+            previous_retro_files,
+        )
+        candidate_tokens = self._estimate_prompt_tokens(
+            context,
+            resolved,
+            candidate_files,
+            mission=mission,
+            filtered_instructions=filtered_instructions,
+        )
+        if candidate_tokens <= token_cap:
+            return candidate_files, candidate_tokens, dropped_sections, dropped_story_files
+
+        for section_name, _ in optional_sections:
+            dropped_sections.append(section_name)
+            candidate_files = self._merge_context_sections(
+                {} if "project-context" in dropped_sections else project_context_files,
+                {} if "architecture" in dropped_sections else architecture_files,
+                {} if "prd" in dropped_sections else prd_files,
+                epic_files,
+                sprint_status_files,
+                story_files,
+                tea_files,
+                {} if "previous-retrospective" in dropped_sections else previous_retro_files,
+            )
+            candidate_tokens = self._estimate_prompt_tokens(
+                context,
+                resolved,
+                candidate_files,
+                mission=mission,
+                filtered_instructions=filtered_instructions,
+            )
+            if candidate_tokens <= token_cap:
+                return candidate_files, candidate_tokens, dropped_sections, dropped_story_files
+
+        remaining_story_items = list(story_files.items())
+        while remaining_story_items and candidate_tokens > token_cap:
+            dropped_path, _ = remaining_story_items.pop(0)
+            dropped_story_files.append(dropped_path)
+            candidate_files = self._merge_context_sections(
+                {} if "project-context" in dropped_sections else project_context_files,
+                {} if "architecture" in dropped_sections else architecture_files,
+                {} if "prd" in dropped_sections else prd_files,
+                epic_files,
+                sprint_status_files,
+                dict(remaining_story_items),
+                tea_files,
+                {} if "previous-retrospective" in dropped_sections else previous_retro_files,
+            )
+            candidate_tokens = self._estimate_prompt_tokens(
+                context,
+                resolved,
+                candidate_files,
+                mission=mission,
+                filtered_instructions=filtered_instructions,
+            )
+            if candidate_tokens <= token_cap:
+                return candidate_files, candidate_tokens, dropped_sections, dropped_story_files
+
+        return candidate_files, candidate_tokens, dropped_sections, dropped_story_files
 
     def _find_epic_file(self, context: CompilerContext, epic_num: Any) -> Path | None:
         """Find epic file by number.
@@ -423,16 +695,15 @@ class RetrospectiveCompiler:
         if impl_artifacts is None:
             return None
 
-        retro_dir = impl_artifacts / "retrospectives"
-        if not retro_dir.exists():
-            return None
-
         # Find most recent retro for previous epic
         pattern = f"epic-{prev_epic_num}-retro-*.md"
-        retros = sorted(retro_dir.glob(pattern), reverse=True)
-
-        if retros:
-            return retros[0]
+        search_dirs = [impl_artifacts / "retrospectives", impl_artifacts]
+        for retro_dir in search_dirs:
+            if not retro_dir.exists():
+                continue
+            retros = sorted(retro_dir.glob(pattern), reverse=True)
+            if retros:
+                return retros[0]
 
         return None
 

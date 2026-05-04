@@ -22,6 +22,8 @@ import pytest
 from bmad_assist.bmad.parser import (
     EpicDocument,
     EpicStory,
+    extract_epic_markdown,
+    extract_markdown_sections,
     parse_epic_file,
 )
 
@@ -390,6 +392,78 @@ total_epics: 2
         assert len(result.stories) == 2
         assert result.stories[0].number == "2.1"
         assert result.stories[1].number == "1.1"
+
+
+class TestMarkdownExtractionHelpers:
+    """Tests for helper extraction utilities used by create-story."""
+
+    def test_extract_epic_markdown_returns_target_block(self) -> None:
+        """Extracts only the requested epic from consolidated markdown."""
+        content = """# Epic 1: Project Foundation
+
+## Story 1.1: Initialize Project
+
+Alpha content.
+
+# Epic 2: BMAD File Integration
+
+## Story 2.1: Markdown Frontmatter Parser
+
+Beta content.
+"""
+
+        extracted = extract_epic_markdown(content, 2)
+
+        assert extracted is not None
+        assert extracted.startswith("# Epic 2: BMAD File Integration")
+        assert "## Story 2.1: Markdown Frontmatter Parser" in extracted
+        assert "# Epic 1: Project Foundation" not in extracted
+
+    def test_extract_markdown_sections_preserves_source_order(self) -> None:
+        """Selected sections preserve original document order."""
+        content = """## Story
+
+Story body.
+
+## Acceptance Criteria
+
+- AC 1
+
+### File List
+
+- `src/example.py`
+"""
+
+        extracted = extract_markdown_sections(
+            content,
+            ["Acceptance Criteria", "Story", "File List"],
+        )
+
+        assert extracted.index("## Story") < extracted.index("## Acceptance Criteria")
+        assert extracted.index("## Acceptance Criteria") < extracted.index("### File List")
+
+    def test_extract_markdown_sections_avoids_nested_duplication(self) -> None:
+        """Parent sections win when parent and child headings are both requested."""
+        content = """## Story
+
+Story body.
+
+### Completion Notes List
+
+- implemented
+
+## Acceptance Criteria
+
+- AC 1
+"""
+
+        extracted = extract_markdown_sections(
+            content,
+            ["Story", "Completion Notes List"],
+        )
+
+        assert extracted.count("### Completion Notes List") == 1
+        assert extracted.startswith("## Story")
 
 
 class TestDependencyExtraction:

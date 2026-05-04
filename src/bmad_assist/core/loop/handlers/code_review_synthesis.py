@@ -18,6 +18,7 @@ has write permission to modify the story file.
 
 import json
 import logging
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -29,17 +30,90 @@ from bmad_assist.code_review.orchestrator import (
 )
 from bmad_assist.compiler import compile_workflow
 from bmad_assist.compiler.types import CompilerContext
-from bmad_assist.core.exceptions import ConfigError
+from bmad_assist.core.exceptions import ConfigError, ProviderTimeoutError
 from bmad_assist.core.io import get_original_cwd
 from bmad_assist.core.loop.handlers.base import BaseHandler, check_for_edit_failures
 from bmad_assist.core.loop.types import PhaseResult
 from bmad_assist.core.paths import get_paths
 from bmad_assist.core.state import State
+from bmad_assist.core.timeout_artifacts import save_provider_timeout_artifact
 from bmad_assist.core.types import EpicId
 from bmad_assist.security.integration import load_security_findings_from_cache
 from bmad_assist.validation.reports import extract_synthesis_report
 
 logger = logging.getLogger(__name__)
+
+_ACTION_ITEMS_CREATED_RE = re.compile(
+    r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?Action Items Created(?:\*\*)?\s*:\s*(?:\*\*)?\s*(\d+)\b"
+)
+_UNCHECKED_AI_REVIEW_TASK_RE = re.compile(
+    r"(?im)^\s*[-*]\s+\[\s\]\s*(?:\[[^\]\r\n]+\]\s*)*\[AI-Review\](?=\s|\[|:)"
+)
+_SENIOR_REVIEW_HEADING_RE = re.compile(
+    r"(?im)^##\s+Senior Developer Review \(AI\)\s*$"
+)
+_MARKDOWN_H2_RE = re.compile(r"(?m)^##\s+")
+
+
+def extract_unresolved_code_review_action_items(synthesis_content: str) -> int | None:
+    """Return explicit unresolved code-review action item count from synthesis output.
+
+    ``Action Items Created`` is the contract emitted by the code-review
+    synthesis workflow for unresolved review follow-ups. If the explicit count
+    is absent, only positive unchecked ``[AI-Review]`` tasks are inferred; zero
+    unresolved items must be explicit so the runner fails closed on ambiguous
+    negative verdicts.
+    """
+    if not synthesis_content.strip():
+        return None
+
+    action_count_matches = list(_ACTION_ITEMS_CREATED_RE.finditer(synthesis_content))
+    if action_count_matches:
+        return int(action_count_matches[-1].group(1))
+
+    unchecked_review_tasks = _UNCHECKED_AI_REVIEW_TASK_RE.findall(synthesis_content)
+    if unchecked_review_tasks:
+        return len(unchecked_review_tasks)
+
+    return None
+
+
+def extract_latest_story_review_action_items(
+    story_content: str,
+    previous_story_content: str | None = None,
+) -> int | None:
+    """Return the latest newly appended story review action-item count.
+
+    Code-review synthesis is instructed to append a ``Senior Developer Review
+    (AI)`` section to the story file. The synthesis report should carry the
+    same action-item count, but older prompts only wrote it to the story. This
+    fallback is intentionally conservative: when a previous snapshot is
+    provided, it only trusts the story file if a new Senior Developer Review
+    section appeared during the current synthesis run.
+    """
+    if not story_content.strip():
+        return None
+
+    review_sections_after = list(_SENIOR_REVIEW_HEADING_RE.finditer(story_content))
+    if not review_sections_after:
+        return None
+
+    if previous_story_content is not None:
+        if story_content == previous_story_content:
+            return None
+        review_sections_before = list(_SENIOR_REVIEW_HEADING_RE.finditer(previous_story_content))
+        if len(review_sections_after) <= len(review_sections_before):
+            return None
+
+    latest_start = review_sections_after[-1].start()
+    next_h2 = _MARKDOWN_H2_RE.search(story_content, pos=latest_start + 1)
+    latest_section = (
+        story_content[latest_start : next_h2.start()]
+        if next_h2
+        else story_content[latest_start:]
+    )
+
+    return extract_unresolved_code_review_action_items(latest_section)
 
 
 class CodeReviewSynthesisHandler(BaseHandler):
@@ -321,6 +395,35 @@ class CodeReviewSynthesisHandler(BaseHandler):
         logger.debug("Found latest code review session: %s", session_id)
         return session_id
 
+    def _read_story_file_for_action_item_reconciliation(
+        self,
+        epic_num: EpicId,
+        story_num: int | str,
+    ) -> str | None:
+        """Read the active story file for action-item count reconciliation."""
+        try:
+            paths = get_paths()
+        except RuntimeError:
+            stories_dir = self.project_path / "_bmad-output" / "implementation-artifacts"
+        else:
+            stories_dir = paths.stories_dir
+
+        if not stories_dir.exists():
+            return None
+
+        matches = sorted(stories_dir.glob(f"{epic_num}-{story_num}-*.md"))
+        if not matches:
+            return None
+
+        try:
+            return matches[0].read_text(encoding="utf-8")
+        except OSError as e:
+            logger.warning(
+                "Unable to read story file for action-item reconciliation: %s",
+                e,
+            )
+            return None
+
     def render_prompt(self, state: State) -> str:
         """Render synthesis prompt with code review data.
 
@@ -406,7 +509,11 @@ class CodeReviewSynthesisHandler(BaseHandler):
 
         synthesis_config = self.config.compiler.synthesis
         base_tokens = estimate_base_context_tokens(
-            self.project_path, self.config, "code_review_synthesis"
+            self.project_path,
+            self.config,
+            "code_review_synthesis",
+            epic_num=epic_num,
+            story_num=story_num,
         )
         total_tokens = estimate_synthesis_tokens(
             anonymized_reviews, base_tokens, synthesis_config.safety_factor
@@ -468,6 +575,25 @@ class CodeReviewSynthesisHandler(BaseHandler):
                     synthesis_config.max_compression_timeout // max(expected_calls, 1),
                     30,
                 )
+                extraction_provider_id = (
+                    f"{getattr(ext_provider, 'provider_name', 'unknown')}-{ext_model}"
+                )
+
+                def save_timeout_attempt(
+                    error: ProviderTimeoutError,
+                    timeout_attempt: int,
+                    will_retry: bool,
+                ) -> None:
+                    save_provider_timeout_artifact(
+                        project_path=self.project_path,
+                        phase_name=f"{self.phase_name}_extraction",
+                        error=error,
+                        epic=epic_num,
+                        story=story_num,
+                        provider_id=extraction_provider_id,
+                        attempt=timeout_attempt,
+                        will_retry=will_retry,
+                    )
 
                 def invoke_fn(prompt: str) -> str:
                     res = invoke_with_timeout_retry(
@@ -477,6 +603,7 @@ class CodeReviewSynthesisHandler(BaseHandler):
                         prompt=prompt,
                         model=ext_model,
                         timeout=per_call_timeout,
+                        on_timeout=save_timeout_attempt,
                         disable_tools=True,
                         cwd=self.project_path,
                     )
@@ -616,6 +743,10 @@ class CodeReviewSynthesisHandler(BaseHandler):
                 raise ConfigError("Cannot synthesize: missing epic_num or story_num in state")
 
             story_num = story_num_str  # Keep as str to support EpicId = int | str (TD-001)
+            story_before_synthesis = self._read_story_file_for_action_item_reconciliation(
+                epic_num,
+                story_num,
+            )
 
             # Get session_id and load reviews for report saving
             session_id = self._get_session_id_from_cache(epic_num, story_num)
@@ -657,7 +788,10 @@ class CodeReviewSynthesisHandler(BaseHandler):
 
             # Invoke Master LLM with restricted tools (file manipulation only)
             result = self.invoke_provider(
-                prompt, allowed_tools=["Read", "Edit", "Write", "Bash"]
+                prompt,
+                allowed_tools=["Read", "Edit", "Write", "Bash"],
+                sandbox_mode="workspace-write",
+                state=state,
             )
 
             # Record end time for benchmarking
@@ -763,21 +897,63 @@ class CodeReviewSynthesisHandler(BaseHandler):
                     if evidence_score_data
                     else "UNKNOWN"
                 )
-
-                phase_result = PhaseResult.ok(
-                    {
-                        "response": result.stdout,
-                        "model": result.model,
-                        "duration_ms": result.duration_ms,
-                        "verdict": verdict,
-                    }
+                unresolved_action_items = extract_unresolved_code_review_action_items(
+                    extracted_synthesis
                 )
+                if unresolved_action_items is None:
+                    story_after_synthesis = self._read_story_file_for_action_item_reconciliation(
+                        epic_num,
+                        story_num,
+                    )
+                    if story_after_synthesis is not None:
+                        unresolved_action_items = extract_latest_story_review_action_items(
+                            story_after_synthesis,
+                            previous_story_content=story_before_synthesis,
+                        )
+                        if unresolved_action_items is not None:
+                            logger.info(
+                                "Recovered code review action-item count from newly appended "
+                                "story review section: %d",
+                                unresolved_action_items,
+                            )
+                    if unresolved_action_items is None:
+                        logger.warning(
+                            "Code review synthesis did not emit explicit Action Items Created "
+                            "count and no new story review count could be reconciled"
+                        )
+
+                phase_outputs = {
+                    "response": result.stdout,
+                    "model": result.model,
+                    "duration_ms": result.duration_ms,
+                    "verdict": verdict,
+                }
+                if unresolved_action_items is not None:
+                    phase_outputs["unresolved_code_review_action_items"] = (
+                        unresolved_action_items
+                    )
+
+                phase_result = PhaseResult.ok(phase_outputs)
 
             return phase_result
 
         except ConfigError as e:
             logger.error("Synthesis config error: %s", e)
             return PhaseResult.fail(str(e))
+
+        except ProviderTimeoutError as e:
+            artifact_path = self._save_timeout_artifact(state, e)
+            outputs: dict[str, Any] = {}
+            artifact_suffix = ""
+            if artifact_path is not None:
+                outputs["timeout_artifact"] = str(artifact_path)
+                artifact_suffix = f" (partial output: {artifact_path})"
+            logger.error("Synthesis provider timeout: %s", e)
+            return PhaseResult(
+                success=False,
+                error=f"Provider timeout: {e}{artifact_suffix}",
+                outputs=outputs,
+            )
 
         except Exception as e:
             logger.error("Synthesis handler failed: %s", e, exc_info=True)

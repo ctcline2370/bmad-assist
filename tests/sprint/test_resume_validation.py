@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from bmad_assist.core.exceptions import StateError
 from bmad_assist.core.state import Phase, State
 from bmad_assist.sprint.resume_validation import (
     ResumeValidationResult,
@@ -17,6 +18,33 @@ from bmad_assist.sprint.resume_validation import (
 )
 
 
+def _write_sprint_status(tmp_path: Path, yaml_content: str) -> Path:
+    """Write sprint-status.yaml to the canonical implementation-artifacts path."""
+    impl_artifacts = tmp_path / "_bmad-output" / "implementation-artifacts"
+    impl_artifacts.mkdir(parents=True, exist_ok=True)
+    sprint_status_path = impl_artifacts / "sprint-status.yaml"
+    sprint_status_path.write_text(yaml_content)
+    return sprint_status_path
+
+
+def _write_retro_artifact(tmp_path: Path, epic_id: int) -> Path:
+    """Write a durable retrospective artifact for the given epic."""
+    retrospectives_dir = tmp_path / "_bmad-output" / "implementation-artifacts" / "retrospectives"
+    retrospectives_dir.mkdir(parents=True, exist_ok=True)
+    retro_path = retrospectives_dir / f"epic-{epic_id}-retro-20260101_000000.md"
+    retro_path.write_text(f"# Epic {epic_id} retrospective\n")
+    return retro_path
+
+
+def _write_legacy_retro_artifact(tmp_path: Path, epic_id: int) -> Path:
+    """Write a durable retrospective artifact to the legacy root location."""
+    implementation_artifacts = tmp_path / "_bmad-output" / "implementation-artifacts"
+    implementation_artifacts.mkdir(parents=True, exist_ok=True)
+    retro_path = implementation_artifacts / f"epic-{epic_id}-retro-20260101_000000.md"
+    retro_path.write_text(f"# Epic {epic_id} retrospective\n")
+    return retro_path
+
+
 @pytest.fixture
 def basic_sprint_status_yaml() -> str:
     """Sprint-status YAML with mixed done/in-progress entries."""
@@ -25,6 +53,7 @@ generated: '2026-01-01T00:00:00'
 project: test-project
 development_status:
   epic-1: done
+  epic-1-retrospective: done
   1-1-first-story: done
   1-2-second-story: done
   epic-2: in-progress
@@ -165,7 +194,7 @@ development_status:
         assert _is_epic_done_in_sprint(1, sprint_status) is False
 
     def test_epic_done_no_retro_entry(self, tmp_path):
-        """Epic is done if no retrospective entry exists (legacy compat)."""
+        """Epic is NOT done if no retrospective entry exists."""
         from bmad_assist.sprint.parser import parse_sprint_status
 
         yaml_content = """
@@ -177,7 +206,7 @@ development_status:
         path.write_text(yaml_content)
         sprint_status = parse_sprint_status(path)
 
-        assert _is_epic_done_in_sprint(1, sprint_status) is True
+        assert _is_epic_done_in_sprint(1, sprint_status) is False
 
     def test_epic_in_progress(self, tmp_path, basic_sprint_status_yaml):
         """Epic marked in-progress returns False."""
@@ -255,7 +284,7 @@ class TestFindNextIncompleteEpic:
         path.write_text(basic_sprint_status_yaml)
         sprint_status = parse_sprint_status(path)
 
-        result = _find_next_incomplete_epic(1, [1, 2, 3], [1], sprint_status)
+        result = _find_next_incomplete_epic(1, [1, 2, 3], [1], sprint_status, tmp_path)
         assert result == 2
 
     def test_skips_completed_epics(self, tmp_path, basic_sprint_status_yaml):
@@ -266,7 +295,7 @@ class TestFindNextIncompleteEpic:
         path.write_text(basic_sprint_status_yaml)
         sprint_status = parse_sprint_status(path)
 
-        result = _find_next_incomplete_epic(1, [1, 2, 3], [1, 2], sprint_status)
+        result = _find_next_incomplete_epic(1, [1, 2, 3], [1, 2], sprint_status, tmp_path)
         assert result == 3
 
     def test_returns_none_when_all_done(self, tmp_path, all_done_sprint_status_yaml):
@@ -276,8 +305,11 @@ class TestFindNextIncompleteEpic:
         path = tmp_path / "sprint-status.yaml"
         path.write_text(all_done_sprint_status_yaml)
         sprint_status = parse_sprint_status(path)
+        _write_retro_artifact(tmp_path, 1)
+        _write_retro_artifact(tmp_path, 2)
+        _write_retro_artifact(tmp_path, 3)
 
-        result = _find_next_incomplete_epic(1, [1, 2, 3], [], sprint_status)
+        result = _find_next_incomplete_epic(1, [1, 2, 3], [], sprint_status, tmp_path)
         assert result is None
 
 
@@ -304,9 +336,8 @@ class TestValidateResumeState:
     ):
         """Advances state when current story is done in sprint-status."""
         # Setup: story 2.1 is marked done in sprint-status
-        impl_artifacts = tmp_path / "_bmad-output" / "implementation-artifacts"
-        impl_artifacts.mkdir(parents=True)
-        (impl_artifacts / "sprint-status.yaml").write_text(basic_sprint_status_yaml)
+        _write_sprint_status(tmp_path, basic_sprint_status_yaml)
+        _write_retro_artifact(tmp_path, 1)
 
         result = validate_resume_state(
             state_at_epic_2_story_1,
@@ -327,14 +358,14 @@ class TestValidateResumeState:
 generated: '2026-01-01'
 development_status:
   epic-1: done
+  epic-1-retrospective: done
   1-1-first: done
   1-2-second: done
   epic-2: backlog
   2-1-first: backlog
 """
-        impl_artifacts = tmp_path / "_bmad-output" / "implementation-artifacts"
-        impl_artifacts.mkdir(parents=True)
-        (impl_artifacts / "sprint-status.yaml").write_text(yaml_content)
+        _write_sprint_status(tmp_path, yaml_content)
+        _write_retro_artifact(tmp_path, 1)
 
         state = State(
             current_epic=1,
@@ -352,13 +383,50 @@ development_status:
         assert result.state.current_story == "2.1"
         assert 1 in result.state.completed_epics
 
+    def test_all_stories_done_without_epic_teardown_raises_state_error(
+        self, tmp_path, epic_stories_loader
+    ):
+        """Fails closed when stories are done but epic teardown is incomplete."""
+        yaml_content = """
+generated: '2026-01-01'
+development_status:
+  epic-1: done
+  epic-1-retrospective: done
+  1-1-first: done
+  1-2-second: done
+  epic-2: in-progress
+  epic-2-retrospective: backlog
+  2-1-first: done
+  2-2-second: done
+  2-3-third: done
+  epic-3: backlog
+  3-1-first: backlog
+"""
+        _write_sprint_status(tmp_path, yaml_content)
+        _write_retro_artifact(tmp_path, 1)
+
+        state = State(
+            current_epic=2,
+            current_story="2.1",
+            current_phase=Phase.CREATE_STORY,
+            completed_stories=[],
+            completed_epics=[1],
+        )
+
+        with pytest.raises(
+            StateError,
+            match="Epic 2 has all stories marked done in sprint-status, but epic teardown is incomplete",
+        ):
+            validate_resume_state(state, tmp_path, [1, 2, 3], epic_stories_loader)
+
     def test_project_complete_all_done(
         self, tmp_path, epic_stories_loader, all_done_sprint_status_yaml
     ):
         """Detects project completion when all epics are done."""
-        impl_artifacts = tmp_path / "_bmad-output" / "implementation-artifacts"
-        impl_artifacts.mkdir(parents=True)
-        (impl_artifacts / "sprint-status.yaml").write_text(all_done_sprint_status_yaml)
+        _write_sprint_status(tmp_path, all_done_sprint_status_yaml)
+        _write_retro_artifact(tmp_path, 1)
+        _write_retro_artifact(tmp_path, 2)
+        _write_retro_artifact(tmp_path, 3)
 
         state = State(
             current_epic=1,
@@ -377,9 +445,8 @@ development_status:
         self, tmp_path, epic_stories_loader, basic_sprint_status_yaml
     ):
         """No changes when current story is not done."""
-        impl_artifacts = tmp_path / "_bmad-output" / "implementation-artifacts"
-        impl_artifacts.mkdir(parents=True)
-        (impl_artifacts / "sprint-status.yaml").write_text(basic_sprint_status_yaml)
+        _write_sprint_status(tmp_path, basic_sprint_status_yaml)
+        _write_retro_artifact(tmp_path, 1)
 
         state = State(
             current_epic=2,
@@ -390,6 +457,66 @@ development_status:
         )
 
         result = validate_resume_state(state, tmp_path, [1, 2, 3], epic_stories_loader)
+
+        assert result.advanced is False
+        assert result.state == state
+
+    def test_rejects_state_advanced_past_epic_without_durable_retrospective_artifact(
+        self, tmp_path, epic_stories_loader
+    ):
+        """Fails closed when state advanced past an epic missing its durable retro artifact."""
+        yaml_content = """
+generated: '2026-01-01'
+development_status:
+  epic-1: done
+  epic-1-retrospective: done
+  1-1-first: done
+  1-2-second: done
+  epic-2: in-progress
+  2-1-first: backlog
+"""
+        _write_sprint_status(tmp_path, yaml_content)
+
+        state = State(
+            current_epic=2,
+            current_story="2.1",
+            current_phase=Phase.CREATE_STORY,
+            completed_stories=[],
+            completed_epics=[1],
+        )
+
+        with pytest.raises(
+            StateError,
+            match="Epic 1 teardown is incomplete .*durable retrospective artifact is missing",
+        ):
+            validate_resume_state(state, tmp_path, [1, 2], epic_stories_loader)
+
+    def test_accepts_state_advanced_past_epic_with_legacy_retro_artifact(
+        self, tmp_path, epic_stories_loader
+    ):
+        """Allows prior-epic advancement when only the legacy retro artifact exists."""
+        yaml_content = """
+generated: '2026-01-01'
+development_status:
+  epic-1: done
+  epic-1-retrospective: done
+  1-1-first: done
+  1-2-second: done
+  epic-2: in-progress
+  2-1-first: backlog
+"""
+        _write_sprint_status(tmp_path, yaml_content)
+        _write_legacy_retro_artifact(tmp_path, 1)
+
+        state = State(
+            current_epic=2,
+            current_story="2.1",
+            current_phase=Phase.CREATE_STORY,
+            completed_stories=[],
+            completed_epics=[1],
+        )
+
+        result = validate_resume_state(state, tmp_path, [1, 2], epic_stories_loader)
 
         assert result.advanced is False
         assert result.state == state

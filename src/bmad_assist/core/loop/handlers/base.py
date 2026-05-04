@@ -30,7 +30,9 @@ from typing import Any
 import yaml
 from jinja2 import Template
 
-from bmad_assist.core.config import Config, get_config, get_phase_retries, get_phase_timeout
+from bmad_assist.compiler.output import validate_token_budget
+from bmad_assist.compiler.shared_utils import estimate_tokens
+from bmad_assist.core.config import Config, get_phase_retries, get_phase_timeout
 from bmad_assist.core.config.models.providers import (
     MasterProviderConfig,
     MultiProviderConfig,
@@ -39,6 +41,8 @@ from bmad_assist.core.config.models.providers import (
 from bmad_assist.core.exceptions import (
     ConfigError,
     ProviderExitCodeError,
+    ProviderTimeoutError,
+    TokenBudgetError,
 )
 from bmad_assist.core.io import get_original_cwd
 from bmad_assist.core.loop.types import PhaseResult
@@ -46,7 +50,7 @@ from bmad_assist.core.paths import get_paths
 from bmad_assist.core.retry import invoke_with_timeout_retry
 from bmad_assist.core.state import State
 from bmad_assist.providers import get_provider
-from bmad_assist.providers.base import BaseProvider, ProviderResult
+from bmad_assist.providers.base import BaseProvider, ProviderResult, is_transient_error
 from bmad_assist.providers.claude import ClaudeSubprocessProvider
 
 logger = logging.getLogger(__name__)
@@ -352,30 +356,29 @@ class BaseHandler(ABC):
             # Add git intelligence if patch config specifies it
             prompt = compiled.context
             prompt = self._inject_git_intelligence(prompt, workflow_name, resolved_variables)
+            final_token_estimate = estimate_tokens(prompt)
 
-            # F4-IMPL: Warn if prompt exceeds expected budget (but don't block)
+            workflow_budget = self.config.compiler.source_context.budgets.get_budget(
+                workflow_name
+            )
             try:
-                config = get_config()
-                workflow_budget = config.compiler.source_context.budgets.get_budget(workflow_name)
-                # Prompt is typically ~2x the token estimate due to XML overhead
-                expected_prompt_tokens = compiled.token_estimate * 2
+                budget_warnings = validate_token_budget(
+                    final_token_estimate, workflow_budget
+                )
+            except TokenBudgetError as e:
+                raise ConfigError(
+                    "Compiled prompt exceeds configured workflow budget for "
+                    f"{workflow_name}.\n\n{e}"
+                ) from e
 
-                if expected_prompt_tokens > workflow_budget:
-                    logger.warning(
-                        "Prompt may exceed budget for %s: estimated %d tokens "
-                        "(config budget: %d). Consider reducing source context.",
-                        workflow_name,
-                        expected_prompt_tokens,
-                        workflow_budget,
-                    )
-            except Exception:
-                # Config not loaded (e.g., in tests) - skip budget warning
-                pass
+            for warning in budget_warnings:
+                logger.warning("%s", warning)
 
             logger.info(
-                "Using compiled prompt for %s (tokens: ~%d)",
+                "Using compiled prompt for %s (compiled tokens: ~%d, final tokens: ~%d)",
                 workflow_name,
                 compiled.token_estimate,
+                final_token_estimate,
             )
 
             return prompt
@@ -383,6 +386,12 @@ class BaseHandler(ABC):
         except CompilerError as e:
             logger.warning("Workflow compilation failed for %s: %s", workflow_name, e)
             raise ConfigError(f"Failed to compile workflow: {workflow_name}\n\n{e}") from e
+        except ConfigError as e:
+            logger.warning("Workflow compilation failed for %s: %s", workflow_name, e)
+            prefix = f"Failed to compile workflow: {workflow_name}"
+            if str(e).startswith(prefix):
+                raise
+            raise ConfigError(f"{prefix}\n\n{e}") from e
         except FileNotFoundError as e:
             # Workflow files not found
             logger.warning("Workflow files not found for %s: %s", workflow_name, e)
@@ -571,6 +580,28 @@ class BaseHandler(ABC):
 
         return get_provider(provider_name)
 
+    def _save_timeout_artifact(
+        self,
+        state: State,
+        error: ProviderTimeoutError,
+        *,
+        attempt: int | None = None,
+        will_retry: bool | None = None,
+    ) -> Path | None:
+        """Persist partial provider output from a timeout for later diagnosis."""
+        from bmad_assist.core.timeout_artifacts import save_provider_timeout_artifact
+
+        return save_provider_timeout_artifact(
+            project_path=self.project_path,
+            phase_name=self.phase_name,
+            error=error,
+            epic=state.current_epic,
+            story=state.current_story,
+            provider_id=self.get_model() or "unknown",
+            attempt=attempt,
+            will_retry=will_retry,
+        )
+
     def get_model(self) -> str | None:
         """Get the display model name for logging (prefers model_name over model).
 
@@ -643,6 +674,8 @@ class BaseHandler(ABC):
         retry_timeout_minutes: int = 30,
         retry_delay: int = 60,
         allowed_tools: list[str] | None = None,
+        sandbox_mode: str | None = None,
+        state: State | None = None,
     ) -> ProviderResult:
         """Invoke the provider with the given prompt, with automatic retry on failure.
 
@@ -653,6 +686,11 @@ class BaseHandler(ABC):
             prompt: Rendered prompt string.
             retry_timeout_minutes: Total time to keep retrying (default: 30 minutes).
             retry_delay: Seconds to wait between retries (default: 60).
+            allowed_tools: Optional tool allowlist to pass through to the provider.
+            sandbox_mode: Optional explicit sandbox mode override for providers
+                that support writable constrained execution.
+            state: Optional active state used to persist timeout artifacts for
+                every timeout attempt, including attempts that are retried.
 
         Returns:
             ProviderResult with stdout, stderr, exit_code, etc.
@@ -717,6 +755,20 @@ class BaseHandler(ABC):
             max_calls_per_minute=tg.max_calls_per_minute,
         )
 
+        def save_timeout_attempt(
+            error: ProviderTimeoutError,
+            timeout_attempt: int,
+            will_retry: bool,
+        ) -> None:
+            if state is None:
+                return
+            self._save_timeout_artifact(
+                state,
+                error,
+                attempt=timeout_attempt,
+                will_retry=will_retry,
+            )
+
         while True:
             attempt += 1
             elapsed = time.time() - start_time
@@ -756,6 +808,7 @@ class BaseHandler(ABC):
                     phase_name=self.phase_name,
                     fallback_invoke_fn=fallback_invoke_fn,
                     fallback_timeout_retries=fallback_timeout_retries,
+                    on_timeout=save_timeout_attempt if state is not None else None,
                     prompt=prompt,
                     model=cli_model,
                     display_model=display_model,
@@ -765,6 +818,7 @@ class BaseHandler(ABC):
                     reasoning_effort=reasoning_effort,
                     guard=guard,
                     allowed_tools=allowed_tools,
+                    sandbox_mode=sandbox_mode,
                 )
 
                 # Check for guard-triggered termination
@@ -806,6 +860,7 @@ class BaseHandler(ABC):
                         phase_name=self.phase_name,
                         fallback_invoke_fn=fallback_invoke_fn,
                         fallback_timeout_retries=fallback_timeout_retries,
+                        on_timeout=save_timeout_attempt if state is not None else None,
                         prompt=prompt,
                         model=cli_model,
                         display_model=display_model,
@@ -815,6 +870,7 @@ class BaseHandler(ABC):
                         reasoning_effort=reasoning_effort,
                         guard=guard,
                         allowed_tools=allowed_tools,
+                        sandbox_mode=sandbox_mode,
                     )
 
                     if (
@@ -839,6 +895,15 @@ class BaseHandler(ABC):
                 return result
 
             except ProviderExitCodeError as e:
+                if not is_transient_error(e.stderr, e.exit_status):
+                    logger.error(
+                        "Provider failed with non-transient exit code in %s phase; "
+                        "not retrying: %s",
+                        self.phase_name,
+                        str(e)[:200],
+                    )
+                    raise
+
                 last_error = e
 
                 if remaining <= current_delay:
@@ -895,7 +960,7 @@ class BaseHandler(ABC):
             save_prompt(self.project_path, epic, story, self.phase_name, prompt)
 
             # Invoke provider
-            result = self.invoke_provider(prompt)
+            result = self.invoke_provider(prompt, state=state)
 
             # Check for errors
             # Build termination_metadata if guard was active
@@ -950,6 +1015,19 @@ class BaseHandler(ABC):
         except ConfigError as e:
             logger.error("Handler config error: %s", e)
             return PhaseResult.fail(str(e))
+        except ProviderTimeoutError as e:
+            artifact_path = self._save_timeout_artifact(state, e)
+            outputs: dict[str, Any] = {}
+            artifact_suffix = ""
+            if artifact_path is not None:
+                outputs["timeout_artifact"] = str(artifact_path)
+                artifact_suffix = f" (partial output: {artifact_path})"
+            logger.error("Handler provider timeout: %s", e)
+            return PhaseResult(
+                success=False,
+                error=f"Provider timeout: {e}{artifact_suffix}",
+                outputs=outputs,
+            )
         except Exception as e:
             logger.error("Handler execution failed: %s", e, exc_info=True)
             return PhaseResult.fail(f"Handler error: {e}")

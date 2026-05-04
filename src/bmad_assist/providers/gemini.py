@@ -47,7 +47,9 @@ from bmad_assist.providers.base import (
     extract_tool_details,
     format_tag,
     is_full_stream,
+    register_child_pgid,
     should_print_progress,
+    unregister_child_pgid,
     validate_settings_file,
     write_progress,
 )
@@ -401,8 +403,10 @@ class GeminiProvider(BaseProvider):
             stderr_chunks: list[str] = []
             raw_stdout_lines: list[str] = []
             session_id: str | None = None
+            restricted_tool_violation: dict[str, Any] | None = None
 
             start_time = time.perf_counter()
+            child_pgid: int | None = None
 
             try:
                 # Set up environment - configure git to point to target project
@@ -432,6 +436,14 @@ class GeminiProvider(BaseProvider):
                     env=env,
                     start_new_session=True,  # Own process group for safe termination
                 )
+                try:
+                    child_pgid = os.getpgid(process.pid)
+                    register_child_pgid(child_pgid)
+                except (ProcessLookupError, PermissionError, OSError, TypeError):
+                    logger.debug(
+                        "Unable to register Gemini child process group",
+                        exc_info=True,
+                    )
 
                 # Write prompt to stdin and close it
                 if process.stdin:
@@ -446,7 +458,7 @@ class GeminiProvider(BaseProvider):
                     color_idx: int | None,
                 ) -> None:
                     """Process Gemini stream-json output, extracting text and logging."""
-                    nonlocal session_id
+                    nonlocal restricted_tool_violation, session_id
                     warned_tools: set[str] = set()  # Dedupe restricted tool warnings
                     for line in iter(stream.readline, ""):
                         raw_lines.append(line)
@@ -510,12 +522,22 @@ class GeminiProvider(BaseProvider):
                                     and normalized_tool_name not in warned_tools
                                 ):
                                     warned_tools.add(normalized_tool_name)
+                                    restricted_tool_violation = {
+                                        "raw_tool_name": tool_name,
+                                        "normalized_tool_name": normalized_tool_name,
+                                        "allowed_tools": list(allowed_tools or []),
+                                        "restricted_tools": list(restricted_tools),
+                                    }
                                     logger.warning(
                                         "Gemini CLI: Restricted tool '%s' "
-                                        "(norm='%s'). May still execute.",
+                                        "(norm='%s'). Terminating invocation.",
                                         tool_name,
                                         normalized_tool_name,
                                     )
+                                    if guard_kill_event is not None:  # noqa: B023
+                                        guard_kill_event.set()  # noqa: B023
+                                    stream.close()
+                                    return
                                 if should_print_progress():
                                     # Format like Claude: [TOOL Bash] command...
                                     display_name = tool_name
@@ -591,15 +613,18 @@ class GeminiProvider(BaseProvider):
                             write_progress(f"{tag} {stripped}")
                     stream.close()
 
-                # Guard monitor for blocking-wait termination
-                guard_kill_event = threading.Event() if guard is not None else None
-                guard_done_event = threading.Event() if guard is not None else None
+                # Termination monitor for blocking waits. It is used both for
+                # ToolCallGuard denials and fail-closed restricted-tool attempts.
+                should_monitor_termination = guard is not None or bool(restricted_tools)
+                guard_kill_event = (
+                    threading.Event() if should_monitor_termination else None
+                )
+                guard_done_event = (
+                    threading.Event() if should_monitor_termination else None
+                )
                 guard_monitor = None
-                if guard is not None:
-                    from bmad_assist.providers.tool_guard import (
-                        build_termination_fields,
-                        start_guard_monitor,
-                    )
+                if should_monitor_termination:
+                    from bmad_assist.providers.tool_guard import start_guard_monitor
                     assert guard_kill_event is not None and guard_done_event is not None
                     guard_monitor = start_guard_monitor(process, guard_kill_event, guard_done_event)
 
@@ -613,10 +638,12 @@ class GeminiProvider(BaseProvider):
                         debug_json_logger,
                         color_index,
                     ),
+                    daemon=True,
                 )
                 stderr_thread = threading.Thread(
                     target=read_stderr,
                     args=(process.stderr, stderr_chunks, color_index),
+                    daemon=True,
                 )
                 stdout_thread.start()
                 stderr_thread.start()
@@ -634,7 +661,9 @@ class GeminiProvider(BaseProvider):
                 try:
                     returncode = process.wait(timeout=effective_timeout)
                 except TimeoutExpired:
-                    process.kill()
+                    from bmad_assist.providers.tool_guard import terminate_process_tree
+
+                    terminate_process_tree(process)
                     # Clean up guard monitor before raising
                     if guard_done_event is not None:
                         guard_done_event.set()
@@ -679,18 +708,50 @@ class GeminiProvider(BaseProvider):
                 stdout_thread.join(timeout=10)
                 stderr_thread.join(timeout=10)
 
-                # Check if guard terminated the process
-                if guard_kill_event is not None and guard_kill_event.is_set():
+                # Check if guard terminated the process. Restricted-tool
+                # termination is handled below as a hard provider failure.
+                if (
+                    guard_kill_event is not None
+                    and guard_kill_event.is_set()
+                    and restricted_tool_violation is None
+                ):
                     returncode = 0  # Guard termination uses exit_code=0
 
             except FileNotFoundError as e:
                 logger.error("Gemini CLI not found in PATH")
                 raise ProviderError("Gemini CLI not found. Is 'gemini' in PATH?") from e
             finally:
+                if child_pgid is not None:
+                    unregister_child_pgid(child_pgid)
                 debug_json_logger.close()
 
             duration_ms = int((time.perf_counter() - start_time) * 1000)
             stderr_content = "".join(stderr_chunks)
+
+            if restricted_tool_violation is not None:
+                raw_tool = restricted_tool_violation["raw_tool_name"]
+                normalized_tool = restricted_tool_violation["normalized_tool_name"]
+                violation_message = (
+                    "Gemini CLI attempted restricted tool "
+                    f"{raw_tool!r} (normalized={normalized_tool!r}); invocation terminated."
+                )
+                stderr_content = (
+                    f"{stderr_content.rstrip()}\n{violation_message}"
+                    if stderr_content.strip()
+                    else violation_message
+                )
+                logger.error("%s", violation_message)
+                return ProviderResult(
+                    stdout="".join(response_text_parts),
+                    stderr=stderr_content,
+                    exit_code=-15,
+                    duration_ms=duration_ms,
+                    model=effective_model,
+                    command=tuple(command),
+                    provider_session_id=debug_json_logger.provider_session_id,
+                    termination_info=restricted_tool_violation,
+                    termination_reason=f"restricted_tool:{raw_tool}->{normalized_tool}",
+                )
 
             if returncode != 0:
                 exit_status = ExitStatus.from_code(returncode)

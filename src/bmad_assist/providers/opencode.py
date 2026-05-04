@@ -562,10 +562,12 @@ class OpenCodeProvider(BaseProvider):
                         debug_json_logger,
                         color_index,
                     ),
+                    daemon=True,
                 )
                 stderr_thread = threading.Thread(
                     target=read_stderr,
                     args=(process.stderr, stderr_chunks, color_index),
+                    daemon=True,
                 )
                 stdout_thread.start()
                 stderr_thread.start()

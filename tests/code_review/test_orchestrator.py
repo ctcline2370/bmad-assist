@@ -9,6 +9,7 @@ Tests cover:
 """
 
 import asyncio
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -18,12 +19,11 @@ import pytest
 from bmad_assist.benchmarking import (
     CollectorContext,
     DeterministicMetrics,
-    EvaluatorRole,
     LLMEvaluationRecord,
 )
 from bmad_assist.code_review.orchestrator import (
-    CODE_REVIEW_WORKFLOW_ID,
     CODE_REVIEW_SYNTHESIS_WORKFLOW_ID,
+    CODE_REVIEW_WORKFLOW_ID,
     CodeReviewError,
     CodeReviewPhaseResult,
     InsufficientReviewsError,
@@ -36,8 +36,8 @@ from bmad_assist.core.config import (
     MultiProviderConfig,
     ProviderConfig,
 )
-from bmad_assist.validation.anonymizer import AnonymizedValidation
-
+from bmad_assist.core.exceptions import ProviderTimeoutError
+from bmad_assist.providers.base import ProviderResult
 
 # ============================================================================
 # Fixtures
@@ -83,6 +83,160 @@ def project_path(tmp_path: Path) -> Path:
 """)
 
     return tmp_path
+
+
+class TestCodeReviewTaskCollection:
+    """Tests for bounded code review task collection."""
+
+    def test_calculates_sweep_timeout_from_provider_timeout_and_retries(self) -> None:
+        """Sweep timeout includes provider attempts, start delay, security timeout, and grace."""
+        from bmad_assist.code_review.orchestrator import _calculate_code_review_sweep_timeout
+
+        timeout = _calculate_code_review_sweep_timeout(
+            timeout=120,
+            timeout_retries=1,
+            task_count=3,
+            max_start_delay=5.0,
+            security_timeout=400,
+        )
+
+        assert timeout == 460.0
+
+    def test_sweep_timeout_preserves_completed_results_and_cancels_stragglers(self) -> None:
+        """A stalled reviewer cannot discard already completed reviewer output."""
+        from bmad_assist.code_review.orchestrator import _collect_code_review_task_results
+        from bmad_assist.validation.anonymizer import ValidationOutput
+
+        async def fast_reviewer():
+            output = ValidationOutput(
+                provider="fast",
+                model="test-model",
+                content="fast review",
+                timestamp=datetime.now(UTC),
+                duration_ms=10,
+                token_count=3,
+            )
+            return "fast", output, None, None
+
+        async def stuck_reviewer():
+            await asyncio.sleep(60)
+            return "stuck", None, None, "unexpected completion"
+
+        async def run_collection():
+            tasks = [
+                asyncio.create_task(fast_reviewer()),
+                asyncio.create_task(stuck_reviewer()),
+            ]
+            return await _collect_code_review_task_results(
+                tasks,
+                ["reviewer:fast", "reviewer:stuck"],
+                timeout_seconds=0.01,
+            )
+
+        with patch("bmad_assist.code_review.orchestrator.kill_all_child_pgids") as kill_mock:
+            results = asyncio.run(run_collection())
+
+        assert any(isinstance(result, tuple) and result[0] == "fast" for result in results)
+        assert any(
+            isinstance(result, tuple)
+            and result[0] == "stuck"
+            and result[1] is None
+            and "exceeded phase timeout" in str(result[3])
+            for result in results
+        )
+        kill_mock.assert_called_once()
+
+    def test_invoke_reviewer_passes_cancel_token_to_provider(self) -> None:
+        """Provider calls receive a cancellation token for orchestrator teardown."""
+        from bmad_assist.code_review.orchestrator import _invoke_reviewer
+
+        provider = MagicMock()
+        provider.provider_name = "mock"
+        provider.invoke.return_value = ProviderResult(
+            stdout="<!-- CODE_REVIEW_REPORT_START -->\n# Review\n<!-- CODE_REVIEW_REPORT_END -->",
+            stderr="",
+            exit_code=0,
+            duration_ms=10,
+            model="mock-model",
+            command=("mock",),
+        )
+
+        asyncio.run(
+            _invoke_reviewer(
+                provider,
+                "prompt",
+                5,
+                "reviewer-a",
+                model="mock-model",
+                timeout_retries=0,
+            )
+        )
+
+        cancel_token = provider.invoke.call_args.kwargs["cancel_token"]
+        assert isinstance(cancel_token, threading.Event)
+        assert cancel_token.is_set() is False
+
+    def test_invoke_reviewer_persists_timeout_artifact_before_retry(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Retried reviewer timeouts persist partial output for diagnosis."""
+        from bmad_assist.code_review.orchestrator import _invoke_reviewer
+
+        provider = MagicMock()
+        provider.provider_name = "mock"
+        partial = ProviderResult(
+            stdout="partial review stdout",
+            stderr="partial review stderr",
+            exit_code=-1,
+            duration_ms=123,
+            model="mock-model",
+            command=("mock",),
+        )
+        provider.invoke.side_effect = [
+            ProviderTimeoutError("reviewer timed out", partial_result=partial),
+            ProviderResult(
+                stdout=(
+                    "<!-- CODE_REVIEW_REPORT_START -->\n"
+                    "# Review\n"
+                    "<!-- CODE_REVIEW_REPORT_END -->"
+                ),
+                stderr="",
+                exit_code=0,
+                duration_ms=10,
+                model="mock-model",
+                command=("mock",),
+            ),
+        ]
+
+        reviewer_id, output, _deterministic, error = asyncio.run(
+            _invoke_reviewer(
+                provider,
+                "prompt",
+                5,
+                "reviewer-a",
+                model="mock-model",
+                timeout_retries=1,
+                epic_num=8,
+                story_num=2,
+                cwd=tmp_path,
+            )
+        )
+
+        assert reviewer_id == "reviewer-a"
+        assert output is not None
+        assert error is None
+        artifacts = list((tmp_path / ".bmad-assist" / "provider-timeouts").glob("*.md"))
+        assert len(artifacts) == 1
+        artifact = artifacts[0].read_text(encoding="utf-8")
+        assert "- Phase: code_review" in artifact
+        assert "- Epic: 8" in artifact
+        assert "- Story: 2" in artifact
+        assert "- ProviderId: reviewer-a" in artifact
+        assert "- Attempt: 1" in artifact
+        assert "- WillRetry: True" in artifact
+        assert "partial review stdout" in artifact
+        assert "partial review stderr" in artifact
 
 
 # ============================================================================

@@ -4,11 +4,9 @@ Story 11.7: Validation Phase Loop Integration
 Tests for ValidateStoryHandler and ValidateStorySynthesisHandler.
 """
 
-import asyncio
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -20,9 +18,9 @@ from bmad_assist.core.config import (
     MultiProviderConfig,
     ProviderConfig,
 )
-from bmad_assist.core.loop.types import PhaseResult
+from bmad_assist.core.exceptions import ProviderTimeoutError
 from bmad_assist.core.state import Phase, State
-from bmad_assist.providers.base import BaseProvider, ProviderResult
+from bmad_assist.providers.base import ProviderResult
 
 
 # =============================================================================
@@ -187,18 +185,21 @@ class TestValidateStoryHandler:
             failed_validators=[],
         )
 
-        async def mock_run_phase(*args: Any, **kwargs: Any) -> ValidationPhaseResult:
-            return mock_result
-
         # Mock the orchestrator - patch run_async_with_timeout to bypass async
+        validation_coro = object()
         with (
             patch(
                 "bmad_assist.core.async_utils.run_async_with_timeout"
             ) as mock_run_async,
             patch(
+                "bmad_assist.core.loop.handlers.validate_story.run_validation_phase",
+                new_callable=MagicMock,
+            ) as mock_run_phase,
+            patch(
                 "bmad_assist.core.loop.handlers.validate_story.save_validations_for_synthesis"
             ) as mock_save,
         ):
+            mock_run_phase.return_value = validation_coro
             mock_run_async.return_value = mock_result
             # save_validations_for_synthesis now receives session_id from result
             mock_save.return_value = None  # Return value not used anymore
@@ -211,6 +212,9 @@ class TestValidateStoryHandler:
             assert result.outputs["session_id"] == "test-session-123"
             assert result.outputs["validation_count"] == 2
             # Verify save was called with the session_id from result
+            mock_run_phase.assert_called_once()
+            mock_run_async.assert_called_once()
+            assert mock_run_async.call_args.args[0] is validation_coro
             mock_save.assert_called_once()
             call_kwargs = mock_save.call_args
             assert call_kwargs[1]["session_id"] == "test-session-123"
@@ -471,6 +475,95 @@ class TestValidateStorySynthesisHandler:
             assert "response" in result.outputs
             assert "Synthesis Summary" in result.outputs["response"]
 
+    def test_execute_timeout_includes_partial_artifact(
+        self,
+        validation_config: Config,
+        project_with_story: Path,
+    ) -> None:
+        """Provider timeouts preserve partial synthesis output for recovery."""
+        from bmad_assist.core.loop.handlers.validate_story_synthesis import (
+            ValidateStorySynthesisHandler,
+        )
+
+        handler = ValidateStorySynthesisHandler(validation_config, project_with_story)
+
+        cache_dir = project_with_story / ".bmad-assist" / "cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_file = cache_dir / "validations-timeout-session.json"
+        cache_file.write_text(
+            json.dumps(
+                {
+                    "cache_version": 2,
+                    "session_id": "timeout-session",
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "validations": [
+                        {
+                            "validator_id": "Validator A",
+                            "content": "Test 1",
+                            "original_ref": "ref-1",
+                        },
+                        {
+                            "validator_id": "Validator B",
+                            "content": "Test 2",
+                            "original_ref": "ref-2",
+                        },
+                    ],
+                    "failed_validators": [],
+                    "evidence_score": {
+                        "total_score": 1.5,
+                        "verdict": "PASS",
+                        "per_validator": {
+                            "Validator A": {"score": 2.0, "verdict": "PASS"},
+                            "Validator B": {"score": 1.0, "verdict": "PASS"},
+                        },
+                        "findings_summary": {
+                            "CRITICAL": 0,
+                            "IMPORTANT": 1,
+                            "MINOR": 1,
+                            "CLEAN_PASS": 4,
+                        },
+                        "consensus_ratio": 0.5,
+                        "total_findings": 2,
+                        "consensus_count": 1,
+                        "unique_count": 1,
+                    },
+                }
+            )
+        )
+        state = State(
+            current_epic=11,
+            current_story="11.7",
+            current_phase=Phase.VALIDATE_STORY_SYNTHESIS,
+        )
+        partial = ProviderResult(
+            stdout="partial validation synthesis output",
+            stderr="validation synthesis timeout stderr",
+            exit_code=-1,
+            duration_ms=300_000,
+            model="opus-4",
+            command=("claude", "--print"),
+        )
+
+        with (
+            patch.object(handler, "render_prompt") as mock_render,
+            patch.object(handler, "invoke_provider") as mock_invoke,
+        ):
+            mock_render.return_value = "<compiled>test synthesis prompt</compiled>"
+            mock_invoke.side_effect = ProviderTimeoutError(
+                "validation synthesis timed out",
+                partial_result=partial,
+            )
+
+            result = handler.execute(state)
+
+        assert not result.success
+        assert result.error is not None
+        assert "Provider timeout" in result.error
+        artifact_path = Path(result.outputs["timeout_artifact"])
+        content = artifact_path.read_text(encoding="utf-8")
+        assert "partial validation synthesis output" in content
+        assert "validation synthesis timeout stderr" in content
+
 
 # =============================================================================
 # Test integration between handlers
@@ -486,9 +579,6 @@ class TestValidationHandlerIntegration:
         project_with_story: Path,
     ) -> None:
         """Session ID from validate handler is found by synthesis handler."""
-        from bmad_assist.core.loop.handlers.validate_story import (
-            ValidateStoryHandler,
-        )
         from bmad_assist.core.loop.handlers.validate_story_synthesis import (
             ValidateStorySynthesisHandler,
         )

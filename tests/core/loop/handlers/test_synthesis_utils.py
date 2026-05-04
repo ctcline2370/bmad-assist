@@ -27,7 +27,6 @@ from bmad_assist.core.loop.handlers.synthesis_utils import (
 )
 from bmad_assist.validation.anonymizer import AnonymizedValidation
 
-
 # =============================================================================
 # Fixtures
 # =============================================================================
@@ -227,7 +226,7 @@ class TestEstimateBaseContextTokens:
         (docs_dir / "project-context.md").write_text("# Project\n" * 100)
         (docs_dir / "architecture.md").write_text("# Architecture\n" * 100)
 
-        config = MagicMock()
+        config = object()
 
         with patch(
             "bmad_assist.core.paths.get_paths"
@@ -247,7 +246,7 @@ class TestEstimateBaseContextTokens:
         self, tmp_path: Path
     ) -> None:
         """Returns >0 even when project knowledge dir is missing."""
-        config = MagicMock()
+        config = object()
 
         # get_paths raises RuntimeError -> falls back to project_path / "docs"
         with patch(
@@ -258,14 +257,14 @@ class TestEstimateBaseContextTokens:
                 tmp_path, config, "validate_story_synthesis"
             )
 
-        # Story estimate (3000) + DV placeholder (2000) = 5000 minimum
-        assert result >= 5000
+        # Story estimate (3000) + source budget (10000) + DV placeholder (2000)
+        assert result >= 15000
 
     def test_code_review_synthesis_includes_security_dv_git_diff(
         self, tmp_path: Path
     ) -> None:
         """code_review_synthesis includes security + DV + git_diff placeholders."""
-        config = MagicMock()
+        config = object()
 
         with patch(
             "bmad_assist.core.paths.get_paths",
@@ -278,11 +277,65 @@ class TestEstimateBaseContextTokens:
                 tmp_path, config, "validate_story_synthesis"
             )
 
-        # Code review adds security (2000) + DV (2000) + git_diff (5000) = 9000 more
-        # Validate story only adds DV (2000)
-        # Difference should be security (2000) + git_diff (5000) = 7000
+        # Code review adds security (2000) + git_diff (5000), but its default
+        # source budget is 5000 while validate_story_synthesis defaults to 10000.
         assert cr_result > vs_result
-        assert cr_result - vs_result == 7000
+        assert cr_result - vs_result == 2000
+
+    def test_uses_active_story_file_when_identifiers_are_available(
+        self, tmp_path: Path
+    ) -> None:
+        """Uses the active story file instead of the generic story estimate."""
+        story_dir = tmp_path / "_bmad-output" / "implementation-artifacts" / "stories"
+        story_dir.mkdir(parents=True)
+        story_content = "# Story 8.2\n" + ("story evidence line\n" * 1200)
+        (story_dir / "8-2-real-story.md").write_text(story_content)
+
+        with patch(
+            "bmad_assist.core.paths.get_paths",
+            side_effect=RuntimeError("not initialized"),
+        ):
+            result = estimate_base_context_tokens(
+                tmp_path,
+                object(),
+                "validate_story_synthesis",
+                epic_num=8,
+                story_num=2,
+            )
+
+        expected_story_tokens = len(story_content) // 4
+        assert result >= expected_story_tokens + 10000 + 2000
+
+    def test_code_review_synthesis_counts_current_epic_antipatterns(
+        self, tmp_path: Path
+    ) -> None:
+        """Counts the same epic-scoped antipattern file loaded by the compiler."""
+        anti_dir = (
+            tmp_path
+            / "_bmad-output"
+            / "implementation-artifacts"
+            / "antipatterns"
+        )
+        anti_dir.mkdir(parents=True)
+        antipatterns = "verified issue from earlier code review\n" * 800
+        (anti_dir / "epic-8-code-antipatterns.md").write_text(antipatterns)
+
+        with patch(
+            "bmad_assist.core.paths.get_paths",
+            side_effect=RuntimeError("not initialized"),
+        ):
+            without_epic = estimate_base_context_tokens(
+                tmp_path, object(), "code_review_synthesis"
+            )
+            with_epic = estimate_base_context_tokens(
+                tmp_path,
+                object(),
+                "code_review_synthesis",
+                epic_num=8,
+                story_num=2,
+            )
+
+        assert with_epic - without_epic == len(antipatterns) // 4
 
 
 # =============================================================================
@@ -377,6 +430,42 @@ class TestValidateExtractionCompleteness:
             validate_extraction_completeness(raw, extracted, log)
             mock_warning.assert_called_once()
             assert "Possible finding loss" in mock_warning.call_args[0][0]
+
+    def test_generic_report_headings_do_not_create_false_loss_warning(
+        self, log: logging.Logger
+    ) -> None:
+        """Generic review sections are not counted as missing findings."""
+        raw = [
+            AnonymizedValidation(
+                validator_id="A",
+                content="\n".join(
+                    [
+                        "## Executive Summary",
+                        "## Scope",
+                        "## Method",
+                        "## Finding: Missing guard",
+                        "**Severity:** warning",
+                        "## Notes",
+                        "## Appendix",
+                    ]
+                ),
+                original_ref="a",
+            )
+        ]
+        extracted = [
+            AnonymizedValidation(
+                validator_id="A",
+                content="## Finding: Missing guard\n**Severity:** warning",
+                original_ref="a",
+            )
+        ]
+
+        with patch.object(log, "info") as mock_info, patch.object(
+            log, "warning"
+        ) as mock_warning:
+            validate_extraction_completeness(raw, extracted, log)
+            mock_info.assert_called_once()
+            mock_warning.assert_not_called()
 
     def test_empty_input_returns_without_error(
         self, log: logging.Logger

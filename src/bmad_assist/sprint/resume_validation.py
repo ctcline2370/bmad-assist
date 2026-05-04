@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from bmad_assist.core.exceptions import StateError
+from bmad_assist.core.retrospective_artifacts import has_durable_retrospective_artifact
 from bmad_assist.core.state import Phase, State
 from bmad_assist.core.types import EpicId
 from bmad_assist.sprint.models import SprintStatus
@@ -123,7 +124,7 @@ def _is_epic_done_in_sprint(
 
     An epic is only considered done if BOTH:
     1. epic-X entry has status "done"
-    2. epic-X-retrospective entry has status "done" (or doesn't exist)
+    2. epic-X-retrospective entry has status "done"
 
     If epic is "done" but retrospective is "backlog"/"in-progress", the epic
     is NOT considered done - it needs to run its retrospective phase.
@@ -144,13 +145,64 @@ def _is_epic_done_in_sprint(
     # Check retrospective status
     retro_key = f"epic-{epic_id}-retrospective"
     retro_entry = sprint_status.entries.get(retro_key)
+    return retro_entry is not None and retro_entry.status == "done"
 
+
+def _get_epic_teardown_gaps(
+    epic_id: EpicId,
+    sprint_status: SprintStatus,
+    project_path: Path,
+) -> list[str]:
+    """Return concrete teardown gaps that still block epic completion."""
+    gaps: list[str] = []
+
+    epic_status = sprint_status.get_epic_status(epic_id)
+    if epic_status != "done":
+        status = epic_status if epic_status is not None else "missing"
+        gaps.append(f"sprint-status epic entry is {status!r}")
+
+    retro_key = f"epic-{epic_id}-retrospective"
+    retro_entry = sprint_status.entries.get(retro_key)
     if retro_entry is None:
-        # No retrospective entry - assume epic is done (legacy compatibility)
-        return True
+        gaps.append("sprint-status retrospective entry is missing")
+    elif retro_entry.status != "done":
+        gaps.append(f"sprint-status retrospective entry is {retro_entry.status!r}")
 
-    # Epic is only done if retrospective is also done
-    return retro_entry.status == "done"
+    if not has_durable_retrospective_artifact(epic_id, project_path):
+        gaps.append("durable retrospective artifact is missing")
+
+    return gaps
+
+
+def _is_epic_durably_done(
+    epic_id: EpicId,
+    sprint_status: SprintStatus,
+    project_path: Path,
+) -> bool:
+    """Check if epic completion is durably backed by teardown artifacts."""
+    return not _get_epic_teardown_gaps(epic_id, sprint_status, project_path)
+
+
+def _ensure_prior_epics_durably_complete(
+    current_epic: EpicId,
+    epic_list: list[EpicId],
+    sprint_status: SprintStatus,
+    project_path: Path,
+) -> None:
+    """Fail closed if state advanced beyond an epic whose teardown is incomplete."""
+    try:
+        current_idx = epic_list.index(current_epic)
+    except ValueError:
+        return
+
+    for prior_epic in epic_list[:current_idx]:
+        gaps = _get_epic_teardown_gaps(prior_epic, sprint_status, project_path)
+        if gaps:
+            gap_text = "; ".join(gaps)
+            raise StateError(
+                f"Epic {prior_epic} teardown is incomplete ({gap_text}). "
+                f"Finish epic {prior_epic} teardown before advancing to epic {current_epic}."
+            )
 
 
 def validate_resume_state(
@@ -261,6 +313,13 @@ def validate_resume_state(
         # Type narrowing: current_epic is guaranteed non-None from here
         current_epic: EpicId = current_state.current_epic
 
+        _ensure_prior_epics_durably_complete(
+            current_epic,
+            epic_list,
+            sprint_status,
+            project_path,
+        )
+
         # CRITICAL: If we're in RETROSPECTIVE phase, don't skip anything.
         # The loop needs to execute the retrospective - we shouldn't try to
         # advance past it just because stories are done.
@@ -268,8 +327,8 @@ def validate_resume_state(
             logger.debug("Current phase is RETROSPECTIVE - not skipping, let loop execute it")
             break
 
-        # Check if current epic is done in sprint-status (including retrospective)
-        if _is_epic_done_in_sprint(current_epic, sprint_status):
+        # Check if current epic is durably done (sprint-status plus artifact)
+        if _is_epic_durably_done(current_epic, sprint_status, project_path):
             # Epic is done - add to completed_epics if not already there
             if current_epic not in current_state.completed_epics:
                 logger.info(
@@ -293,6 +352,7 @@ def validate_resume_state(
                 epic_list,
                 current_state.completed_epics,
                 sprint_status,
+                project_path,
             )
 
             if next_epic is None:
@@ -372,67 +432,17 @@ def validate_resume_state(
             )
 
             if next_story is None:
-                # All stories in epic done - epic should be marked done
-                # This is a consistency issue: stories all done but epic not marked done
-                logger.warning(
-                    "All stories in epic %s are done but epic not marked done in sprint-status",
+                gap_text = "; ".join(_get_epic_teardown_gaps(current_epic, sprint_status, project_path))
+                logger.error(
+                    "Epic %s has all stories marked done in sprint-status, but epic teardown is incomplete: %s",
                     current_epic,
+                    gap_text,
                 )
-                # Mark epic as completed and advance to the next epic
-                if current_epic not in current_state.completed_epics:
-                    epics_skipped.append(current_epic)
-                    current_state = current_state.model_copy(
-                        update={
-                            "completed_epics": [
-                                *current_state.completed_epics,
-                                current_epic,
-                            ],
-                            "updated_at": now,
-                        }
-                    )
-
-                # Find next epic that's not done
-                next_epic = _find_next_incomplete_epic(
-                    current_epic,
-                    epic_list,
-                    current_state.completed_epics,
-                    sprint_status,
+                raise StateError(
+                    f"Epic {current_epic} has all stories marked done in sprint-status, "
+                    f"but epic teardown is incomplete ({gap_text}). Finish the epic teardown "
+                    "before advancing to the next epic."
                 )
-
-                if next_epic is None:
-                    # All epics done
-                    logger.info("All epics are done (all stories completed)")
-                    return ResumeValidationResult(
-                        state=current_state,
-                        stories_skipped=stories_skipped,
-                        epics_skipped=epics_skipped,
-                        advanced=bool(stories_skipped or epics_skipped),
-                        project_complete=True,
-                    )
-
-                # Advance to next epic
-                try:
-                    next_epic_stories = epic_stories_loader(next_epic)
-                except Exception as e:
-                    raise StateError(f"Failed to load stories for epic {next_epic}: {e}") from e
-
-                if not next_epic_stories:
-                    raise StateError(f"No stories found in epic {next_epic}")
-
-                current_state = current_state.model_copy(
-                    update={
-                        "current_epic": next_epic,
-                        "current_story": next_epic_stories[0],
-                        "current_phase": Phase.CREATE_STORY,
-                        "updated_at": now,
-                    }
-                )
-                logger.info(
-                    "Advanced to epic %s, story %s",
-                    next_epic,
-                    next_epic_stories[0],
-                )
-                continue
 
             # Advance to next story
             current_state = current_state.model_copy(
@@ -466,6 +476,7 @@ def _find_next_incomplete_epic(
     epic_list: list[EpicId],
     completed_epics: list[EpicId],
     sprint_status: SprintStatus,
+    project_path: Path,
 ) -> EpicId | None:
     """Find the next epic that is not complete.
 
@@ -494,9 +505,9 @@ def _find_next_incomplete_epic(
         if epic in completed_epics:
             logger.debug("Skipping epic %s - in completed_epics", epic)
             continue
-        # Skip if done in sprint-status
-        if _is_epic_done_in_sprint(epic, sprint_status):
-            logger.debug("Skipping epic %s - done in sprint-status", epic)
+        # Skip only if durably complete
+        if _is_epic_durably_done(epic, sprint_status, project_path):
+            logger.debug("Skipping epic %s - durably done", epic)
             continue
         return epic
 

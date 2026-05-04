@@ -8,6 +8,7 @@ a new dependency. The Dev Notes specify this approach.
 """
 
 import asyncio
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -22,8 +23,8 @@ from bmad_assist.core.config import (
     MultiProviderConfig,
     ProviderConfig,
 )
+from bmad_assist.core.exceptions import ProviderTimeoutError
 from bmad_assist.providers.base import BaseProvider, ProviderResult
-
 
 # =============================================================================
 # Fixtures
@@ -312,6 +313,149 @@ class TestRunValidationPhase:
             # Should succeed with remaining validators
             assert result.validation_count >= 2
             assert len(result.failed_validators) >= 1
+
+
+class TestValidationTaskCollection:
+    """Tests for bounded validation task collection."""
+
+    def test_calculates_sweep_timeout_from_provider_timeout_and_retries(self) -> None:
+        """Sweep timeout includes provider attempts, start delay, and grace."""
+        from bmad_assist.validation.orchestrator import _calculate_validation_sweep_timeout
+
+        timeout = _calculate_validation_sweep_timeout(
+            timeout=120,
+            timeout_retries=1,
+            task_count=3,
+            max_start_delay=5.0,
+        )
+
+        assert timeout == 305.0
+
+    def test_sweep_timeout_preserves_completed_results_and_cancels_stragglers(self) -> None:
+        """A stalled validator cannot discard already completed validator output."""
+        from bmad_assist.validation.anonymizer import ValidationOutput
+        from bmad_assist.validation.orchestrator import _collect_validation_task_results
+
+        async def fast_validator():
+            output = ValidationOutput(
+                provider="fast",
+                model="test-model",
+                content="fast validation",
+                timestamp=datetime.now(UTC),
+                duration_ms=10,
+                token_count=3,
+            )
+            return "fast", output, None, None
+
+        async def stuck_validator():
+            await asyncio.sleep(60)
+            return "stuck", None, None, "unexpected completion"
+
+        async def run_collection():
+            tasks = [
+                asyncio.create_task(fast_validator()),
+                asyncio.create_task(stuck_validator()),
+            ]
+            return await _collect_validation_task_results(
+                tasks,
+                ["A:fast", "B:stuck"],
+                timeout_seconds=0.01,
+            )
+
+        with patch("bmad_assist.validation.orchestrator.kill_all_child_pgids") as kill_mock:
+            results = asyncio.run(run_collection())
+
+        assert any(
+            isinstance(result, tuple) and result[0] == "fast"
+            for result in results
+        )
+        assert any(
+            isinstance(result, tuple)
+            and result[0] == "stuck"
+            and result[1] is None
+            and "exceeded phase timeout" in str(result[3])
+            for result in results
+        )
+        kill_mock.assert_called_once()
+
+    def test_invoke_validator_passes_cancel_token_to_provider(
+        self, mock_provider: MagicMock
+    ) -> None:
+        """Provider calls receive a cancellation token for orchestrator teardown."""
+        from bmad_assist.validation.orchestrator import _invoke_validator
+
+        asyncio.run(
+            _invoke_validator(
+                mock_provider,
+                "prompt",
+                5,
+                "validator-a",
+                model="mock-model",
+                timeout_retries=0,
+            )
+        )
+
+        cancel_token = mock_provider.invoke.call_args.kwargs["cancel_token"]
+        assert isinstance(cancel_token, threading.Event)
+        assert cancel_token.is_set() is False
+
+    def test_invoke_validator_persists_timeout_artifact_before_retry(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Retried validator timeouts persist partial output for diagnosis."""
+        from bmad_assist.validation.orchestrator import _invoke_validator
+
+        provider = MagicMock()
+        provider.provider_name = "mock"
+        partial = ProviderResult(
+            stdout="partial validation stdout",
+            stderr="partial validation stderr",
+            exit_code=-1,
+            duration_ms=123,
+            model="mock-model",
+            command=("mock",),
+        )
+        provider.invoke.side_effect = [
+            ProviderTimeoutError("validator timed out", partial_result=partial),
+            ProviderResult(
+                stdout="Mock validation output",
+                stderr="",
+                exit_code=0,
+                duration_ms=1000,
+                model="mock-model",
+                command=("mock",),
+            ),
+        ]
+
+        provider_id, output, _deterministic, error = asyncio.run(
+            _invoke_validator(
+                provider,
+                "prompt",
+                5,
+                "validator-a",
+                model="mock-model",
+                timeout_retries=1,
+                epic_num=8,
+                story_num=2,
+                cwd=tmp_path,
+            )
+        )
+
+        assert provider_id == "validator-a"
+        assert output is not None
+        assert error is None
+        artifacts = list((tmp_path / ".bmad-assist" / "provider-timeouts").glob("*.md"))
+        assert len(artifacts) == 1
+        artifact = artifacts[0].read_text(encoding="utf-8")
+        assert "- Phase: validate_story" in artifact
+        assert "- Epic: 8" in artifact
+        assert "- Story: 2" in artifact
+        assert "- ProviderId: validator-a" in artifact
+        assert "- Attempt: 1" in artifact
+        assert "- WillRetry: True" in artifact
+        assert "partial validation stdout" in artifact
+        assert "partial validation stderr" in artifact
 
 
 # =============================================================================
@@ -905,8 +1049,6 @@ class TestStory22_8ValidationSynthesisSaving:
             mock_compile.return_value = mock_compiled
 
             # Mock save_validation_report to fail with OSError
-            import os
-
             mock_save.side_effect = OSError("Permission denied")
 
             # Should NOT crash - should continue and log warning

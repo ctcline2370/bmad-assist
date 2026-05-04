@@ -267,10 +267,12 @@ def start_stream_reader_threads(
     stdout_thread = threading.Thread(
         target=read_stream_lines,
         args=(process.stdout, stdout_chunks, stdout_callback),
+        daemon=True,
     )
     stderr_thread = threading.Thread(
         target=read_stream_lines,
         args=(process.stderr, stderr_chunks, stderr_callback),
+        daemon=True,
     )
     stdout_thread.start()
     stderr_thread.start()

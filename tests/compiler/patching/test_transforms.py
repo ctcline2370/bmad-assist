@@ -385,3 +385,20 @@ class TestFixXmlEntities:
         content = "<action>Check if score &lt; 3</action>"
         result = fix_xml_entities(content)
         assert result == content
+
+    def test_preserves_markdown_instructions_with_ampersand(self) -> None:
+        """Preserves markdown bodies wrapped in instructions-xml."""
+        content = """<workflow-source>
+<workflow-yaml>
+name: testarch-trace
+</workflow-yaml>
+<instructions-xml>
+# Requirements Traceability & Quality Gate Decision
+
+Use Markdown and compare values like score < 3.
+</instructions-xml>
+</workflow-source>"""
+
+        result = fix_xml_entities(content)
+
+        assert result == content

@@ -116,26 +116,18 @@ def _load_context_documents(
         return ""
 
     # Map config flags to paths and names
-    # Note: project_context_file uses underscore (project_context.md), but we
-    # also check the hyphenated version (project-context.md) for compatibility
     doc_mappings: list[tuple[bool, Path, str]] = [
         (config.include_prd, paths.prd_file, "PRD"),
         (config.include_architecture, paths.architecture_file, "Architecture"),
     ]
 
-    # Handle project-context with fallback to both naming conventions
     if config.include_project_context:
-        # Primary: project_context.md (as defined in paths.py)
-        pc_path = paths.project_context_file
-        # Fallback: project-context.md (common convention)
-        pc_path_alt = paths.project_knowledge / "project-context.md"
-        if pc_path.exists():
+        pc_path = _find_project_context_for_deep_verify(paths)
+        if pc_path is not None:
             doc_mappings.append((True, pc_path, "Project Context"))
-        elif pc_path_alt.exists():
-            doc_mappings.append((True, pc_path_alt, "Project Context"))
         else:
             logger.warning(
-                "Project context not found at %s or %s", pc_path, pc_path_alt
+                "Project context not found in any known location for Deep Verify"
             )
 
     for include, doc_path, doc_name in doc_mappings:
@@ -170,6 +162,56 @@ def _load_context_documents(
         )
 
     return "\n".join(context_parts)
+
+
+def _find_project_context_for_deep_verify(paths: object) -> Path | None:
+    """Find project-context.md using the same broad locations as compilers.
+
+    Deep Verify runs from validation orchestration, not from a compiler context,
+    so it cannot call compiler.shared_utils.find_project_context_file directly.
+    Keep this resolver aligned with that search order so validation and Deep
+    Verify see the same project rules in autonomous runs.
+    """
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+
+    def add_candidate(candidate: Path | None) -> None:
+        if candidate is None or candidate in seen:
+            return
+        seen.add(candidate)
+        candidates.append(candidate)
+
+    def add_dir(directory: object) -> None:
+        if not isinstance(directory, Path):
+            return
+        add_candidate(directory / "project-context.md")
+        add_candidate(directory / "project_context.md")
+
+    direct = getattr(paths, "project_context_file", None)
+    if isinstance(direct, Path):
+        add_candidate(direct)
+        add_candidate(direct.parent / "project-context.md")
+
+    add_dir(getattr(paths, "project_knowledge", None))
+    add_dir(getattr(paths, "output_folder", None))
+
+    implementation_artifacts = getattr(paths, "implementation_artifacts", None)
+    if isinstance(implementation_artifacts, Path):
+        add_dir(implementation_artifacts)
+        add_dir(implementation_artifacts.parent)
+
+    add_dir(getattr(paths, "project_docs_fallback", None))
+    add_dir(getattr(paths, "project_root", None))
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+
+    logger.debug(
+        "Deep Verify project context candidates missing: %s",
+        ", ".join(str(candidate) for candidate in candidates),
+    )
+    return None
 
 
 async def run_deep_verify_validation(

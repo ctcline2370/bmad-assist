@@ -308,12 +308,15 @@ loop:
 
   # Code review rework loop (optional)
   code_review_rework: true    # Re-run dev_story when review verdict is negative
-  max_rework_attempts: 2      # Max dev→review→fix cycles before moving on
+  max_rework_attempts: 2      # Max dev→review→fix cycles before the run stops
+  fail_on_unresolved_negative_code_review: true  # Default: stop instead of advancing
 ```
 
 ### Code Review Rework Loop
 
 When `code_review_rework: true`, the runner checks the code review synthesis verdict. If the verdict is negative (issues found), it automatically loops back to `dev_story` for fixes, then re-runs code review. The cycle repeats up to `max_rework_attempts` times.
+
+If a negative verdict still remains after those attempts are exhausted, the run stops by default. Set `fail_on_unresolved_negative_code_review: false` only if you intentionally want the legacy fail-open behavior that continues to the next story despite unresolved review findings.
 
 ```
 dev_story → code_review → code_review_synthesis

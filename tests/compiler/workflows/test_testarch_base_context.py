@@ -111,9 +111,8 @@ class TestTEAContextIntegration:
         mock_testarch.context = TEAContextConfig(enabled=True)
         mock_config = MagicMock()
         mock_config.testarch = mock_testarch
-        object.__setattr__(context, "config", mock_config)
-
-        assert is_tea_context_enabled(context) is True
+        with patch("bmad_assist.core.config.loaders.get_config", return_value=mock_config):
+            assert is_tea_context_enabled(context) is True
 
     def test_build_context_files_skips_tea_when_disabled(self, tmp_path):
         """TEA context should NOT be collected when config is not present."""

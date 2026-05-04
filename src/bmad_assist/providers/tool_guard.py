@@ -18,6 +18,7 @@ import contextlib
 import dataclasses
 import logging
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -310,6 +311,60 @@ def build_termination_fields(
     return None, None
 
 
+def _isolated_process_group_id(process: subprocess.Popen[Any]) -> int | None:
+    """Return the child process group when it is safe to signal as a group."""
+    try:
+        pgid = os.getpgid(process.pid)
+        own_pgid = os.getpgrp()
+    except (ProcessLookupError, PermissionError, OSError, TypeError):
+        return None
+    if pgid == own_pgid:
+        return None
+    return pgid
+
+
+def terminate_process_tree(
+    process: subprocess.Popen[Any],
+    *,
+    grace_seconds: float = 3.0,
+) -> None:
+    """Terminate a subprocess and its isolated process group when available.
+
+    Providers launch CLI agents with ``start_new_session=True`` so the parent
+    process and any descendants share a process group outside bmad-assist's
+    own group. Terminating only the parent can leave child CLI processes
+    orphaned. When the process is not isolated, this falls back to the single
+    process to avoid signaling bmad-assist's own process group.
+    """
+    if process.poll() is not None:
+        return
+
+    pgid = _isolated_process_group_id(process)
+    if pgid is not None:
+        logger.info("Terminating process group %d (SIGTERM)", pgid)
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            return
+    else:
+        with contextlib.suppress(OSError):
+            process.terminate()
+
+    try:
+        process.wait(timeout=grace_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    if pgid is not None:
+        logger.warning("Process group %d did not terminate, escalating to SIGKILL", pgid)
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            os.killpg(pgid, signal.SIGKILL)
+    else:
+        with contextlib.suppress(OSError):
+            process.kill()
+
+
 def start_guard_monitor(
     process: subprocess.Popen[Any],
     guard_kill_event: threading.Event,
@@ -341,14 +396,7 @@ def start_guard_monitor(
         while not guard_kill_event.is_set() and not guard_done_event.is_set():
             guard_kill_event.wait(timeout=0.5)
         if guard_kill_event.is_set():
-            # Graceful: SIGTERM first, then SIGKILL after 3s
-            with contextlib.suppress(OSError):
-                process.terminate()
-            try:
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                with contextlib.suppress(OSError):
-                    process.kill()
+            terminate_process_tree(process)
 
     thread = threading.Thread(target=_monitor, daemon=True)
     thread.start()

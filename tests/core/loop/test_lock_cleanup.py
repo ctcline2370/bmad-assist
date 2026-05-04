@@ -19,14 +19,16 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
 import pytest
+import yaml
 
 from bmad_assist.core.exceptions import StateError
+from bmad_assist.core.loop.run_tracking import CurrentPhase, RunLog, RunStatus, save_run_log
 
 if TYPE_CHECKING:
     pass
@@ -372,6 +374,83 @@ class TestStaleLockDetection:
 
         # Lock should work normally after cleanup
         assert not lock_path.exists()
+
+    def test_stale_lock_recovery_finalizes_running_run(self, tmp_path: Path) -> None:
+        """Dead-PID stale recovery should finalize the full stale running backlog."""
+        from bmad_assist.core.loop.locking import _running_lock
+
+        assist_dir = tmp_path / ".bmad-assist"
+        assist_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = assist_dir / "running.lock"
+        lock_path.write_text("99999999\n2026-04-21T09:02:37.199244+00:00\n")
+
+        older_started_at = datetime(2026, 4, 21, 8, 52, 37, tzinfo=timezone.utc)
+        newer_started_at = datetime(2026, 4, 21, 9, 2, 37, tzinfo=timezone.utc)
+        older_yaml = save_run_log(
+            RunLog(
+                run_id="deadpid0",
+                started_at=older_started_at,
+                current_phase=CurrentPhase(
+                    phase="DEV_STORY",
+                    started_at=older_started_at,
+                    provider="openai",
+                    model="gpt-5.4",
+                ),
+            ),
+            tmp_path,
+        )
+        newer_yaml = save_run_log(
+            RunLog(
+                run_id="deadpid1",
+                started_at=newer_started_at,
+                current_phase=CurrentPhase(
+                    phase="DEV_STORY",
+                    started_at=newer_started_at,
+                    provider="openai",
+                    model="gpt-5.4",
+                ),
+            ),
+            tmp_path,
+        )
+
+        with patch("bmad_assist.core.io.init_run_prompts_dir"):
+            with _running_lock(tmp_path):
+                pass
+
+        for yaml_path in (older_yaml, newer_yaml):
+            data = yaml.safe_load(yaml_path.read_text())
+            assert data["status"] == RunStatus.CRASHED.value
+            assert data["exit_reason"] == "stale_lock_recovered_dead_pid"
+            assert data["ended_at"] is not None
+            assert data["current_phase"] is None
+
+    def test_missing_lock_recovery_finalizes_running_run(self, tmp_path: Path) -> None:
+        """Startup should reconcile stale RUNNING logs even when no lock remains."""
+        from bmad_assist.core.loop.locking import _running_lock
+
+        started_at = datetime(2026, 4, 24, 15, 23, 5, tzinfo=UTC)
+        yaml_path = save_run_log(
+            RunLog(
+                run_id="nolock01",
+                started_at=started_at,
+                current_phase=CurrentPhase(
+                    phase="VALIDATE_STORY",
+                    started_at=started_at,
+                    provider="codex",
+                    model="gpt-5.5",
+                ),
+            ),
+            tmp_path,
+        )
+
+        with patch("bmad_assist.core.io.init_run_prompts_dir"), _running_lock(tmp_path):
+            pass
+
+        data = yaml.safe_load(yaml_path.read_text())
+        assert data["status"] == RunStatus.CRASHED.value
+        assert data["exit_reason"] == "stale_run_recovered_missing_lock"
+        assert data["ended_at"] is not None
+        assert data["current_phase"] is None
 
     def test_stale_lock_warning_includes_timestamp(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture

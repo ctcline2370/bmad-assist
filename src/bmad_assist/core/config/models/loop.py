@@ -79,7 +79,11 @@ class LoopConfig(BaseModel):
         default=2,
         ge=1,
         le=5,
-        description="Maximum rework cycles before continuing despite negative verdict (1-5)",
+        description="Maximum rework cycles before stopping on an unresolved negative code review verdict (1-5)",
+    )
+    fail_on_unresolved_negative_code_review: bool = Field(
+        default=True,
+        description="Stop the run when REJECT or MAJOR_REWORK remains unresolved instead of continuing to the next story",
     )
     evidence_reject_threshold: float = Field(
         default=6.0,

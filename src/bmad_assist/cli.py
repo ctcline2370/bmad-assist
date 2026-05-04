@@ -34,13 +34,14 @@ from bmad_assist.core.config import (
     load_config_with_project,
 )
 from bmad_assist.core.config_generator import run_config_wizard
-from bmad_assist.core.exceptions import ConfigError
+from bmad_assist.core.exceptions import ConfigError, StateError
 from bmad_assist.core.io import get_original_cwd
 from bmad_assist.core.loop import LoopExitReason, run_loop
 from bmad_assist.core.loop.interactive import set_non_interactive, set_skip_story_prompts
 from bmad_assist.core.paths import init_paths
 from bmad_assist.core.state import Phase, get_state_path, load_state, save_state, update_position
 from bmad_assist.core.types import EpicId, epic_sort_key, parse_epic_id
+from bmad_assist.sprint.resume_validation import validate_resume_state
 
 # Module logger
 logger = logging.getLogger(__name__)
@@ -64,21 +65,25 @@ def main(ctx: typer.Context) -> None:
 
 def _load_epic_data(
     config: Config, project_path: Path
-) -> tuple[list[EpicId], dict[EpicId, list[str]]]:
+) -> tuple[
+    list[EpicId],
+    dict[EpicId, list[str]],
+    list[EpicId],
+    dict[EpicId, list[str]],
+]:
     """Load epic list and story mapping from BMAD files.
 
     Reads project state from BMAD documentation and extracts:
-    - Sorted list of unique epic numbers
-    - Mapping of epic number to list of story IDs
+    - Active scope: non-done stories only for normal loop progression
+    - Lifecycle scope: all stories for resume validation and epic teardown
 
     Args:
         config: Loaded configuration with bmad_paths.
         project_path: Path to project root directory.
 
     Returns:
-        Tuple of (epic_list, stories_by_epic) where:
-        - epic_list: Sorted list of epic numbers [1, 2, 3, ...]
-        - stories_by_epic: Dict mapping epic -> story IDs {1: ["1.1", "1.2"], ...}
+        Tuple of (active_epic_list, active_stories_by_epic, lifecycle_epic_list,
+        lifecycle_stories_by_epic).
 
     Raises:
         FileNotFoundError: If BMAD docs directory doesn't exist.
@@ -96,34 +101,45 @@ def _load_epic_data(
     # Read project state (handles both sharded and single-file patterns, and sprint-status)
     project_state = read_project_state(bmad_path, use_sprint_status=True)
 
-    # Extract unique epic numbers from stories
-    # CRITICAL: Only include NON-DONE stories to prevent premature RETROSPECTIVE trigger
-    # When all stories in epic are done, epic should transition to RETROSPECTIVE
-    epic_numbers: set[EpicId] = set()
-    stories_by_epic: dict[EpicId, list[str]] = {}
+    active_epic_numbers: set[EpicId] = set()
+    active_stories_by_epic: dict[EpicId, list[str]] = {}
+    lifecycle_epic_numbers: set[EpicId] = set()
+    lifecycle_stories_by_epic: dict[EpicId, list[str]] = {}
 
     for story in project_state.all_stories:
-        # Skip stories that are already done - they should not be in the active list
+        epic_part = story.number.split(".")[0]
+        epic_id = parse_epic_id(epic_part)  # Supports int and string epic IDs
+        lifecycle_epic_numbers.add(epic_id)
+
+        if epic_id not in lifecycle_stories_by_epic:
+            lifecycle_stories_by_epic[epic_id] = []
+        lifecycle_stories_by_epic[epic_id].append(story.number)
+
+        # Keep normal loop progression scoped to non-done stories so teardown
+        # runs only after story execution is complete.
         if story.status == "done":
             continue
 
-        epic_part = story.number.split(".")[0]
-        epic_id = parse_epic_id(epic_part)  # Supports int and string epic IDs
-        epic_numbers.add(epic_id)
+        active_epic_numbers.add(epic_id)
+        if epic_id not in active_stories_by_epic:
+            active_stories_by_epic[epic_id] = []
+        active_stories_by_epic[epic_id].append(story.number)
 
-        if epic_id not in stories_by_epic:
-            stories_by_epic[epic_id] = []
-        stories_by_epic[epic_id].append(story.number)
-
-    epic_list = sorted(epic_numbers, key=epic_sort_key)
+    active_epic_list = sorted(active_epic_numbers, key=epic_sort_key)
+    lifecycle_epic_list = sorted(lifecycle_epic_numbers, key=epic_sort_key)
 
     logger.info(
         "Loaded %d epics with %d total stories",
-        len(epic_list),
+        len(lifecycle_epic_list),
         len(project_state.all_stories),
     )
 
-    return epic_list, stories_by_epic
+    return (
+        active_epic_list,
+        active_stories_by_epic,
+        lifecycle_epic_list,
+        lifecycle_stories_by_epic,
+    )
 
 
 def _handle_debug_vars(config: Config, project_path: Path) -> None:
@@ -547,7 +563,12 @@ def run(
 
         # Load epic list and story mapping from BMAD files
         try:
-            epic_list, stories_by_epic = _load_epic_data(loaded_config, project_path)
+            (
+                epic_list,
+                stories_by_epic,
+                lifecycle_epic_list,
+                lifecycle_stories_by_epic,
+            ) = _load_epic_data(loaded_config, project_path)
         except FileNotFoundError as e:
             _error(f"BMAD documentation not found: {e}")
             _error("Ensure your project has a docs/ directory with epics.md")
@@ -556,6 +577,10 @@ def run(
         def epic_stories_loader(epic: EpicId) -> list[str]:
             """Return story IDs for given epic number."""
             return stories_by_epic.get(epic, [])
+
+        def lifecycle_epic_stories_loader(epic: EpicId) -> list[str]:
+            """Return story IDs for lifecycle validation and teardown checks."""
+            return lifecycle_stories_by_epic.get(epic, [])
 
         # Validate: --story requires --epic
         if story and not epic:
@@ -598,8 +623,8 @@ def run(
                 project_paths.project_knowledge,
                 epic,
                 story,
-                epic_list,
-                stories_by_epic,
+                lifecycle_epic_list,
+                lifecycle_stories_by_epic,
                 force,
             )
 
@@ -616,7 +641,7 @@ def run(
                 # epic is guaranteed non-None (validated above)
                 assert epic is not None
                 resolved_epic = parse_epic_id(epic.strip())
-                epic_story_list = stories_by_epic.get(resolved_epic, [])
+                epic_story_list = lifecycle_stories_by_epic.get(resolved_epic, [])
                 if epic_story_list:
                     last_story = epic_story_list[-1]
                     update_position(state, story=last_story)
@@ -628,6 +653,16 @@ def run(
 
         # Handle debug vars mode - display variables and exit without LLM
         if debug_vars:
+            state_path = get_state_path(loaded_config, project_root=project_path)
+            state = load_state(state_path)
+            validation = validate_resume_state(
+                state,
+                project_path,
+                lifecycle_epic_list,
+                lifecycle_epic_stories_loader,
+            )
+            if validation.advanced:
+                save_state(validation.state, state_path)
             _handle_debug_vars(loaded_config, project_path)
             raise typer.Exit(code=EXIT_SUCCESS)
 
@@ -637,6 +672,8 @@ def run(
             project_path,
             epic_list,
             epic_stories_loader,
+            lifecycle_epic_list=lifecycle_epic_list,
+            lifecycle_epic_stories_loader=lifecycle_epic_stories_loader,
             ipc_enabled=not no_ipc,
             plain=plain,
         )
@@ -663,6 +700,9 @@ def run(
     except ConfigError as e:
         _error(str(e))
         raise typer.Exit(code=EXIT_CONFIG_ERROR) from None
+    except StateError as e:
+        _error(str(e))
+        raise typer.Exit(code=EXIT_ERROR) from None
     except typer.Exit:
         # Re-raise typer exits (already handled)
         raise
@@ -694,34 +734,44 @@ def reset_lock_command(
     the process has actually terminated (stale lock).
     """
     from bmad_assist.core.loop.locking import _is_pid_alive, _read_lock_file
+    from bmad_assist.core.loop.run_tracking import reconcile_stale_running_runs
 
     # Resolve project path
     project_path = project.resolve()
     lock_path = project_path / ".bmad-assist" / "running.lock"
 
-    if not lock_path.exists():
-        _info(f"No lock file found at {lock_path}")
-        raise typer.Exit(code=EXIT_SUCCESS)
+    if lock_path.exists():
+        # Read lock file to report what we're removing
+        pid, timestamp = _read_lock_file(lock_path)
 
-    # Read lock file to report what we're removing
-    pid, timestamp = _read_lock_file(lock_path)
+        # Check if process is actually alive
+        if pid is not None and _is_pid_alive(pid):
+            _warning(f"Process {pid} is still running! Lock file is valid.")
+            _warning("If you're sure no bmad-assist run is active, use --force (not implemented yet)")
+            raise typer.Exit(code=EXIT_WARNING)
 
-    # Check if process is actually alive
-    if pid is not None and _is_pid_alive(pid):
-        _warning(f"Process {pid} is still running! Lock file is valid.")
-        _warning("If you're sure no bmad-assist run is active, use --force (not implemented yet)")
-        raise typer.Exit(code=EXIT_WARNING)
+        # Remove the lock file
+        try:
+            lock_path.unlink()
+        except OSError as e:
+            _error(f"Failed to remove lock file: {e}")
+            raise typer.Exit(code=EXIT_ERROR) from None
 
-    # Remove the lock file
-    try:
-        lock_path.unlink()
         if pid is not None:
             _success(f"Removed stale lock file (PID {pid}, locked at {timestamp})")
         else:
             _success(f"Removed lock file at {lock_path}")
-    except OSError as e:
-        _error(f"Failed to remove lock file: {e}")
-        raise typer.Exit(code=EXIT_ERROR) from None
+    else:
+        _info(f"No lock file found at {lock_path}")
+
+    reconciled_runs = reconcile_stale_running_runs(
+        project_path,
+        exit_reason="manual_reset_lock_recovered_dead_pid",
+    )
+    if len(reconciled_runs) == 1:
+        _info(f"Finalized stale run log: {reconciled_runs[0].name}")
+    elif reconciled_runs:
+        _info(f"Finalized {len(reconciled_runs)} stale run logs (latest: {reconciled_runs[0].name})")
 
 
 # ============================================================================

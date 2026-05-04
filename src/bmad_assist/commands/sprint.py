@@ -4,7 +4,9 @@ Commands for sprint-status management and validation.
 """
 
 import sys
+import re
 from dataclasses import dataclass
+from datetime import UTC, datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -21,9 +23,10 @@ from bmad_assist.cli_utils import (
     console,
 )
 from bmad_assist.core.config import load_config_with_project
-from bmad_assist.core.exceptions import BmadAssistError, ConfigError
+from bmad_assist.core.exceptions import BmadAssistError, ConfigError, StateError
 
 if TYPE_CHECKING:
+    from bmad_assist.bmad.state_reader import ProjectState
     from bmad_assist.sprint.reconciler import StatusChange
 
 sprint_app = typer.Typer(
@@ -190,9 +193,372 @@ def _display_discrepancies_table(discrepancies: list[Discrepancy]) -> None:
     console.print(table)
 
 
+def _story_key_match(key: str) -> re.Match[str] | None:
+    """Match the epic/story prefix of a sprint status key."""
+    return re.match(r"^(?P<epic>[a-z0-9-]+?)-(?P<story>\d+)(?:-|$)", key, re.IGNORECASE)
+
+
+def _story_epic_id(key: str) -> str | None:
+    """Return the epic identifier for a sprint story key."""
+    match = _story_key_match(key)
+    if not match:
+        return None
+    return match.group("epic").lower()
+
+
+def _story_sort_key(key: str) -> tuple[int, int, int, str, int, str]:
+    """Sort sprint story keys by epic, story number, then full key."""
+    match = _story_key_match(key)
+    if not match:
+        return (1, 1, 0, key.lower(), 0, key.lower())
+
+    epic = match.group("epic").lower()
+    story = int(match.group("story"))
+    if epic.isdigit():
+        return (0, 0, int(epic), "", story, key.lower())
+    return (0, 1, 0, epic, story, key.lower())
+
+
+def _is_story_entry(entry_type: object) -> bool:
+    """Return True for status entries that represent sprint work items."""
+    from bmad_assist.sprint.classifier import EntryType
+
+    return entry_type not in (EntryType.EPIC_META, EntryType.RETROSPECTIVE)
+
+
+def _parse_status_timestamp(value: datetime | None) -> datetime | None:
+    """Normalize sprint metadata timestamps for staleness checks."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _build_sprint_status_summary(
+    project_root: Path,
+    sprint_path: Path,
+) -> dict[str, object]:
+    """Build a read-only summary matching the BMAD sprint-status workflow."""
+    from bmad_assist.sprint import parse_sprint_status
+    from bmad_assist.sprint.classifier import EntryType
+
+    sprint_status = parse_sprint_status(sprint_path)
+
+    story_entries = [
+        entry for entry in sprint_status.entries.values() if _is_story_entry(entry.entry_type)
+    ]
+    epic_entries = [
+        entry
+        for entry in sprint_status.entries.values()
+        if entry.entry_type == EntryType.EPIC_META
+    ]
+    retrospective_entries = [
+        entry
+        for entry in sprint_status.entries.values()
+        if entry.entry_type == EntryType.RETROSPECTIVE
+    ]
+
+    story_counts = {
+        "backlog": 0,
+        "ready-for-dev": 0,
+        "in-progress": 0,
+        "review": 0,
+        "done": 0,
+        "blocked": 0,
+        "deferred": 0,
+    }
+    for entry in story_entries:
+        story_counts.setdefault(entry.status, 0)
+        story_counts[entry.status] += 1
+
+    epic_counts = {"backlog": 0, "in-progress": 0, "done": 0, "blocked": 0, "deferred": 0}
+    for entry in epic_entries:
+        epic_counts.setdefault(entry.status, 0)
+        epic_counts[entry.status] += 1
+
+    retrospective_counts = {"optional": 0, "done": 0}
+    for entry in retrospective_entries:
+        retrospective_counts.setdefault(entry.status, 0)
+        retrospective_counts[entry.status] += 1
+
+    sorted_story_entries = sorted(story_entries, key=lambda entry: _story_sort_key(entry.key))
+    sorted_retro_entries = sorted(retrospective_entries, key=lambda entry: entry.key.lower())
+
+    next_workflow_id: str | None = None
+    next_story_id: str | None = None
+    next_agent: str | None = None
+
+    for status, workflow in [
+        ("in-progress", "dev-story"),
+        ("review", "code-review"),
+        ("ready-for-dev", "dev-story"),
+        ("backlog", "create-story"),
+    ]:
+        match = next((entry for entry in sorted_story_entries if entry.status == status), None)
+        if match is not None:
+            next_workflow_id = workflow
+            next_story_id = match.key
+            next_agent = "DEV"
+            break
+
+    if next_workflow_id is None:
+        retro_match = next(
+            (entry for entry in sorted_retro_entries if entry.status == "optional"),
+            None,
+        )
+        if retro_match is not None:
+            next_workflow_id = "retrospective"
+            next_story_id = retro_match.key
+            next_agent = "DEV"
+
+    risks: list[str] = []
+    review_keys = [entry.key for entry in sorted_story_entries if entry.status == "review"]
+    if review_keys:
+        risks.append(
+            "Story status 'review' detected; run code-review for "
+            + ", ".join(review_keys[:3])
+            + (" ..." if len(review_keys) > 3 else "")
+        )
+
+    in_progress_keys = [
+        entry.key for entry in sorted_story_entries if entry.status == "in-progress"
+    ]
+    if in_progress_keys and story_counts.get("ready-for-dev", 0) == 0:
+        risks.append(
+            "Active story in progress and no ready-for-dev stories; stay focused on "
+            + in_progress_keys[0]
+        )
+
+    if (
+        epic_entries
+        and all(entry.status == "backlog" for entry in epic_entries)
+        and story_counts.get("ready-for-dev", 0) == 0
+    ):
+        risks.append("All epics are backlog and no ready-for-dev story is available.")
+
+    status_time = _parse_status_timestamp(
+        sprint_status.metadata.last_updated or sprint_status.metadata.generated
+    )
+    if status_time is not None:
+        age_days = (datetime.now(timezone.utc) - status_time).days
+        if age_days > 7:
+            risks.append("sprint-status.yaml may be stale; last update is over 7 days old.")
+
+    epic_ids = {
+        entry.key.removeprefix("epic-")
+        for entry in epic_entries
+        if entry.entry_type == EntryType.EPIC_META
+    }
+    for entry in sorted_story_entries:
+        epic_id = _story_epic_id(entry.key)
+        if epic_id is None:
+            continue
+        if epic_id not in epic_ids:
+            risks.append(f"Orphaned story detected: {entry.key} has no epic-{epic_id}.")
+
+    stories_by_epic: dict[str, int] = {}
+    for entry in sorted_story_entries:
+        epic_id = _story_epic_id(entry.key)
+        if epic_id is None:
+            continue
+        stories_by_epic[epic_id] = stories_by_epic.get(epic_id, 0) + 1
+
+    for entry in epic_entries:
+        epic_id = entry.key.removeprefix("epic-")
+        if entry.status == "in-progress" and stories_by_epic.get(epic_id, 0) == 0:
+            risks.append(f"In-progress epic has no associated stories: {entry.key}.")
+
+    return {
+        "project_root": str(project_root),
+        "sprint_path": str(sprint_path),
+        "project": sprint_status.metadata.project or project_root.name,
+        "project_key": sprint_status.metadata.project_key,
+        "tracking_system": sprint_status.metadata.tracking_system,
+        "generated": (
+            sprint_status.metadata.generated.isoformat()
+            if sprint_status.metadata.generated
+            else None
+        ),
+        "last_updated": (
+            sprint_status.metadata.last_updated.isoformat()
+            if sprint_status.metadata.last_updated
+            else None
+        ),
+        "story_counts": story_counts,
+        "epic_counts": epic_counts,
+        "retrospective_counts": retrospective_counts,
+        "next": {
+            "workflow_id": next_workflow_id,
+            "story_id": next_story_id,
+            "agent": next_agent,
+        },
+        "risks": risks,
+        "stories_by_status": {
+            status: [entry.key for entry in sorted_story_entries if entry.status == status]
+            for status in story_counts
+        },
+        "epics_by_status": {
+            status: [entry.key for entry in epic_entries if entry.status == status]
+            for status in epic_counts
+        },
+        "retrospectives_by_status": {
+            status: [entry.key for entry in sorted_retro_entries if entry.status == status]
+            for status in retrospective_counts
+        },
+        "entry_count": len(sprint_status.entries),
+    }
+
+
+def _iter_lifecycle_knowledge_roots() -> list[Path]:
+    """Return deduplicated lifecycle knowledge roots in runtime search order."""
+    from bmad_assist.core.paths import get_paths
+
+    paths = get_paths()
+    seen: set[Path] = set()
+    roots: list[Path] = []
+
+    for candidate in [
+        paths.project_knowledge,
+        paths.planning_artifacts,
+        paths.project_docs_fallback,
+    ]:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        roots.append(candidate)
+
+    return roots
+
+
+def _load_lifecycle_project_state() -> "ProjectState":
+    """Load lifecycle project state from the first viable knowledge root.
+
+    The runtime resolves BMAD knowledge from multiple roots. Validation must
+    mirror that search order instead of crashing when the first configured root
+    is absent or empty.
+    """
+    from bmad_assist.bmad import read_project_state
+    from bmad_assist.core.exceptions import StateError
+
+    candidate_notes: list[str] = []
+
+    for candidate in _iter_lifecycle_knowledge_roots():
+        if not candidate.exists():
+            candidate_notes.append(f"{candidate} (missing)")
+            continue
+
+        try:
+            project_state = read_project_state(candidate, use_sprint_status=True)
+        except FileNotFoundError:
+            candidate_notes.append(f"{candidate} (missing)")
+            continue
+
+        if project_state.all_stories:
+            return project_state
+
+        candidate_notes.append(f"{candidate} (no epic stories)")
+
+    searched = ", ".join(candidate_notes) if candidate_notes else "no knowledge roots configured"
+    raise StateError(
+        "Unable to load lifecycle project state from any BMAD knowledge root. "
+        f"Searched: {searched}"
+    )
+
+
 # --------------------------------------------------------------------------
 # Sprint Commands
 # --------------------------------------------------------------------------
+
+
+@sprint_app.command("status")
+def sprint_status(
+    project: str = typer.Option(
+        ".",
+        "--project",
+        "-p",
+        help="Path to project directory",
+    ),
+    format_: str = typer.Option(
+        "plain",
+        "--format",
+        "-f",
+        help="Output format: plain or json",
+    ),
+) -> None:
+    """Summarize sprint-status and recommend the next BMAD workflow action."""
+    import json
+
+    project_root, sprint_path, _is_legacy_only = _setup_sprint_context(project)
+
+    format_lower = format_.lower()
+    if format_lower not in ("plain", "json"):
+        _error(f"Invalid --format: {format_}. Use 'plain' or 'json'.")
+        raise typer.Exit(code=EXIT_ERROR)
+
+    if not sprint_path.exists():
+        _error(f"Sprint-status not found: {sprint_path}")
+        _error("Run sprint planning or `bmad-assist sprint generate` first.")
+        raise typer.Exit(code=EXIT_ERROR)
+
+    try:
+        summary = _build_sprint_status_summary(project_root, sprint_path)
+    except BmadAssistError as e:
+        _error(f"Failed to read sprint status: {e}")
+        raise typer.Exit(code=EXIT_ERROR) from None
+
+    if format_lower == "json":
+        sys.stdout.write(json.dumps(summary, indent=2))
+        sys.stdout.write("\n")
+        raise typer.Exit(code=EXIT_SUCCESS)
+
+    story_counts = summary["story_counts"]
+    epic_counts = summary["epic_counts"]
+    retrospective_counts = summary["retrospective_counts"]
+    next_action = summary["next"]
+    risks = summary["risks"]
+
+    console.print()
+    console.print("[bold]Sprint Status[/bold]")
+    console.print(f"  Project: {summary['project']} ({summary.get('project_key') or 'NOKEY'})")
+    console.print(f"  Tracking: {summary.get('tracking_system') or 'unknown'}")
+    console.print(f"  Status file: {summary['sprint_path']}")
+    console.print(
+        "  Stories: "
+        f"backlog {story_counts['backlog']}, "
+        f"ready-for-dev {story_counts['ready-for-dev']}, "
+        f"in-progress {story_counts['in-progress']}, "
+        f"review {story_counts['review']}, "
+        f"done {story_counts['done']}"
+    )
+    console.print(
+        "  Epics: "
+        f"backlog {epic_counts['backlog']}, "
+        f"in-progress {epic_counts['in-progress']}, "
+        f"done {epic_counts['done']}"
+    )
+    console.print(
+        "  Retrospectives: "
+        f"optional {retrospective_counts['optional']}, "
+        f"done {retrospective_counts['done']}"
+    )
+
+    if next_action["workflow_id"]:
+        console.print(
+            "  Next Recommendation: "
+            f"{next_action['workflow_id']} ({next_action['story_id']})"
+        )
+    else:
+        console.print("  Next Recommendation: all implementation items complete")
+
+    if risks:
+        console.print()
+        console.print("[bold yellow]Risks[/bold yellow]")
+        for risk in risks:
+            console.print(f"  - {risk}")
+
+    raise typer.Exit(code=EXIT_SUCCESS)
 
 
 @sprint_app.command("generate")
@@ -297,6 +663,12 @@ def sprint_repair(
         "-n",
         help="Show changes without applying",
     ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Apply repair without confirmation prompt",
+    ),
     include_legacy: bool = typer.Option(
         False,
         "--include-legacy",
@@ -354,7 +726,7 @@ def sprint_repair(
         # Check if we need confirmation before overwriting
         from bmad_assist.core.loop.interactive import is_non_interactive
 
-        if sprint_path.exists() and not is_non_interactive():
+        if sprint_path.exists() and not yes and not is_non_interactive():
             console.print(f"\n[yellow]Warning:[/yellow] This will overwrite {sprint_path}")
             console.print(
                 "[dim]You can restore using BMAD workflow: /bmad:bmm:workflows:sprint-planning[/dim]"
@@ -413,6 +785,8 @@ def sprint_validate(
     """
     import json
 
+    from bmad_assist.core.state import get_state_path, load_state
+    from bmad_assist.core.types import EpicId, epic_sort_key, parse_epic_id
     from bmad_assist.sprint import (
         ArtifactIndex,
         InferenceConfidence,
@@ -420,6 +794,7 @@ def sprint_validate(
         parse_sprint_status,
     )
     from bmad_assist.sprint.classifier import EntryType
+    from bmad_assist.sprint.resume_validation import validate_resume_state
 
     project_root, sprint_path, _is_legacy_only = _setup_sprint_context(project)
 
@@ -441,6 +816,44 @@ def sprint_validate(
 
     # Compare each entry with inferred status
     discrepancies: list[Discrepancy] = []
+
+    try:
+        loaded_config = load_config_with_project(project_path=project_root)
+        state_path = get_state_path(loaded_config, project_root=project_root)
+    except ConfigError:
+        state_path = project_root / ".bmad-assist" / "state.yaml"
+
+    if state_path.exists():
+        try:
+            project_state = _load_lifecycle_project_state()
+
+            lifecycle_stories_by_epic: dict[EpicId, list[str]] = {}
+            for story in project_state.all_stories:
+                epic_id = parse_epic_id(story.number.split(".", 1)[0])
+                lifecycle_stories_by_epic.setdefault(epic_id, []).append(story.number)
+
+            lifecycle_epic_list = sorted(lifecycle_stories_by_epic, key=epic_sort_key)
+
+            def lifecycle_epic_stories_loader(epic_id: EpicId) -> list[str]:
+                return list(lifecycle_stories_by_epic.get(epic_id, []))
+
+            validate_resume_state(
+                load_state(state_path),
+                project_root,
+                lifecycle_epic_list,
+                lifecycle_epic_stories_loader,
+            )
+        except StateError as exc:
+            discrepancies.append(
+                Discrepancy(
+                    key="loop-state",
+                    sprint_status="current state",
+                    inferred_status="invalid lifecycle progression",
+                    severity=DiscrepancySeverity.ERROR,
+                    reason=str(exc),
+                    evidence=str(state_path),
+                )
+            )
 
     for key, entry in sprint_status.entries.items():
         # Skip non-story entries (epic meta, retrospectives)

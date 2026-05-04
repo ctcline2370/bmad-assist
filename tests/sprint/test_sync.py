@@ -26,7 +26,6 @@ from bmad_assist.sprint.models import (
 )
 from bmad_assist.sprint.sync import (
     PHASE_TO_STATUS,
-    SyncCallback,
     SyncResult,
     _find_epic_key,
     _find_story_key,
@@ -36,7 +35,6 @@ from bmad_assist.sprint.sync import (
     sync_state_to_sprint,
     trigger_sync,
 )
-
 
 # =============================================================================
 # Fixtures
@@ -163,7 +161,7 @@ class TestSyncResult:
         result = SyncResult(synced_stories=1)
         # Should not raise
         hash(result)
-        {result}  # Can add to set
+        assert {result} == {result}
 
     def test_sync_result_repr(self):
         """SyncResult has informative repr."""
@@ -380,14 +378,127 @@ class TestSyncStateToSprint:
         """Completed epics are marked as done."""
         state = State(
             current_epic=21,
-            current_story="21.1",
-            current_phase=Phase.CREATE_STORY,
+            current_story=None,
+            current_phase=None,
             completed_epics=[20],
         )
         updated, result = sync_state_to_sprint(state, sample_sprint_status)
 
         assert updated.entries["epic-20"].status == "done"
         assert result.synced_epics == 1
+
+    def test_sync_does_not_complete_retrospective_from_completed_epics(
+        self,
+        sample_metadata: SprintStatusMetadata,
+    ):
+        """Completed epics do not imply retrospective completion."""
+        sprint_status = SprintStatus(
+            metadata=sample_metadata,
+            entries={
+                "epic-20": SprintStatusEntry(
+                    key="epic-20",
+                    status="in-progress",
+                    entry_type=EntryType.EPIC_META,
+                ),
+                "epic-20-retrospective": SprintStatusEntry(
+                    key="epic-20-retrospective",
+                    status="in-progress",
+                    entry_type=EntryType.RETROSPECTIVE,
+                ),
+            },
+        )
+        state = State(
+            current_epic=21,
+            current_story=None,
+            current_phase=None,
+            completed_epics=[20],
+        )
+
+        updated, result = sync_state_to_sprint(state, sprint_status)
+
+        assert updated.entries["epic-20"].status == "done"
+        assert updated.entries["epic-20-retrospective"].status == "in-progress"
+        assert result.synced_epics == 1
+
+    def test_sync_marks_retrospective_done_with_durable_artifact(
+        self,
+        sample_metadata: SprintStatusMetadata,
+        tmp_path: Path,
+    ):
+        """Completed epic retrospective is done when the durable artifact exists."""
+        retrospectives_dir = (
+            tmp_path / "_bmad-output" / "implementation-artifacts" / "retrospectives"
+        )
+        retrospectives_dir.mkdir(parents=True)
+        (retrospectives_dir / "epic-20-retro-20260101_000000.md").write_text(
+            "# Epic 20 retrospective\n",
+            encoding="utf-8",
+        )
+        sprint_status = SprintStatus(
+            metadata=sample_metadata,
+            entries={
+                "epic-20": SprintStatusEntry(
+                    key="epic-20",
+                    status="done",
+                    entry_type=EntryType.EPIC_META,
+                ),
+                "epic-20-retrospective": SprintStatusEntry(
+                    key="epic-20-retrospective",
+                    status="in-progress",
+                    entry_type=EntryType.RETROSPECTIVE,
+                ),
+            },
+        )
+        state = State(
+            current_epic=21,
+            current_story=None,
+            current_phase=None,
+            completed_epics=[20],
+        )
+
+        updated, result = sync_state_to_sprint(state, sprint_status, tmp_path)
+
+        assert updated.entries["epic-20-retrospective"].status == "done"
+        assert result.skipped_keys == ()
+
+    def test_sync_current_retrospective_artifact_wins_over_in_progress(
+        self,
+        sample_metadata: SprintStatusMetadata,
+        tmp_path: Path,
+    ):
+        """Current retrospective becomes done when its durable artifact already exists."""
+        retrospectives_dir = (
+            tmp_path / "_bmad-output" / "implementation-artifacts" / "retrospectives"
+        )
+        retrospectives_dir.mkdir(parents=True)
+        (retrospectives_dir / "epic-20-retro-20260101_000000.md").write_text(
+            "# Epic 20 retrospective\n",
+            encoding="utf-8",
+        )
+        sprint_status = SprintStatus(
+            metadata=sample_metadata,
+            entries={
+                "epic-20": SprintStatusEntry(
+                    key="epic-20",
+                    status="in-progress",
+                    entry_type=EntryType.EPIC_META,
+                ),
+                "epic-20-retrospective": SprintStatusEntry(
+                    key="epic-20-retrospective",
+                    status="backlog",
+                    entry_type=EntryType.RETROSPECTIVE,
+                ),
+            },
+        )
+        state = State(
+            current_epic=20,
+            current_story="20.3",
+            current_phase=Phase.RETROSPECTIVE,
+        )
+
+        updated, _ = sync_state_to_sprint(state, sprint_status, tmp_path)
+
+        assert updated.entries["epic-20-retrospective"].status == "done"
 
     def test_sync_skips_missing_story_keys(
         self,
@@ -555,7 +666,7 @@ class TestTriggerSync:
         write_sprint_status(sample_sprint_status, sprint_path)
 
         # Trigger sync
-        result = trigger_sync(sample_state, project_root)
+        trigger_sync(sample_state, project_root)
 
         # File should be updated
         assert sprint_path.exists()
@@ -613,6 +724,76 @@ class TestTriggerSync:
 
         assert isinstance(result, SyncResult)
         assert result.synced_stories > 0
+
+    def test_trigger_sync_updates_story_file_status_fields(
+        self,
+        tmp_path: Path,
+        sample_sprint_status: SprintStatus,
+    ):
+        """trigger_sync keeps story markdown Status fields aligned with state."""
+        project_root = tmp_path / "project"
+        sprint_dir = project_root / "_bmad-output" / "implementation-artifacts"
+        sprint_dir.mkdir(parents=True)
+        sprint_path = sprint_dir / "sprint-status.yaml"
+
+        from bmad_assist.sprint.writer import write_sprint_status
+
+        write_sprint_status(sample_sprint_status, sprint_path)
+        (sprint_dir / "20-1-setup.md").write_text(
+            "# Story 20.1\n\nStatus: review\n\nDone story.\n",
+            encoding="utf-8",
+        )
+        (sprint_dir / "20-9-sync.md").write_text(
+            "# Story 20.9\n\nStatus: ready-for-dev\n\nActive story.\n",
+            encoding="utf-8",
+        )
+        state = State(
+            current_epic=20,
+            current_story="20.9",
+            current_phase=Phase.CODE_REVIEW,
+            completed_stories=["20.1"],
+        )
+
+        result = trigger_sync(state, project_root)
+
+        assert result.synced_story_files == 2
+        assert "Status: done" in (sprint_dir / "20-1-setup.md").read_text(
+            encoding="utf-8"
+        )
+        assert "Status: review" in (sprint_dir / "20-9-sync.md").read_text(
+            encoding="utf-8"
+        )
+
+    def test_trigger_sync_completed_current_story_writes_done_to_story_file(
+        self,
+        tmp_path: Path,
+        sample_sprint_status: SprintStatus,
+    ):
+        """Completed current story file is done, overriding current phase."""
+        project_root = tmp_path / "project"
+        sprint_dir = project_root / "_bmad-output" / "implementation-artifacts"
+        sprint_dir.mkdir(parents=True)
+        sprint_path = sprint_dir / "sprint-status.yaml"
+
+        from bmad_assist.sprint.writer import write_sprint_status
+
+        write_sprint_status(sample_sprint_status, sprint_path)
+        story_file = sprint_dir / "20-9-sync.md"
+        story_file.write_text(
+            "# Story 20.9\n\nStatus: review\n\nComplete story.\n",
+            encoding="utf-8",
+        )
+        state = State(
+            current_epic=20,
+            current_story="20.9",
+            current_phase=Phase.CODE_REVIEW_SYNTHESIS,
+            completed_stories=["20.9"],
+        )
+
+        result = trigger_sync(state, project_root)
+
+        assert result.synced_story_files == 1
+        assert "Status: done" in story_file.read_text(encoding="utf-8")
 
 
 # =============================================================================
@@ -886,7 +1067,7 @@ class TestIntegration:
         )
 
         # Trigger sync
-        result = trigger_sync(state, project_root)
+        trigger_sync(state, project_root)
 
         # Verify results
         final_status = parse_sprint_status(sprint_path)

@@ -75,6 +75,129 @@ EPIC_TITLE_PATTERN = re.compile(
     re.MULTILINE,
 )
 
+MARKDOWN_HEADER_PATTERN = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
+
+NON_EPIC_SECTION_IDS = frozenset(
+    {
+        "backlog",
+        "breakdown",
+        "details",
+        "inventory",
+        "list",
+        "overview",
+        "requirements",
+        "roadmap",
+        "scope",
+        "stories",
+        "story",
+        "summary",
+    }
+)
+
+
+def _normalize_heading(heading: str) -> str:
+    """Normalize markdown headings for case-insensitive matching."""
+    return re.sub(r"\s+", " ", heading.strip()).lower()
+
+
+def is_non_epic_section_id(raw_epic_id: object) -> bool:
+    """Return True when an ``Epic <id>`` header is a document section.
+
+    Consolidated planning documents often contain headings such as
+    ``## Epic List`` before the actual numbered epics. The broad epic-header
+    parser supports non-numeric epic IDs for module workflows, so generation
+    must explicitly reject these known section labels instead of creating
+    synthetic sprint entries like ``epic-List``.
+    """
+    if not isinstance(raw_epic_id, str):
+        return False
+
+    return raw_epic_id.strip().lower() in NON_EPIC_SECTION_IDS
+
+
+def extract_epic_markdown(content: str, epic_id: EpicId) -> str | None:
+    """Extract a single epic block from markdown content.
+
+    Args:
+        content: Markdown content that may contain one or more epic sections.
+        epic_id: Target epic identifier to extract.
+
+    Returns:
+        The matching epic block, stripped of surrounding whitespace, or None if absent.
+
+    """
+    headers = list(EPIC_TITLE_PATTERN.finditer(content))
+    if not headers:
+        return None
+
+    target = str(epic_id)
+    for index, header in enumerate(headers):
+        if str(header.group(1)) != target:
+            continue
+
+        start = header.start()
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(content)
+        return content[start:end].strip()
+
+    return None
+
+
+def extract_markdown_sections(content: str, headings: list[str]) -> str:
+    """Extract selected markdown sections, preserving source order.
+
+    Sections run from the selected heading to the next heading of the same or
+    higher level. When both a parent and nested child heading are requested, the
+    parent section wins to avoid duplicate content in the output.
+
+    Args:
+        content: Markdown content to extract sections from.
+        headings: Heading titles to extract, matched case-insensitively.
+
+    Returns:
+        Concatenated markdown sections separated by blank lines.
+
+    """
+    if not content or not headings:
+        return ""
+
+    target_headings = {
+        _normalize_heading(heading)
+        for heading in headings
+        if heading and heading.strip()
+    }
+    if not target_headings:
+        return ""
+
+    matches = list(MARKDOWN_HEADER_PATTERN.finditer(content))
+    if not matches:
+        return ""
+
+    extracted: list[str] = []
+    covered_ranges: list[tuple[int, int]] = []
+
+    for index, match in enumerate(matches):
+        heading_title = _normalize_heading(match.group(2))
+        if heading_title not in target_headings:
+            continue
+
+        level = len(match.group(1))
+        start = match.start()
+        end = len(content)
+        for next_match in matches[index + 1 :]:
+            if len(next_match.group(1)) <= level:
+                end = next_match.start()
+                break
+
+        if any(start >= range_start and start < range_end for range_start, range_end in covered_ranges):
+            continue
+
+        excerpt = content[start:end].strip()
+        if excerpt:
+            extracted.append(excerpt)
+            covered_ranges.append((start, end))
+
+    return "\n\n".join(extracted)
+
 
 @dataclass
 class BmadDocument:

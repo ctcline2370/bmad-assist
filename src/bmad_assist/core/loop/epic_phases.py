@@ -1,7 +1,8 @@
 """Epic-scope phase execution (setup and teardown).
 
 Per ADR-007: Epic setup phases run before first story.
-Per ADR-002: Epic teardown phases continue on failure.
+Epic teardown phases fail closed so autonomous runs cannot advance an epic
+after retrospective or teardown evidence reports a real failure.
 Extracted from runner.py as part of the runner refactoring.
 
 """
@@ -145,12 +146,12 @@ def _execute_epic_teardown(
     state: LoopState,
     state_path: Path,
     project_path: Path,
-) -> tuple[LoopState, PhaseResult | None]:
+) -> tuple[LoopState, bool, PhaseResult | None]:
     """Execute epic teardown phases after last story.
 
     Iterates through all phases in loop_config.epic_teardown and executes each.
-    On failure, logs warning and CONTINUES to next phase (per ADR-002).
-    Returns the last PhaseResult for metrics/logging purposes.
+    On failure, saves state and returns immediately so the runner can halt
+    without promoting the epic or project.
 
     Args:
         state: Current loop state after last story's CODE_REVIEW_SYNTHESIS.
@@ -158,7 +159,9 @@ def _execute_epic_teardown(
         project_path: Project root directory.
 
     Returns:
-        Tuple of (updated_state, last_result).
+        Tuple of (updated_state, success, last_result).
+        - success=False: A teardown phase failed and automation must stop
+        - success=True: All configured teardown phases completed
         - last_result: PhaseResult from the last executed phase (for metrics)
         - last_result is None if epic_teardown is empty
 
@@ -170,7 +173,7 @@ def _execute_epic_teardown(
     if not loop_config.epic_teardown:
         # No teardown phases configured - nothing to do
         logger.debug("No epic_teardown phases configured, skipping")
-        return state, None
+        return state, True, None
 
     logger.info(
         "Running %d epic teardown phases for epic %s: %s",
@@ -217,18 +220,16 @@ def _execute_epic_teardown(
         )
 
         if not result.success:
-            # Teardown failure - log warning and CONTINUE (per ADR-002)
-            logger.warning(
-                "Epic teardown phase %s failed for epic %s: %s. Continuing to next teardown phase.",
+            logger.error(
+                "Epic teardown phase %s failed for epic %s: %s. Stopping epic advancement.",
                 phase_name,
                 state.current_epic,
                 result.error,
             )
-            # Still save state even on failure
             save_state(state, state_path)
-            continue
+            return state, False, result
 
         logger.info("Epic teardown phase %s completed successfully", phase_name)
 
     logger.info("Epic teardown complete for epic %s", state.current_epic)
-    return state, last_result
+    return state, True, last_result

@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 import yaml
@@ -42,7 +42,6 @@ from bmad_assist.sprint.writer import (
     has_ruamel,
     write_sprint_status,
 )
-
 
 # =============================================================================
 # Fixtures
@@ -219,6 +218,19 @@ class TestBuildOutputData:
         assert "project" not in data
         assert "project_key" not in data
 
+    def test_build_output_data_includes_last_updated(self):
+        """Output data includes last_updated when present."""
+        meta = SprintStatusMetadata(
+            generated=datetime(2026, 1, 7),
+            last_updated=datetime(2026, 1, 8, 1, 2, 3),
+            project=None,
+        )
+        status = SprintStatus(metadata=meta, entries={})
+
+        data = _build_output_data(status, {})
+
+        assert data["last_updated"] == "2026-01-08T01:02:03Z"
+
 
 # =============================================================================
 # Test: Atomic Write Pattern (AC1, AC7)
@@ -302,6 +314,33 @@ class TestAtomicWrite:
         target = tmp_path / "sprint-status.yaml"
         write_sprint_status(sample_status, target)
         assert target.exists()
+
+    def test_write_touches_last_updated(
+        self,
+        sample_status: SprintStatus,
+        tmp_path: Path,
+    ):
+        """write_sprint_status refreshes stale last_updated metadata."""
+        target = tmp_path / "sprint-status.yaml"
+        target.write_text(
+            "generated: 2026-01-01T00:00:00\n"
+            "last_updated: 2026-01-01T00:00:00Z\n"
+            "development_status: {}\n",
+            encoding="utf-8",
+        )
+
+        before = datetime.now(UTC).replace(tzinfo=None, microsecond=0)
+        write_sprint_status(sample_status, target)
+        after = datetime.now(UTC).replace(tzinfo=None, microsecond=0)
+
+        with open(target, encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+
+        updated = datetime.fromisoformat(data["last_updated"].replace("Z", "+00:00"))
+        updated = updated.replace(tzinfo=None)
+
+        assert data["last_updated"] != "2026-01-01T00:00:00Z"
+        assert before <= updated <= after
 
 
 # =============================================================================

@@ -19,6 +19,7 @@ from pathlib import Path
 from bmad_assist.core.exceptions import StateError
 from bmad_assist.core.io import get_timestamp, init_run_prompts_dir
 from bmad_assist.core.loop.pause import cleanup_stale_pause_flags
+from bmad_assist.core.loop.run_tracking import reconcile_stale_running_runs
 
 logger = logging.getLogger(__name__)
 
@@ -128,8 +129,21 @@ def _running_lock(project_path: Path) -> Generator[Path, None, None]:
                 )
                 try:
                     lock_path.unlink()
+                    reconcile_stale_running_runs(
+                        project_path,
+                        exit_reason="stale_lock_recovered_dead_pid",
+                    )
                 except OSError as e:
                     logger.warning(f"Failed to remove stale lock file: {e}")
+
+    # A process may be killed after saving a RUNNING log but before the lock
+    # finalizer runs, leaving no lock file for reset-lock to discover. Once this
+    # process has passed the active-lock check, any pre-existing RUNNING logs are
+    # stale and must be finalized before the new run creates its own log.
+    reconcile_stale_running_runs(
+        project_path,
+        exit_reason="stale_run_recovered_missing_lock",
+    )
 
     # Generate run timestamp for run-scoped prompts directory
     run_timestamp = get_timestamp()

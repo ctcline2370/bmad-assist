@@ -18,13 +18,11 @@ from pathlib import Path
 from textwrap import dedent
 
 import pytest
-import yaml
 
 from bmad_assist.core.exceptions import ParserError
 from bmad_assist.sprint import (
     EntryType,
     FormatVariant,
-    SprintStatus,
     detect_format,
     parse_sprint_status,
 )
@@ -197,6 +195,7 @@ class TestParseFullFormat:
         """Parse Full format with all metadata fields."""
         content = dedent("""
             generated: 2026-01-07T10:30:00
+            last_updated: 2026-01-08T01:02:03Z
             project: bmad-assist
             project_key: bmad
             tracking_system: file-system
@@ -210,6 +209,13 @@ class TestParseFullFormat:
         status = parse_sprint_status(path)
 
         assert status.metadata.project == "bmad-assist"
+        assert status.metadata.last_updated is not None
+        assert status.metadata.last_updated.year == 2026
+        assert status.metadata.last_updated.month == 1
+        assert status.metadata.last_updated.day == 8
+        assert status.metadata.last_updated.hour == 1
+        assert status.metadata.last_updated.minute == 2
+        assert status.metadata.last_updated.second == 3
         assert status.metadata.project_key == "bmad"
         assert status.metadata.tracking_system == "file-system"
         assert status.metadata.story_location == "_bmad-output/stories"

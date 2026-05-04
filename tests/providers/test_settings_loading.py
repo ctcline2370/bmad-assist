@@ -51,9 +51,9 @@ class TestResolveSettingsFile:
 
     def test_absolute_path_used_as_is(self, tmp_path: Path) -> None:
         """AC1: Absolute path is used directly, ignoring base_dir."""
-        absolute_path = "/etc/provider-settings.json"
-        result = resolve_settings_file(absolute_path, tmp_path)
-        assert result == Path(absolute_path)
+        absolute_path = tmp_path / "provider-settings.json"
+        result = resolve_settings_file(str(absolute_path), tmp_path)
+        assert result == absolute_path.resolve()
 
     def test_tilde_expansion(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """AC8: Tilde (~) is expanded to user home directory."""
@@ -165,8 +165,8 @@ class TestValidateSettingsFile:
         assert len(record.args) == 3
         # Verify the arguments are passed separately (structured logging)
         assert str(missing_file) in str(record.args[0])
-        assert "test-provider" == record.args[1]
-        assert "test-model" == record.args[2]
+        assert record.args[1] == "test-provider"
+        assert record.args[2] == "test-model"
 
 
 class TestClaudeSubprocessProviderSettingsIntegration:
@@ -225,12 +225,14 @@ class TestClaudeSubprocessProviderSettingsIntegration:
         """
         missing_file = tmp_path / "missing.json"
 
-        with caplog.at_level(logging.WARNING):
-            with patch("bmad_assist.providers.claude.Popen") as mock_popen:
-                mock_popen.return_value = create_mock_process(
-                    response_text="Response text",
-                )
-                result = provider.invoke("Hello", model="sonnet", settings_file=missing_file)
+        with (
+            caplog.at_level(logging.WARNING),
+            patch("bmad_assist.providers.claude.Popen") as mock_popen,
+        ):
+            mock_popen.return_value = create_mock_process(
+                response_text="Response text",
+            )
+            result = provider.invoke("Hello", model="sonnet", settings_file=missing_file)
 
         # Verify result returned normally (graceful degradation)
         assert isinstance(result, ProviderResult)
@@ -265,12 +267,14 @@ class TestClaudeSubprocessProviderSettingsIntegration:
         dir_path = tmp_path / "settings-dir"
         dir_path.mkdir()
 
-        with caplog.at_level(logging.WARNING):
-            with patch("bmad_assist.providers.claude.Popen") as mock_popen:
-                mock_popen.return_value = create_mock_process(
-                    response_text="Response text",
-                )
-                result = provider.invoke("Hello", model="sonnet", settings_file=dir_path)
+        with (
+            caplog.at_level(logging.WARNING),
+            patch("bmad_assist.providers.claude.Popen") as mock_popen,
+        ):
+            mock_popen.return_value = create_mock_process(
+                response_text="Response text",
+            )
+            result = provider.invoke("Hello", model="sonnet", settings_file=dir_path)
 
         # Verify result returned normally (graceful degradation)
         assert isinstance(result, ProviderResult)

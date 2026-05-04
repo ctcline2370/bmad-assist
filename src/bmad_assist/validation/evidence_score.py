@@ -344,10 +344,14 @@ _SEVERITY_ALIASES: dict[str, str] = {
 _ALL_SEVERITY_LABELS = "|".join(_SEVERITY_ALIASES.keys())
 
 # Regex patterns for Evidence Score parsing
+_FENCED_CODE_BLOCK_PATTERN = re.compile(r"(?ms)^(?:```|~~~).*?^(?:```|~~~)\s*$")
+_FINDING_ICON_PATTERN = r"(?:🔴|🟠|🟡|:red_circle:|:orange_circle:|:yellow_circle:)?"
+_CLEAN_PASS_ICON_PATTERN = r"(?:🟢|:green_circle:)?"
+
 # Pattern for Evidence Score table format:
 # | 🔴 CRITICAL | description | source | +3 |
 _FINDING_TABLE_PATTERN = re.compile(
-    rf"\|\s*(?:🔴|🟠|🟡)?\s*({_ALL_SEVERITY_LABELS})\s*\|"
+    rf"\|\s*{_FINDING_ICON_PATTERN}\s*({_ALL_SEVERITY_LABELS})\s*\|"
     r"\s*([^|]+)\s*\|"  # description
     r"\s*([^|]*)\s*\|"  # source (optional)
     r"\s*\+?(\d+(?:\.\d+)?)\s*\|",  # score
@@ -357,7 +361,7 @@ _FINDING_TABLE_PATTERN = re.compile(
 # Alternative pattern: bullet point format
 # - 🔴 **CRITICAL** (+3): Description [source]
 _FINDING_BULLET_PATTERN = re.compile(
-    rf"[-*]\s*(?:🔴|🟠|🟡)?\s*\*?\*?({_ALL_SEVERITY_LABELS})\*?\*?\s*"
+    rf"[-*]\s*{_FINDING_ICON_PATTERN}\s*\*?\*?({_ALL_SEVERITY_LABELS})\*?\*?\s*"
     r"\(\+?(\d+(?:\.\d+)?)\):\s*"
     r"([^\[]+)"  # description
     r"(?:\[([^\]]+)\])?",  # source (optional)
@@ -373,7 +377,15 @@ _SECTION_HEADER_PATTERN = re.compile(
 
 # Pattern for CLEAN PASS count
 # | 🟢 CLEAN PASS | 5 |
-_CLEAN_PASS_TABLE_PATTERN = re.compile(r"\|\s*🟢\s*CLEAN PASS\s*\|\s*(\d+)\s*\|", re.IGNORECASE)
+_CLEAN_PASS_TABLE_PATTERN = re.compile(
+    rf"\|\s*{_CLEAN_PASS_ICON_PATTERN}\s*CLEAN PASS(?:ES)?\s*\|\s*(\d+)\s*\|",
+    re.IGNORECASE,
+)
+_CLEAN_PASS_LABEL_PATTERN = re.compile(
+    rf"{_CLEAN_PASS_ICON_PATTERN}\s*CLEAN PASS(?:ES)?", re.IGNORECASE
+)
+_NUMERIC_CELL_PATTERN = re.compile(r"\*?\*?(-?\d+(?:\.\d+)?)\*?\*?")
+_LEADING_INT_PATTERN = re.compile(r"^\s*(\d+)\b")
 
 # Alternative: "CLEAN PASS: 5" or "5 CLEAN PASS"
 _CLEAN_PASS_TEXT_PATTERN = re.compile(
@@ -387,6 +399,49 @@ _EVIDENCE_SCORE_PATTERN = re.compile(
     r"|\|\s*\*?\*?Evidence Score\*?\*?\s*\|\s*\*?\*?(-?\d+(?:\.\d+)?)\*?\*?\s*\|)",
     re.IGNORECASE,
 )
+
+
+def _strip_fenced_code_blocks(content: str) -> str:
+    """Remove fenced examples before parsing report structure."""
+    return _FENCED_CODE_BLOCK_PATTERN.sub("", content)
+
+
+def _parse_clean_passes_from_table_rows(content: str) -> int | None:
+    """Parse CLEAN PASS rows from detailed or count-only Evidence Score tables."""
+    total = 0
+    found_row = False
+
+    for line in content.splitlines():
+        if "|" not in line:
+            continue
+
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if not cells or not _CLEAN_PASS_LABEL_PATTERN.fullmatch(cells[0]):
+            continue
+
+        found_row = True
+        count: int | None = None
+
+        for cell in reversed(cells[1:]):
+            numeric_match = _NUMERIC_CELL_PATTERN.fullmatch(cell)
+            if not numeric_match:
+                continue
+            value = float(numeric_match.group(1))
+            if value < 0:
+                clean_units = abs(value) / abs(SEVERITY_SCORES["CLEAN_PASS"])
+                count = max(1, int(round(clean_units)))
+                break
+
+        if count is None:
+            for cell in cells[1:]:
+                count_match = _LEADING_INT_PATTERN.match(cell)
+                if count_match:
+                    count = int(count_match.group(1))
+                    break
+
+        total += count if count is not None else 1
+
+    return total if found_row else None
 
 
 def _resolve_severity(label: str) -> Severity:
@@ -444,9 +499,10 @@ def parse_evidence_findings(
     clean_passes = 0
     parse_warnings: list[str] = []
     parsed_score: float | None = None
+    parse_content = _strip_fenced_code_blocks(content)
 
     # Try table format first
-    table_matches = _FINDING_TABLE_PATTERN.findall(content)
+    table_matches = _FINDING_TABLE_PATTERN.findall(parse_content)
     for severity_str, description, source, score_str in table_matches:
         try:
             severity = _resolve_severity(severity_str)
@@ -465,7 +521,7 @@ def parse_evidence_findings(
 
     # Try bullet format if no table findings
     if not findings:
-        bullet_matches = _FINDING_BULLET_PATTERN.findall(content)
+        bullet_matches = _FINDING_BULLET_PATTERN.findall(parse_content)
         for severity_str, score_str, description, source in bullet_matches:
             try:
                 severity = _resolve_severity(severity_str)
@@ -484,7 +540,7 @@ def parse_evidence_findings(
 
     # Try section-header fallback if no findings yet
     if not findings:
-        header_matches = list(_SECTION_HEADER_PATTERN.finditer(content))
+        header_matches = list(_SECTION_HEADER_PATTERN.finditer(parse_content))
         for i, header_match in enumerate(header_matches):
             try:
                 severity_label = header_match.group(1) or header_match.group(2)
@@ -492,8 +548,12 @@ def parse_evidence_findings(
                 score = SEVERITY_SCORES[severity.value]
                 # Extract text between this header and the next header (or end)
                 start = header_match.end()
-                end = header_matches[i + 1].start() if i + 1 < len(header_matches) else len(content)
-                section_text = content[start:end]
+                end = (
+                    header_matches[i + 1].start()
+                    if i + 1 < len(header_matches)
+                    else len(parse_content)
+                )
+                section_text = parse_content[start:end]
                 # Find bullet points or numbered items in the section
                 bullets = re.findall(r"[-*]\s+(.+?)(?:\n|$)", section_text)
                 if not bullets:
@@ -512,16 +572,16 @@ def parse_evidence_findings(
                 parse_warnings.append(f"Failed to parse section-header finding: {e}")
 
     # Parse CLEAN PASS count
-    clean_pass_match = _CLEAN_PASS_TABLE_PATTERN.search(content)
-    if clean_pass_match:
-        clean_passes = int(clean_pass_match.group(1))
+    table_clean_passes = _parse_clean_passes_from_table_rows(parse_content)
+    if table_clean_passes is not None:
+        clean_passes = table_clean_passes
     else:
-        clean_pass_text = _CLEAN_PASS_TEXT_PATTERN.search(content)
+        clean_pass_text = _CLEAN_PASS_TEXT_PATTERN.search(parse_content)
         if clean_pass_text:
             clean_passes = int(clean_pass_text.group(1) or clean_pass_text.group(2))
 
     # Try to extract reported score for validation
-    score_match = _EVIDENCE_SCORE_PATTERN.search(content)
+    score_match = _EVIDENCE_SCORE_PATTERN.search(parse_content)
     if score_match:
         parsed_score = float(score_match.group(1) or score_match.group(2))
 

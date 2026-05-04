@@ -868,3 +868,62 @@ class TestSourceFilesCollection:
         result = service.collect_files(["src/nonexistent.py"], None)
 
         assert len(result) == 0
+
+    def test_create_story_prioritizes_live_code_and_tests_over_docs(
+        self, tmp_project: Path
+    ) -> None:
+        """create_story keeps implementation context ahead of stale markdown noise."""
+        from bmad_assist.compiler.source_context import SourceContextService
+
+        src_dir = tmp_project / "src"
+        tests_dir = tmp_project / "tests"
+        docs_dir = tmp_project / "docs"
+        artifacts_dir = tmp_project / "_bmad-output" / "implementation-artifacts"
+        src_dir.mkdir()
+        tests_dir.mkdir()
+        docs_dir.mkdir(exist_ok=True)
+        artifacts_dir.mkdir(parents=True)
+
+        (src_dir / "service.py").write_text("def handle() -> None:\n    return None\n")
+        (tests_dir / "test_service.py").write_text(
+            "def test_handle() -> None:\n    assert True\n"
+        )
+        (docs_dir / "notes.md").write_text("# Design Notes\n")
+        (artifacts_dir / "7-2-current.md").write_text("# Prior Story Artifact\n")
+
+        context = create_test_context(
+            tmp_project,
+            epic_num=7,
+            story_num=3,
+            story_id="7.3",
+            story_key="7-3",
+        )
+        service = SourceContextService(context, "create_story")
+        service.config = service.config.model_copy(
+            update={
+                "extraction": service.config.extraction.model_copy(
+                    update={"max_files": 2}
+                ),
+                "scoring": service.config.scoring.model_copy(
+                    update={"is_test_file": -5}
+                ),
+            }
+        )
+
+        result = service.collect_files(
+            [
+                "src/service.py",
+                "tests/test_service.py",
+                "docs/notes.md",
+                "_bmad-output/implementation-artifacts/7-2-current.md",
+            ],
+            None,
+        )
+
+        ordered_paths = [
+            Path(path).relative_to(tmp_project).as_posix() for path in result.keys()
+        ]
+        assert ordered_paths == [
+            "src/service.py",
+            "tests/test_service.py",
+        ]

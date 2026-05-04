@@ -7,8 +7,6 @@ Tests cover:
 - Evidence Score integration
 """
 
-import pytest
-
 from bmad_assist.validation.validation_metrics import (
     AggregateMetrics,
     ValidatorMetrics,
@@ -78,6 +76,33 @@ class TestExtractValidatorMetrics:
         assert metrics.minor_finding_count == 5
         assert metrics.clean_pass_count == 4
         assert metrics.total_evidence_findings == 10  # 2 + 3 + 5
+
+    def test_extracts_detailed_evidence_score_table_with_github_aliases(self) -> None:
+        """Extracts counts and score from detailed Evidence Score tables."""
+        content = """
+## Evidence Score Summary
+
+| Severity | Description | Source | Score |
+|----------|-------------|--------|-------|
+| :red_circle: CRITICAL | Hidden skip helper | tests.py:10 | +3 |
+| :orange_circle: IMPORTANT | Missing telemetry source | src.py:20 | +1 |
+| :green_circle: CLEAN PASS | 4 clean categories | - | -2.0 |
+
+### Evidence Score: 2.0
+
+```markdown
+### Critical: Example heading from a recommended fix
+1. This fenced example must not be counted.
+```
+"""
+        metrics = extract_validator_metrics(content, "Validator A")
+
+        assert metrics.evidence_score == 2.0
+        assert metrics.critical_finding_count == 1
+        assert metrics.important_finding_count == 1
+        assert metrics.minor_finding_count == 0
+        assert metrics.clean_pass_count == 4
+        assert metrics.total_evidence_findings == 2
 
     def test_counts_invest_violations(self) -> None:
         """Counts bullet points in INVEST Violations section."""

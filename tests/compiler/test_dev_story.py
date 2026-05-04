@@ -7,6 +7,7 @@ story implementation by developers.
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -422,6 +423,154 @@ class TestContextFileBuilding:
         ux_content = next((v for k, v in context_files.items() if k.endswith("ux.md")), None)
         assert ux_content is None, "UX should not be in context for dev_story by default"
 
+    def test_story_file_list_excludes_self_from_source_collection(self, tmp_project: Path) -> None:
+        """Story artifacts listed in their own File List are not re-collected as source context."""
+        from bmad_assist.compiler.source_context import SourceContextService
+
+        src_dir = tmp_project / "src"
+        src_dir.mkdir()
+        (src_dir / "module.py").write_text("def run() -> None:\n    return None\n")
+
+        story_file = tmp_project / "docs" / "sprint-artifacts" / "14-1-test.md"
+        story_file.write_text("""# Story 14.1
+
+Status: ready-for-dev
+
+## File List
+
+- `docs/sprint-artifacts/14-1-test.md` - This story artifact
+- `src/module.py` - Real source module
+
+## Tasks
+- [ ] Task 1
+""")
+
+        context = create_test_context(tmp_project)
+        compiler = DevStoryCompiler()
+        compiler.validate_context(context)
+        resolved = dict(context.resolved_variables)
+        resolved["story_file"] = str(story_file)
+
+        with patch.object(
+            SourceContextService,
+            "collect_files",
+            return_value={"src/module.py": "def run() -> None:\n    return None\n"},
+        ) as collect_files_mock:
+            compiler._build_context_files(context, resolved)
+
+        collected_paths = collect_files_mock.call_args.args[0]
+        assert "src/module.py" in collected_paths
+        assert "docs/sprint-artifacts/14-1-test.md" not in collected_paths
+
+    def test_epic_context_is_trimmed_to_current_epic(self, tmp_project: Path) -> None:
+        """Multi-epic files are trimmed to the active epic before inclusion."""
+        story_file = tmp_project / "docs" / "sprint-artifacts" / "14-1-test.md"
+        story_file.write_text("# Story 14.1\n\nStatus: ready-for-dev")
+
+        (tmp_project / "docs" / "epics" / "epic-14.md").write_text("""# Epic 13: Remove Me
+
+Prior epic context.
+
+# Epic 14: Keep Me
+
+Target epic context.
+
+## Stories
+
+- Story 14.1
+
+# Epic 15: Remove Me Too
+
+Future epic context.
+""")
+
+        context = create_test_context(tmp_project)
+        compiler = DevStoryCompiler()
+        compiler.validate_context(context)
+
+        context_files = compiler._build_context_files(context, context.resolved_variables)
+        epic_content = next(v for k, v in context_files.items() if k.endswith("epic-14.md"))
+
+        assert "# Epic 14: Keep Me" in epic_content
+        assert "# Epic 13: Remove Me" not in epic_content
+        assert "# Epic 15: Remove Me Too" not in epic_content
+
+    def test_story_context_keeps_only_implementation_sections(self, tmp_project: Path) -> None:
+        """Final story context excludes execution-noise sections while keeping dev notes."""
+        story_file = tmp_project / "docs" / "sprint-artifacts" / "14-1-test.md"
+        story_file.write_text("""# Story 14.1: Governed Dashboards
+
+Status: ready-for-dev
+
+## Story
+
+Implement the governed dashboard workflow.
+
+## Acceptance Criteria
+
+- AC1
+
+## Validation Requirements
+
+- Run validation
+
+## Tasks / Subtasks
+
+- [ ] Task 1
+
+## Dev Notes
+
+### Existing Implementation Inventory
+
+- Keep this section
+
+### References
+
+- Keep this too
+
+### File List
+
+- `src/dashboard.py`
+
+## Dev Agent Record
+
+### Agent Model Used
+
+- Remove this section
+
+### Debug Log References
+
+- Remove this too
+
+### Completion Notes List
+
+- Remove this as well
+""")
+
+        context = create_test_context(tmp_project)
+        compiler = DevStoryCompiler()
+        compiler.validate_context(context)
+
+        resolved = dict(context.resolved_variables)
+        resolved["story_file"] = str(story_file)
+
+        context_files = compiler._build_context_files(context, resolved)
+        story_key = next(path for path in context_files if path.endswith("14-1-test.md"))
+        story_content = context_files[story_key]
+
+        assert "# Story 14.1: Governed Dashboards" in story_content
+        assert "## Story" in story_content
+        assert "## Acceptance Criteria" in story_content
+        assert "## Validation Requirements" in story_content
+        assert "## Tasks / Subtasks" in story_content
+        assert "### Existing Implementation Inventory" in story_content
+        assert "### References" in story_content
+        assert "### File List" not in story_content
+        assert "## Dev Agent Record" not in story_content
+        assert "### Agent Model Used" not in story_content
+        assert "### Debug Log References" not in story_content
+        assert "### Completion Notes List" not in story_content
+
 
 class TestFileListExtraction:
     """Tests for File List source file extraction (AC3)."""
@@ -483,6 +632,53 @@ Implementation details.
 
         result = service.collect_files(["src/main.py"], None)
         assert len(result) == 1
+
+    def test_dev_story_prioritizes_live_code_and_tests_over_stale_artifacts(
+        self, tmp_project: Path
+    ) -> None:
+        """dev_story ranks current source and tests ahead of stale artifact markdown."""
+        from bmad_assist.compiler.source_context import SourceContextService
+
+        src_dir = tmp_project / "src"
+        tests_dir = tmp_project / "tests"
+        artifacts_dir = tmp_project / "_bmad-output" / "implementation-artifacts"
+        src_dir.mkdir()
+        tests_dir.mkdir()
+        artifacts_dir.mkdir(parents=True)
+
+        (src_dir / "service.py").write_text("def handle() -> None:\n    return None\n")
+        (tests_dir / "test_service.py").write_text(
+            "def test_handle() -> None:\n    assert True\n"
+        )
+        (artifacts_dir / "7-2-current.md").write_text("# Story 7.2 artifact\n")
+        (artifacts_dir / "epic-1-retro-2026-03-06.md").write_text("# Old retro\n")
+
+        context = create_test_context(
+            tmp_project,
+            epic_num=7,
+            story_num=2,
+            story_id="7.2",
+            story_key="7-2",
+        )
+        service = SourceContextService(context, "dev_story")
+
+        result = service.collect_files(
+            [
+                "src/service.py",
+                "tests/test_service.py",
+                "_bmad-output/implementation-artifacts/7-2-current.md",
+                "_bmad-output/implementation-artifacts/epic-1-retro-2026-03-06.md",
+            ],
+            None,
+        )
+
+        ordered_paths = [Path(path).relative_to(tmp_project).as_posix() for path in result]
+        assert ordered_paths == [
+            "src/service.py",
+            "tests/test_service.py",
+        ]
+        assert "_bmad-output/implementation-artifacts/7-2-current.md" not in ordered_paths
+        assert "_bmad-output/implementation-artifacts/epic-1-retro-2026-03-06.md" not in ordered_paths
 
     def test_skip_nonexistent_files(self, tmp_project: Path) -> None:
         """Non-existent files are skipped gracefully."""
@@ -664,6 +860,281 @@ class TestSourceContextConfigDefaults:
 
         budgets = SourceContextBudgetsConfig()
         assert budgets.get_budget("dev_story") == 20000
+
+    def test_context_soft_cap_matches_output_budget_warning_threshold(self) -> None:
+        """dev_story optional pruning targets the same soft limit as final output."""
+        compiler = DevStoryCompiler()
+
+        assert compiler._get_context_soft_token_cap(20000) == 15000
+        assert compiler._get_context_soft_token_cap(12000) == 9000
+
+    def test_context_cap_uses_configured_budget(self) -> None:
+        """dev_story context cap uses the configured budget when present."""
+        compiler = DevStoryCompiler()
+        mock_budget_config = MagicMock()
+        mock_budget_config.get_budget.return_value = 12000
+        mock_source_context = MagicMock()
+        mock_source_context.budgets = mock_budget_config
+        mock_compiler_config = MagicMock()
+        mock_compiler_config.source_context = mock_source_context
+        mock_config = MagicMock()
+        mock_config.compiler = mock_compiler_config
+
+        with patch(
+            "bmad_assist.core.config.loaders.get_config",
+            return_value=mock_config,
+        ):
+            assert compiler._get_context_token_cap() == 12000
+
+    def test_prune_context_files_honors_token_cap(self, tmp_project: Path) -> None:
+        """Pruning respects the caller-provided operational cap."""
+        compiler = DevStoryCompiler()
+        context = create_test_context(tmp_project)
+        strategic_files = {"docs/project-context.md": "# Context"}
+        antipattern_files = {"docs/code-antipatterns.md": "# Antipatterns"}
+        epic_files = {"docs/epics/epic-14.md": "# Epic"}
+        tea_test_design_files = {"docs/test-design.md": "# Test Design"}
+        tea_other_files = {"docs/tea-notes.md": "# TEA Notes"}
+        tea_atdd_files = {"docs/atdd-checklist-14.1.md": "# ATDD"}
+        source_files = {
+            "src/alpha.py": "# alpha",
+            "src/beta.py": "# beta",
+        }
+        story_files = {"docs/sprint-artifacts/14-1-test.md": "# Story"}
+
+        with patch.object(compiler, "_estimate_prompt_tokens", side_effect=[600, 550, 500, 450, 390]):
+            pruned_files, pruned_tokens, dropped_sections, dropped_source_files = compiler._prune_context_files(
+                strategic_files,
+                antipattern_files,
+                epic_files,
+                tea_test_design_files,
+                tea_other_files,
+                tea_atdd_files,
+                source_files,
+                story_files,
+                token_cap=400,
+                context=context,
+                resolved=context.resolved_variables,
+            )
+
+        assert pruned_tokens == 390
+        assert dropped_sections == ["antipatterns", "tea-other", "tea-test-design"]
+        assert dropped_source_files == ["src/beta.py"]
+        assert "src/beta.py" not in pruned_files
+        assert "src/alpha.py" in pruned_files
+
+    def test_prune_context_files_can_preserve_source_for_soft_target(self, tmp_project: Path) -> None:
+        """Soft-target pruning removes optional sections without dropping source files."""
+        compiler = DevStoryCompiler()
+        context = create_test_context(tmp_project)
+        strategic_files = {"docs/project-context.md": "# Context"}
+        antipattern_files = {"docs/code-antipatterns.md": "# Antipatterns"}
+        epic_files = {"docs/epics/epic-14.md": "# Epic"}
+        tea_test_design_files = {"docs/test-design.md": "# Test Design"}
+        tea_other_files = {"docs/tea-notes.md": "# TEA Notes"}
+        tea_atdd_files = {"docs/atdd-checklist-14.1.md": "# ATDD"}
+        source_files = {
+            "src/alpha.py": "# alpha",
+            "src/beta.py": "# beta",
+        }
+        story_files = {"docs/sprint-artifacts/14-1-test.md": "# Story"}
+
+        with patch.object(compiler, "_estimate_prompt_tokens", side_effect=[600, 550, 500, 450]):
+            pruned_files, pruned_tokens, dropped_sections, dropped_source_files = compiler._prune_context_files(
+                strategic_files,
+                antipattern_files,
+                epic_files,
+                tea_test_design_files,
+                tea_other_files,
+                tea_atdd_files,
+                source_files,
+                story_files,
+                token_cap=400,
+                context=context,
+                resolved=context.resolved_variables,
+                prune_source=False,
+            )
+
+        assert pruned_tokens == 450
+        assert dropped_sections == ["antipatterns", "tea-other", "tea-test-design"]
+        assert dropped_source_files == []
+        assert "src/alpha.py" in pruned_files
+        assert "src/beta.py" in pruned_files
+
+    def test_review_synthesis_source_mentions_are_protected_from_hard_prune(
+        self,
+        tmp_project: Path,
+    ) -> None:
+        """Hard-cap pruning preserves source files implicated by latest review synthesis."""
+        reviews_dir = tmp_project / "docs" / "code-reviews"
+        reviews_dir.mkdir()
+        (reviews_dir / "synthesis-14-1-20260425T010000Z.md").write_text(
+            "# Synthesis\n\nRequired rework in `src/critical.py` must be completed.\n"
+        )
+
+        compiler = DevStoryCompiler()
+        context = create_test_context(tmp_project)
+        strategic_files = {"docs/project-context.md": "# Context"}
+        antipattern_files = {"docs/code-antipatterns.md": "# Antipatterns"}
+        epic_files = {"docs/epics/epic-14.md": "# Epic"}
+        tea_test_design_files = {"docs/test-design.md": "# Test Design"}
+        tea_other_files = {"docs/tea-notes.md": "# TEA Notes"}
+        tea_atdd_files = {"docs/atdd-checklist-14.1.md": "# ATDD"}
+        source_files = {
+            "src/alpha.py": "# alpha",
+            "src/critical.py": "# critical",
+            "src/beta.py": "# beta",
+        }
+        story_files = {"docs/sprint-artifacts/14-1-test.md": "# Story"}
+
+        protected_source_files = compiler._find_review_critical_source_files(
+            context,
+            context.resolved_variables,
+            source_files,
+        )
+
+        with patch.object(compiler, "_estimate_prompt_tokens", side_effect=[600, 550, 500, 450, 390]):
+            pruned_files, pruned_tokens, dropped_sections, dropped_source_files = compiler._prune_context_files(
+                strategic_files,
+                antipattern_files,
+                epic_files,
+                tea_test_design_files,
+                tea_other_files,
+                tea_atdd_files,
+                source_files,
+                story_files,
+                token_cap=400,
+                context=context,
+                resolved=context.resolved_variables,
+                protected_source_files=protected_source_files,
+            )
+
+        assert protected_source_files == {"src/critical.py"}
+        assert pruned_tokens == 390
+        assert dropped_sections == ["antipatterns", "tea-other", "tea-test-design"]
+        assert dropped_source_files == ["src/beta.py"]
+        assert "src/beta.py" not in pruned_files
+        assert "src/critical.py" in pruned_files
+
+    def test_review_synthesis_protection_keeps_placeholder_when_protected_source_exceeds_cap(
+        self,
+        tmp_project: Path,
+    ) -> None:
+        """Hard-cap pruning keeps a path placeholder for review-critical source."""
+        compiler = DevStoryCompiler()
+        context = create_test_context(tmp_project)
+        source_files = {"src/critical.py": "# critical"}
+
+        with patch.object(
+            compiler,
+            "_estimate_prompt_tokens",
+            side_effect=[600, 550, 500, 450, 390],
+        ):
+            (
+                pruned_files,
+                pruned_tokens,
+                dropped_sections,
+                dropped_source_files,
+            ) = compiler._prune_context_files(
+                {"docs/project-context.md": "# Context"},
+                {"docs/code-antipatterns.md": "# Antipatterns"},
+                {"docs/epics/epic-14.md": "# Epic"},
+                {"docs/test-design.md": "# Test Design"},
+                {"docs/tea-notes.md": "# TEA Notes"},
+                {"docs/atdd-checklist-14.1.md": "# ATDD"},
+                source_files,
+                {"docs/sprint-artifacts/14-1-test.md": "# Story"},
+                token_cap=400,
+                context=context,
+                resolved=context.resolved_variables,
+                protected_source_files={"src/critical.py"},
+            )
+
+        assert pruned_tokens == 390
+        assert dropped_sections == ["antipatterns", "tea-other", "tea-test-design"]
+        assert dropped_source_files == []
+        assert "src/critical.py" in pruned_files
+        assert "# critical" not in pruned_files["src/critical.py"]
+        assert "read this file directly" in pruned_files["src/critical.py"]
+
+    def test_build_context_prunes_optional_context_toward_soft_cap(self, tmp_project: Path) -> None:
+        """dev_story keeps source evidence while reducing optional context below the soft cap."""
+        story_file = tmp_project / "docs" / "sprint-artifacts" / "14-1-test.md"
+        story_file.write_text(
+            "# Story\n\nStatus: ready-for-dev\n\n## File List\n\n- `src/feature.py`\n"
+        )
+        source_file = tmp_project / "src" / "feature.py"
+        source_file.parent.mkdir()
+        source_file.write_text("print('feature')\n")
+        epic_file = tmp_project / "docs" / "epics" / "epic-14.md"
+        epic_file.write_text("# Epic 14\n")
+
+        compiler = DevStoryCompiler()
+        context = create_test_context(tmp_project)
+        resolved = {
+            **context.resolved_variables,
+            "story_file": str(story_file),
+            "story_id": "14.1",
+        }
+
+        with patch.object(
+            compiler,
+            "_estimate_prompt_tokens",
+            side_effect=[18000, 18000, 17000, 14900],
+        ), patch.object(
+            compiler,
+            "_get_context_token_cap",
+            return_value=20000,
+        ), patch(
+            "bmad_assist.compiler.strategic_context.load_antipatterns",
+            return_value={"docs/code-antipatterns.md": "# Antipatterns"},
+        ), patch(
+            "bmad_assist.compiler.workflows.dev_story.is_tea_context_enabled",
+            return_value=True,
+        ), patch(
+            "bmad_assist.compiler.workflows.dev_story.collect_tea_context",
+            return_value={
+                "docs/test-design.md": "# Test Design",
+                "docs/tea-notes.md": "# TEA Notes",
+                "docs/atdd-checklist-14.1.md": "# ATDD",
+            },
+        ):
+            files = compiler._build_context_files(
+                context,
+                resolved,
+                mission="Implement the story",
+                filtered_instructions="<workflow />",
+            )
+
+        assert "docs/code-antipatterns.md" not in files
+        assert "docs/tea-notes.md" not in files
+        assert "docs/test-design.md" in files
+        assert str(source_file) in files
+        assert str(story_file) in files
+
+    def test_tea_context_enabled_skips_legacy_atdd_fallback(self, tmp_project: Path) -> None:
+        """TEA ATDD context takes precedence over the legacy checklist fallback."""
+        story_file = tmp_project / "docs" / "sprint-artifacts" / "14-1-test.md"
+        story_file.write_text("# Story 14.1\n\nStatus: ready-for-dev")
+        legacy_atdd = tmp_project / "docs" / "atdd-checklist-14.1-legacy.md"
+        legacy_atdd.write_text("# Legacy ATDD")
+
+        context = create_test_context(tmp_project, story_id="14.1")
+        compiler = DevStoryCompiler()
+        resolved = dict(context.resolved_variables)
+        resolved["story_file"] = str(story_file)
+
+        with patch(
+            "bmad_assist.compiler.workflows.dev_story.is_tea_context_enabled",
+            return_value=True,
+        ), patch(
+            "bmad_assist.compiler.workflows.dev_story.collect_tea_context",
+            return_value={"docs/tea/atdd-checklist-14.1.md": "# TEA ATDD"},
+        ):
+            context_files = compiler._build_context_files(context, resolved)
+
+        assert "docs/tea/atdd-checklist-14.1.md" in context_files
+        assert str(legacy_atdd) not in context_files
 
 
 class TestFinalXMLOrdering:

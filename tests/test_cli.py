@@ -12,10 +12,12 @@ Comprehensive tests covering:
 
 import logging
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import yaml
 from typer.testing import CliRunner
 
 from bmad_assist import __version__
@@ -34,8 +36,30 @@ from bmad_assist.cli_utils import (
     _warning,
     console,
 )
+from bmad_assist.core.exceptions import StateError
+from bmad_assist.core.loop.run_tracking import CurrentPhase, RunLog, RunStatus, save_run_log
 
 runner = CliRunner()
+
+
+def _mock_epic_data(
+    epic_list: list[int | str] | None = None,
+    stories_by_epic: dict[int | str, list[str]] | None = None,
+) -> tuple[
+    list[int | str],
+    dict[int | str, list[str]],
+    list[int | str],
+    dict[int | str, list[str]],
+]:
+    """Return cli._load_epic_data()-shaped active and lifecycle scope fixtures."""
+    resolved_stories = (
+        {1: ["1.1"]}
+        if stories_by_epic is None
+        else {epic: list(stories) for epic, stories in stories_by_epic.items()}
+    )
+    resolved_epics = list(epic_list) if epic_list is not None else list(resolved_stories.keys())
+    lifecycle_stories = {epic: list(stories) for epic, stories in resolved_stories.items()}
+    return resolved_epics, resolved_stories, list(resolved_epics), lifecycle_stories
 
 
 # =============================================================================
@@ -234,7 +258,7 @@ development_status:
         # Mock run_loop and _load_epic_data to avoid actual execution
         with (
             patch("bmad_assist.cli.run_loop"),
-            patch("bmad_assist.cli._load_epic_data", return_value=([1], {1: ["1.1"]})),
+            patch("bmad_assist.cli._load_epic_data", return_value=_mock_epic_data()),
         ):
             result = runner.invoke(app, ["run"])
 
@@ -275,7 +299,7 @@ providers:
 
         with (
             patch("bmad_assist.cli.run_loop") as mock_run_loop,
-            patch("bmad_assist.cli._load_epic_data", return_value=([1], {1: ["1.1"]})),
+            patch("bmad_assist.cli._load_epic_data", return_value=_mock_epic_data()),
         ):
             result = runner.invoke(
                 app,
@@ -320,7 +344,7 @@ providers:
 
         with (
             patch("bmad_assist.cli.run_loop") as mock_run_loop,
-            patch("bmad_assist.cli._load_epic_data", return_value=([1], {1: ["1.1"]})),
+            patch("bmad_assist.cli._load_epic_data", return_value=_mock_epic_data()),
         ):
             result = runner.invoke(
                 app,
@@ -430,7 +454,7 @@ providers:
 
         with (
             patch("bmad_assist.cli.run_loop"),
-            patch("bmad_assist.cli._load_epic_data", return_value=([1], {1: ["1.1"]})),
+            patch("bmad_assist.cli._load_epic_data", return_value=_mock_epic_data()),
         ):
             result = runner.invoke(
                 app,
@@ -518,7 +542,7 @@ providers:
 
         with (
             patch("bmad_assist.cli.run_loop") as mock_run_loop,
-            patch("bmad_assist.cli._load_epic_data", return_value=([1], {1: ["1.1"]})),
+            patch("bmad_assist.cli._load_epic_data", return_value=_mock_epic_data()),
         ):
             result = runner.invoke(
                 app,
@@ -566,7 +590,7 @@ providers:
                 "bmad_assist.cli.run_loop",
                 side_effect=RuntimeError("Unexpected error"),
             ),
-            patch("bmad_assist.cli._load_epic_data", return_value=([1], {1: ["1.1"]})),
+            patch("bmad_assist.cli._load_epic_data", return_value=_mock_epic_data()),
         ):
             result = runner.invoke(
                 app,
@@ -581,6 +605,105 @@ providers:
 
         assert result.exit_code == EXIT_ERROR
         assert "unexpected error" in result.output.lower()
+
+    def test_debug_vars_surfaces_lifecycle_state_error(self, tmp_path: Path) -> None:
+        """--debug-vars fails closed when resume validation detects lifecycle drift."""
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+
+        sprint_dir = project_dir / "_bmad-output" / "implementation-artifacts"
+        sprint_dir.mkdir(parents=True)
+        (sprint_dir / "sprint-status.yaml").write_text("epics: []\n")
+
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+providers:
+  master:
+    provider: claude
+    model: opus_4
+"""
+        )
+
+        state = MagicMock()
+        state_path = project_dir / ".bmad-assist" / "state.yaml"
+        with (
+            patch("bmad_assist.cli._load_epic_data", return_value=_mock_epic_data()),
+            patch("bmad_assist.cli.get_state_path", return_value=state_path),
+            patch("bmad_assist.cli.load_state", return_value=state),
+            patch(
+                "bmad_assist.cli.validate_resume_state",
+                side_effect=StateError("Finish epic 7 teardown before advancing to epic 8."),
+            ),
+            patch("bmad_assist.cli._handle_debug_vars") as mock_handle_debug_vars,
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "run",
+                    "--project",
+                    str(project_dir),
+                    "--config",
+                    str(config_file),
+                    "--debug-vars",
+                ],
+            )
+
+        assert result.exit_code == EXIT_ERROR
+        assert "finish epic 7 teardown before advancing to epic 8" in result.output.lower()
+        mock_handle_debug_vars.assert_not_called()
+
+    def test_debug_vars_validates_and_persists_advanced_state(self, tmp_path: Path) -> None:
+        """--debug-vars uses validated lifecycle state before compiling workflow context."""
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+
+        sprint_dir = project_dir / "_bmad-output" / "implementation-artifacts"
+        sprint_dir.mkdir(parents=True)
+        (sprint_dir / "sprint-status.yaml").write_text("epics: []\n")
+
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+providers:
+  master:
+    provider: claude
+    model: opus_4
+"""
+        )
+
+        state = MagicMock()
+        validated_state = MagicMock()
+        validation = MagicMock(advanced=True, state=validated_state)
+        state_path = project_dir / ".bmad-assist" / "state.yaml"
+
+        with (
+            patch("bmad_assist.cli._load_epic_data", return_value=_mock_epic_data()),
+            patch("bmad_assist.cli.get_state_path", return_value=state_path),
+            patch("bmad_assist.cli.load_state", return_value=state),
+            patch("bmad_assist.cli.validate_resume_state", return_value=validation) as mock_validate,
+            patch("bmad_assist.cli.save_state") as mock_save_state,
+            patch("bmad_assist.cli._handle_debug_vars") as mock_handle_debug_vars,
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "run",
+                    "--project",
+                    str(project_dir),
+                    "--config",
+                    str(config_file),
+                    "--debug-vars",
+                ],
+            )
+
+        assert result.exit_code == EXIT_SUCCESS
+        mock_validate.assert_called_once()
+        validate_args = mock_validate.call_args.args
+        assert validate_args[:3] == (state, project_dir, [1])
+        assert callable(validate_args[3])
+        mock_save_state.assert_called_once_with(validated_state, state_path)
+        mock_handle_debug_vars.assert_called_once()
 
 
 # =============================================================================
@@ -742,7 +865,7 @@ providers:
 
         with (
             patch("bmad_assist.cli.run_loop"),
-            patch("bmad_assist.cli._load_epic_data", return_value=([1], {1: ["1.1"]})),
+            patch("bmad_assist.cli._load_epic_data", return_value=_mock_epic_data()),
         ):
             result = runner.invoke(
                 app,
@@ -783,7 +906,7 @@ providers:
 
         with (
             patch("bmad_assist.cli.run_loop"),
-            patch("bmad_assist.cli._load_epic_data", return_value=([1], {1: ["1.1"]})),
+            patch("bmad_assist.cli._load_epic_data", return_value=_mock_epic_data()),
         ):
             result = runner.invoke(
                 app,
@@ -844,7 +967,7 @@ class TestConfigExistsHelper:
 class TestWizardIntegration:
     """Tests for wizard integration in CLI (AC1, AC8)."""
 
-    @patch("bmad_assist.cli._load_epic_data", return_value=([1], {1: ["1.1"]}))
+    @patch("bmad_assist.cli._load_epic_data", return_value=_mock_epic_data())
     @patch("bmad_assist.cli.run_config_wizard")
     @patch("bmad_assist.cli.run_loop")
     def test_missing_config_triggers_wizard(
@@ -941,6 +1064,94 @@ providers:
         assert result.exit_code == EXIT_ERROR
 
 
+class TestResetLockCommand:
+    """Tests for reset-lock command stale run reconciliation."""
+
+    def test_reset_lock_finalizes_stale_running_run(self, tmp_path: Path) -> None:
+        """reset-lock should finalize the newest stale running run log."""
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+
+        assist_dir = project_dir / ".bmad-assist"
+        assist_dir.mkdir(parents=True, exist_ok=True)
+        (assist_dir / "running.lock").write_text("99999999\n2026-04-21T09:02:37.199244+00:00\n")
+
+        started_at = datetime(2026, 4, 21, 9, 2, 37, tzinfo=UTC)
+        run_log = RunLog(
+            run_id="reset001",
+            started_at=started_at,
+            current_phase=CurrentPhase(
+                phase="DEV_STORY",
+                started_at=started_at,
+                provider="openai",
+                model="gpt-5.4",
+            ),
+        )
+        yaml_path = save_run_log(run_log, project_dir)
+
+        result = runner.invoke(app, ["reset-lock", "--project", str(project_dir)])
+
+        assert result.exit_code == EXIT_SUCCESS
+        assert "Removed stale lock" in result.output
+        assert "Finalized stale run log:" in result.output
+
+        data = yaml.safe_load(yaml_path.read_text())
+        assert data["status"] == RunStatus.CRASHED.value
+        assert data["exit_reason"] == "manual_reset_lock_recovered_dead_pid"
+        assert data["ended_at"] is not None
+        assert data["current_phase"] is None
+
+    def test_reset_lock_finalizes_stale_running_runs_without_lock_file(self, tmp_path: Path) -> None:
+        """reset-lock should reconcile stale runs even when the lock file is already gone."""
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+
+        assist_dir = project_dir / ".bmad-assist"
+        assist_dir.mkdir(parents=True, exist_ok=True)
+
+        older_started_at = datetime(2026, 4, 21, 8, 52, 37, tzinfo=UTC)
+        newer_started_at = datetime(2026, 4, 21, 9, 2, 37, tzinfo=UTC)
+        older_yaml = save_run_log(
+            RunLog(
+                run_id="reset000",
+                started_at=older_started_at,
+                current_phase=CurrentPhase(
+                    phase="DEV_STORY",
+                    started_at=older_started_at,
+                    provider="openai",
+                    model="gpt-5.4",
+                ),
+            ),
+            project_dir,
+        )
+        newer_yaml = save_run_log(
+            RunLog(
+                run_id="reset001",
+                started_at=newer_started_at,
+                current_phase=CurrentPhase(
+                    phase="DEV_STORY",
+                    started_at=newer_started_at,
+                    provider="openai",
+                    model="gpt-5.4",
+                ),
+            ),
+            project_dir,
+        )
+
+        result = runner.invoke(app, ["reset-lock", "--project", str(project_dir)])
+
+        assert result.exit_code == EXIT_SUCCESS
+        assert "No lock file found" in result.output
+        assert "Finalized 2 stale run logs" in result.output
+
+        for yaml_path in (older_yaml, newer_yaml):
+            data = yaml.safe_load(yaml_path.read_text())
+            assert data["status"] == RunStatus.CRASHED.value
+            assert data["exit_reason"] == "manual_reset_lock_recovered_dead_pid"
+            assert data["ended_at"] is not None
+            assert data["current_phase"] is None
+
+
 # =============================================================================
 # Test: CLI Start Point Parameters (Epic 22)
 # =============================================================================
@@ -1020,7 +1231,7 @@ development_status:
             patch("bmad_assist.cli.run_loop"),
             patch(
                 "bmad_assist.cli._load_epic_data",
-                return_value=([1, 22], {1: ["1.1"], 22: ["22.1"]}),
+                return_value=_mock_epic_data([1, 22], {1: ["1.1"], 22: ["22.1"]}),
             ),
         ):
             result = runner.invoke(

@@ -1,22 +1,19 @@
 """End-to-end integration tests for patch compilation."""
 
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from bmad_assist.compiler.patching import (
     CacheMeta,
-    Compatibility,
-    PatchConfig,
     PatchSession,
     TemplateCache,
     TemplateMetadata,
     TransformResult,
     Validation,
-    WorkflowPatch,
     check_threshold,
     compute_file_hash,
     discover_patch,
@@ -25,7 +22,12 @@ from bmad_assist.compiler.patching import (
     validate_output,
 )
 from bmad_assist.compiler.patching.config import reset_patcher_config
-from bmad_assist.core.exceptions import PatchError
+from bmad_assist.core.exceptions import (
+    NonTransientProviderPatchError,
+    PatchError,
+    ProviderExitCodeError,
+)
+from bmad_assist.providers.base import ExitStatus
 
 
 @pytest.fixture(autouse=True)
@@ -160,7 +162,7 @@ validation:
         # Create cache
         cache = TemplateCache()
         content = "<workflow>Compiled content</workflow>"
-        compiled_at = datetime.now(timezone.utc).isoformat()
+        compiled_at = datetime.now(UTC).isoformat()
 
         meta = CacheMeta(
             compiled_at=compiled_at,
@@ -198,7 +200,7 @@ validation:
         # Create and save cache
         cache = TemplateCache()
         meta = CacheMeta(
-            compiled_at=datetime.now(timezone.utc).isoformat(),
+            compiled_at=datetime.now(UTC).isoformat(),
             bmad_version="0.1.0",
             source_hashes={"workflow.yaml": compute_file_hash(workflow_file)},
             patch_hash=compute_file_hash(patch_file),
@@ -253,6 +255,16 @@ validation:
 
 class TestErrorScenarios:
     """Tests for error handling scenarios."""
+
+    @staticmethod
+    def _provider_exit_error(stderr: str) -> ProviderExitCodeError:
+        return ProviderExitCodeError(
+            message=f"Provider failed: {stderr}",
+            exit_code=1,
+            exit_status=ExitStatus.ERROR,
+            stderr=stderr,
+            command=("codex", "exec"),
+        )
 
     def test_invalid_patch_yaml(self, tmp_path: Path) -> None:
         """Test error on malformed YAML."""
@@ -333,6 +345,197 @@ transforms:
         assert (
             "no" in reason and ("change" in reason or "transformation" in reason)
         ) or "transformed-document" in reason
+
+    def test_non_transient_provider_exit_fails_fast(self) -> None:
+        """Non-transient provider startup failures raise without retrying."""
+        workflow_content = "<step>Test</step>"
+        instructions = ["Remove step completely"]
+
+        mock_provider = MagicMock()
+        mock_provider.invoke.side_effect = self._provider_exit_error(
+            "Operation not permitted"
+        )
+
+        session = PatchSession(workflow_content, instructions, mock_provider)
+
+        with pytest.raises(PatchError, match="Non-transient provider error"):
+            session.run()
+
+        assert mock_provider.invoke.call_count == 1
+        mock_provider.parse_output.assert_not_called()
+
+    @pytest.mark.real_patch_compilation
+    def test_compile_patch_skips_validation_retry_for_non_transient_provider_error(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Compiler validation retries do not repeat deterministic provider failures."""
+        project = tmp_path / "project"
+        project.mkdir()
+
+        patch_file = tmp_path / "create-story.patch.yaml"
+        patch_file.write_text("""
+patch:
+  name: create-story-optimizer
+  version: "1.0.0"
+  author: "Test"
+  description: "Optimizes create-story workflow"
+compatibility:
+  bmad_version: "0.1.0"
+  workflow: create-story
+transforms:
+  - "Remove step 1"
+""")
+
+        workflow_yaml = tmp_path / "workflow.yaml"
+        workflow_yaml.write_text("name: create-story\n")
+        instructions_xml = tmp_path / "instructions.xml"
+        instructions_xml.write_text("<workflow><step>Test</step></workflow>")
+
+        mock_config = MagicMock()
+        mock_config.phase_models = {}
+        mock_config.timeouts = None
+        mock_config.timeout = 120
+        mock_config.providers.master.provider = "codex"
+        mock_config.providers.master.model = "gpt-5.5"
+        mock_config.providers.master.model_name = None
+        mock_config.providers.master.settings_path = None
+        mock_provider = MagicMock()
+
+        session = MagicMock()
+        session.run.side_effect = NonTransientProviderPatchError(
+            "Non-transient provider error"
+        )
+
+        from bmad_assist.compiler.patching.compiler import compile_patch
+
+        with (
+            patch(
+                "bmad_assist.compiler.patching.compiler.discover_patch",
+                return_value=patch_file,
+            ),
+            patch(
+                "bmad_assist.compiler.patching.compiler._find_workflow_files",
+                return_value=(workflow_yaml, instructions_xml),
+            ),
+            patch(
+                "bmad_assist.core.config.get_config",
+                return_value=mock_config,
+            ),
+            patch(
+                "bmad_assist.providers.registry.get_provider",
+                return_value=mock_provider,
+            ),
+            patch(
+                "bmad_assist.compiler.patching.compiler.PatchSession",
+                return_value=session,
+            ) as session_cls,
+            pytest.raises(NonTransientProviderPatchError),
+        ):
+            compile_patch("create-story", project)
+
+        assert session_cls.call_count == 1
+        assert session.run.call_count == 1
+
+    @pytest.mark.real_patch_compilation
+    def test_compile_patch_stops_on_repeated_validation_errors(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Repeated identical validation errors fail after the second attempt."""
+        project = tmp_path / "project"
+        project.mkdir()
+
+        patch_file = tmp_path / "create-story.patch.yaml"
+        patch_file.write_text("""
+patch:
+  name: create-story-optimizer
+  version: "1.0.0"
+  author: "Test"
+  description: "Optimizes create-story workflow"
+compatibility:
+  bmad_version: "0.1.0"
+  workflow: create-story
+transforms:
+  - "Keep the story workflow concise"
+validation:
+  must_contain:
+    - "REQUIRED_MARKER"
+""")
+
+        workflow_yaml = tmp_path / "workflow.yaml"
+        workflow_yaml.write_text("name: create-story\n")
+        instructions_xml = tmp_path / "instructions.xml"
+        instructions_xml.write_text("<workflow><step>Test</step></workflow>")
+
+        mock_config = MagicMock()
+        mock_config.phase_models = {}
+        mock_config.timeouts = None
+        mock_config.timeout = 120
+        mock_config.providers.master.provider = "codex"
+        mock_config.providers.master.model = "gpt-5.5"
+        mock_config.providers.master.model_name = None
+        mock_config.providers.master.settings_path = None
+        mock_provider = MagicMock()
+
+        session = MagicMock()
+        session.run.return_value = (
+            "<workflow><step>Changed</step></workflow>",
+            [TransformResult(success=True, reason=None, transform_index=0)],
+        )
+
+        from bmad_assist.compiler.patching.compiler import compile_patch
+
+        with (
+            patch(
+                "bmad_assist.compiler.patching.compiler.discover_patch",
+                return_value=patch_file,
+            ),
+            patch(
+                "bmad_assist.compiler.patching.compiler._find_workflow_files",
+                return_value=(workflow_yaml, instructions_xml),
+            ),
+            patch(
+                "bmad_assist.core.config.get_config",
+                return_value=mock_config,
+            ),
+            patch(
+                "bmad_assist.providers.registry.get_provider",
+                return_value=mock_provider,
+            ),
+            patch(
+                "bmad_assist.compiler.patching.compiler.PatchSession",
+                return_value=session,
+            ) as session_cls,
+            pytest.raises(PatchError, match="repeated identical errors"),
+        ):
+            compile_patch("create-story", project)
+
+        assert session_cls.call_count == 2
+        assert session.run.call_count == 2
+
+    def test_transient_provider_exit_still_retries(self) -> None:
+        """Transient provider failures retain retry behavior."""
+        workflow_content = "<step>Test</step>"
+        instructions = ["Remove step completely"]
+
+        mock_provider = MagicMock()
+        mock_provider.invoke.side_effect = [
+            self._provider_exit_error("rate limit exceeded"),
+            "raw_result",
+        ]
+        mock_provider.parse_output.return_value = (
+            "<transformed-document><step>Changed</step></transformed-document>"
+        )
+
+        session = PatchSession(workflow_content, instructions, mock_provider)
+        result, transform_results = session.run()
+
+        assert mock_provider.invoke.call_count == 2
+        assert mock_provider.parse_output.call_count == 1
+        assert result == "<step>Changed</step>"
+        assert len(transform_results) == 1
+        assert transform_results[0].success is True
 
     def test_validation_regex_failure(self) -> None:
         """Test regex validation failure."""
@@ -477,7 +680,7 @@ validation:
             patch_name=patch.config.name,
             patch_version=patch.config.version,
             bmad_version="0.1.0",
-            compiled_at=datetime.now(timezone.utc).isoformat(),
+            compiled_at=datetime.now(UTC).isoformat(),
             source_hash=compute_file_hash(patch_path),
         )
         template = generate_template(result, meta)

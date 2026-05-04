@@ -95,6 +95,75 @@ CONFIG_EXTENSIONS: frozenset[str] = frozenset(
     }
 )
 
+SOURCE_CODE_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".py",
+        ".cs",
+        ".js",
+        ".jsx",
+        ".ts",
+        ".tsx",
+        ".java",
+        ".kt",
+        ".go",
+        ".rb",
+        ".rs",
+        ".php",
+        ".swift",
+        ".scala",
+        ".cpp",
+        ".cc",
+        ".cxx",
+        ".c",
+        ".h",
+        ".hpp",
+        ".m",
+        ".mm",
+        ".fs",
+        ".fsx",
+        ".vb",
+        ".sql",
+        ".sh",
+        ".ps1",
+    }
+)
+
+DOCUMENTATION_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".md",
+        ".mdx",
+        ".rst",
+        ".txt",
+    }
+)
+
+SOURCE_PREFIXES: tuple[str, ...] = (
+    "src/",
+    "app/",
+    "lib/",
+    "services/",
+    "packages/",
+)
+
+GENERATED_ARTIFACT_PREFIXES: tuple[str, ...] = (
+    "_bmad-output/",
+    ".bmad-assist/",
+)
+
+SEMANTIC_PRIORITY_WORKFLOWS: frozenset[str] = frozenset(
+    {
+        "dev_story",
+        "create_story",
+    }
+)
+
+GENERATED_DOCUMENT_EXCLUSION_WORKFLOWS: frozenset[str] = frozenset(
+    {
+        "create_story",
+        "dev_story",
+    }
+)
+
 # Test file patterns
 TEST_PATH_PATTERNS: tuple[str, ...] = (
     "tests/",
@@ -147,6 +216,8 @@ class ScoredFile:
         in_git_diff: Whether file was in git diff.
         is_test: Whether detected as test file.
         is_config: Whether detected as config file.
+        relevance_rank: Deterministic semantic tie-breaker. Higher is better.
+        is_current_story_context: Whether the path appears to match the current story.
         change_lines: Lines changed (from git diff, 0 if not in diff).
         hunk_ranges: Line ranges of changes [(start, end), ...].
 
@@ -159,6 +230,8 @@ class ScoredFile:
     in_git_diff: bool = False
     is_test: bool = False
     is_config: bool = False
+    relevance_rank: int = 0
+    is_current_story_context: bool = False
     change_lines: int = 0
     hunk_ranges: list[tuple[int, int]] = field(default_factory=list)
 
@@ -343,6 +416,166 @@ def _normalize_path(path: str) -> str:
     return "/".join(parts) if parts else "."
 
 
+def _build_story_markers(context: CompilerContext) -> tuple[str, ...]:
+    """Build lightweight story identifiers for path relevance checks.
+
+    Args:
+        context: Compiler context with resolved story variables.
+
+    Returns:
+        Lower-cased marker strings sorted longest-first for stable matching.
+
+    """
+    resolved = context.resolved_variables or {}
+    markers: set[str] = set()
+
+    epic_num = resolved.get("epic_num")
+    story_num = resolved.get("story_num")
+    story_id = resolved.get("story_id")
+    story_key = resolved.get("story_key")
+
+    for raw in (story_id, story_key):
+        if raw is None:
+            continue
+        text = str(raw).strip().lower()
+        if not text:
+            continue
+        markers.add(text)
+        markers.add(text.replace(".", "-"))
+        markers.add(text.replace("-", "."))
+        markers.add(text.replace(".", "_"))
+        markers.add(text.replace("-", "_"))
+
+    if epic_num is not None and story_num is not None:
+        epic_text = str(epic_num).strip().lower()
+        story_text = str(story_num).strip().lower()
+        markers.update(
+            {
+                f"{epic_text}.{story_text}",
+                f"{epic_text}-{story_text}",
+                f"{epic_text}_{story_text}",
+                f"story-{epic_text}-{story_text}",
+            }
+        )
+
+    return tuple(sorted((marker for marker in markers if marker), key=len, reverse=True))
+
+
+def _is_source_code_file(path: str) -> bool:
+    """Check if file is likely live implementation source.
+
+    Args:
+        path: Normalized file path.
+
+    Returns:
+        True if file appears to be source code rather than documentation.
+
+    """
+    normalized = _normalize_path(path)
+    suffix = Path(normalized).suffix.lower()
+
+    if suffix in SOURCE_CODE_EXTENSIONS:
+        return True
+
+    return any(normalized.startswith(prefix) for prefix in SOURCE_PREFIXES)
+
+
+def _is_documentation_file(path: str) -> bool:
+    """Check if file is documentation-like content.
+
+    Args:
+        path: Normalized file path.
+
+    Returns:
+        True if file appears to be documentation text.
+
+    """
+    suffix = Path(_normalize_path(path)).suffix.lower()
+    return suffix in DOCUMENTATION_EXTENSIONS
+
+
+def _is_generated_artifact(path: str) -> bool:
+    """Check if file belongs to generated BMAD artifact folders.
+
+    Args:
+        path: Normalized file path.
+
+    Returns:
+        True if file is in a generated artifact folder.
+
+    """
+    normalized = _normalize_path(path)
+    return any(normalized.startswith(prefix) for prefix in GENERATED_ARTIFACT_PREFIXES)
+
+
+def _should_exclude_path_for_workflow(path: str, workflow_name: str) -> bool:
+    """Check whether a candidate path is low-value noise for a workflow.
+
+    Args:
+        path: Normalized candidate path.
+        workflow_name: Active compiler workflow.
+
+    Returns:
+        True when the candidate should be skipped before scoring.
+
+    """
+    normalized = _normalize_path(path)
+
+    return (
+        workflow_name in GENERATED_DOCUMENT_EXCLUSION_WORKFLOWS
+        and _is_generated_artifact(normalized)
+        and _is_documentation_file(normalized)
+    )
+
+
+def _matches_story_marker(path: str, story_markers: tuple[str, ...]) -> bool:
+    """Check whether a path appears to reference the active story.
+
+    Args:
+        path: Normalized file path.
+        story_markers: Known story identifier variants.
+
+    Returns:
+        True if the path includes a bounded story marker.
+
+    """
+    normalized = _normalize_path(path).lower()
+    for marker in story_markers:
+        pattern = rf"(^|[^a-z0-9]){re.escape(marker)}([^a-z0-9]|$)"
+        if re.search(pattern, normalized):
+            return True
+    return False
+
+
+def _relevance_rank(path: str, story_markers: tuple[str, ...]) -> tuple[int, bool]:
+    """Assign a semantic relevance tier for deterministic tie-breaking.
+
+    Args:
+        path: File path to classify.
+        story_markers: Known story identifier variants.
+
+    Returns:
+        Tuple of relevance rank and whether the file appears tied to the story.
+
+    """
+    normalized = _normalize_path(path)
+    is_current_story_context = _matches_story_marker(normalized, story_markers)
+
+    if _is_source_code_file(normalized) and not _is_test_file(normalized):
+        return 40, is_current_story_context
+    if _is_test_file(normalized):
+        return 30, is_current_story_context
+    if _is_generated_artifact(normalized) and is_current_story_context:
+        return 20, True
+    if is_current_story_context:
+        return 18, True
+    if _is_generated_artifact(normalized):
+        return 10, False
+    if _is_documentation_file(normalized):
+        return 5, False
+    return 0, False
+
+
 def _is_test_file(path: str) -> bool:
     """Check if file is a test file.
 
@@ -403,6 +636,7 @@ class SourceContextService:
         self.context = context
         self.project_root = context.project_root.resolve()
         self.workflow_name = workflow_name
+        self.story_markers = _build_story_markers(context)
 
         # Get config, fallback to defaults if not loaded
         try:
@@ -515,6 +749,14 @@ class SourceContextService:
         for path in candidate_paths:
             abs_path = self.project_root / path
 
+            if _should_exclude_path_for_workflow(path, self.workflow_name):
+                logger.debug(
+                    "Skipping low-value generated documentation for %s: %s",
+                    self.workflow_name,
+                    path,
+                )
+                continue
+
             # Skip if doesn't exist or is binary
             if not abs_path.exists():
                 logger.debug("Skipping non-existent file: %s", path)
@@ -543,6 +785,9 @@ class SourceContextService:
             in_git_diff = git_diff_info is not None
             is_test = _is_test_file(path)
             is_config = _is_config_file(path)
+            relevance_rank, is_current_story_context = _relevance_rank(
+                path, self.story_markers
+            )
             change_lines = git_diff_info.change_lines if git_diff_info else 0
             hunk_ranges = git_diff_info.hunk_ranges if git_diff_info else []
 
@@ -572,15 +817,19 @@ class SourceContextService:
                 in_git_diff=in_git_diff,
                 is_test=is_test,
                 is_config=is_config,
+                relevance_rank=relevance_rank,
+                is_current_story_context=is_current_story_context,
                 change_lines=change_lines,
                 hunk_ranges=list(hunk_ranges),
             )
             scored.append(sf)
 
             logger.debug(
-                "Scored %s: score=%d (file_list=%s, git_diff=%s, test=%s, config=%s, changes=%d)",
+                "Scored %s: score=%d rank=%d story=%s (file_list=%s, git_diff=%s, test=%s, config=%s, changes=%d)",
                 path,
                 score,
+                relevance_rank,
+                is_current_story_context,
                 in_file_list,
                 in_git_diff,
                 is_test,
@@ -605,11 +854,16 @@ class SourceContextService:
 
         max_files = self.config.extraction.max_files
 
-        # Sort by score descending, then path ascending (deterministic)
-        sorted_files = sorted(
-            scored_files,
-            key=lambda f: (-f.score, f.path),
-        )
+        # Story-driven workflows benefit from semantic ordering before score
+        # because File List entries often share the same base score while stale
+        # docs and artifact references are still present in the surrounding
+        # planning context.
+        if self.workflow_name in SEMANTIC_PRIORITY_WORKFLOWS:
+            sort_key = lambda f: (-f.relevance_rank, -f.score, f.path)
+        else:
+            sort_key = lambda f: (-f.score, -f.relevance_rank, f.path)
+
+        sorted_files = sorted(scored_files, key=sort_key)
 
         # Apply max_files cap
         selected = sorted_files[:max_files]

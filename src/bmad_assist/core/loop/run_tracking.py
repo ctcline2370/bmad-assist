@@ -34,6 +34,9 @@ class RunStatus(str, Enum):
 
     RUNNING = "running"
     COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    INTERRUPTED = "interrupted"
+    HALTED = "halted"
     CRASHED = "crashed"
 
 
@@ -99,6 +102,7 @@ class RunLog(BaseModel):
     started_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     ended_at: datetime | None = None
     status: RunStatus = RunStatus.RUNNING
+    exit_reason: str | None = None
     cli_args: list[str] = Field(default_factory=list)
     cli_args_masked: list[str] = Field(default_factory=list)
     epic: EpicId | None = None
@@ -240,6 +244,7 @@ def _write_csv(run_log: RunLog, path: Path) -> None:
         f.write(f"# Project: {_sanitize_csv_value(run_log.project_path)}\n")
         f.write(f"# CLI Args (masked): {' '.join(run_log.cli_args_masked)}\n")
         f.write(f"# Status: {run_log.status.value}\n")
+        f.write(f"# Exit Reason: {_sanitize_csv_value(run_log.exit_reason)}\n")
 
         writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
 
@@ -284,6 +289,107 @@ def _write_csv(run_log: RunLog, path: Path) -> None:
                     term_meta_str,
                 ]
             )
+
+
+def _iter_run_log_paths(project_path: Path) -> list[Path]:
+    """Return run log YAML files ordered newest-first.
+
+    Args:
+        project_path: Project root path.
+
+    Returns:
+        Run log YAML paths sorted by mtime descending.
+
+    """
+    runs_dir = project_path / ".bmad-assist" / "runs"
+    if not runs_dir.exists():
+        return []
+
+    return sorted(
+        runs_dir.glob("run-*.yaml"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+
+def _load_run_log(path: Path) -> RunLog:
+    """Load a run log from YAML.
+
+    Args:
+        path: YAML file path.
+
+    Returns:
+        Parsed run log.
+
+    Raises:
+        yaml.YAMLError: If the file is not valid YAML.
+        ValueError: If the file is empty.
+        pydantic.ValidationError: If the data does not match RunLog.
+
+    """
+    with open(path, encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+
+    if data is None:
+        raise ValueError(f"Run log file is empty: {path}")
+
+    return RunLog.model_validate(data)
+
+
+def reconcile_stale_running_runs(project_path: Path, exit_reason: str) -> list[Path]:
+    """Finalize all stale running run logs after dead-PID recovery.
+
+    Args:
+        project_path: Project root path.
+        exit_reason: Recovery reason to persist on the run log.
+
+    Returns:
+        Reconciled YAML paths in newest-first order.
+
+    """
+    reconciled_paths: list[Path] = []
+
+    for yaml_path in _iter_run_log_paths(project_path):
+        try:
+            run_log = _load_run_log(yaml_path)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.warning("Failed to inspect run log %s during stale recovery: %s", yaml_path, exc)
+            continue
+
+        if run_log.status != RunStatus.RUNNING:
+            continue
+
+        run_log.status = RunStatus.CRASHED
+        run_log.exit_reason = exit_reason
+        run_log.ended_at = datetime.now(UTC)
+        run_log.current_phase = None
+
+        csv_exists = yaml_path.with_suffix(".csv").exists()
+        saved_path = save_run_log(run_log, project_path, as_csv=csv_exists)
+        logger.warning(
+            "Reconciled stale running run log %s as %s (%s)",
+            saved_path.name,
+            run_log.status.value,
+            exit_reason,
+        )
+        reconciled_paths.append(saved_path)
+
+    return reconciled_paths
+
+
+def reconcile_stale_running_run(project_path: Path, exit_reason: str) -> Path | None:
+    """Finalize the newest stale running run log after dead-PID recovery.
+
+    Args:
+        project_path: Project root path.
+        exit_reason: Recovery reason to persist on the run log.
+
+    Returns:
+        Path to the newest reconciled YAML file, or None if nothing was updated.
+
+    """
+    reconciled_paths = reconcile_stale_running_runs(project_path, exit_reason)
+    return reconciled_paths[0] if reconciled_paths else None
 
 
 def save_run_log(run_log: RunLog, project_path: Path, as_csv: bool = False) -> Path:

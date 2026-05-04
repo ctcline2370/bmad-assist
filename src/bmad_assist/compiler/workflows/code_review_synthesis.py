@@ -22,6 +22,7 @@ Public API:
 """
 
 import logging
+import re
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -71,6 +72,70 @@ _WORKFLOW_RELATIVE_PATH = "_bmad/bmm/workflows/4-implementation/code-review-synt
 
 # Minimum reviewers required for meaningful synthesis
 _MIN_REVIEWERS = 2
+
+_CONTROL_PLANE_FIX_PATTERNS = (
+    re.compile(r"Not applied;\s*workspace is read-only\.", re.IGNORECASE),
+    re.compile(r"Not applied;\s*read-only sandbox\.", re.IGNORECASE),
+)
+_CONTROL_PLANE_FIX_REPLACEMENT = "Pending validation in current writable workspace."
+_ENVIRONMENT_NOISE_MARKERS = (
+    "workspace is read-only",
+    "read-only sandbox",
+    "sandbox blocked",
+    "unauthorizedaccessexception",
+    "msbuild temp directory",
+    "access to the path is denied",
+    "could not complete in this environment",
+)
+
+
+def _sanitize_synthesis_input(content: str, *, label: str) -> str:
+    """Remove environment-only execution noise from synthesis inputs.
+
+    Synthesis should focus on durable code findings, not stale notes from a prior
+    read-only sandbox. The sanitizer is intentionally phrase-specific so it does
+    not weaken actual reviewer or antipattern content.
+    """
+
+    sanitized = content
+    for pattern in _CONTROL_PLANE_FIX_PATTERNS:
+        sanitized = pattern.sub(_CONTROL_PLANE_FIX_REPLACEMENT, sanitized)
+
+    removed_lines = 0
+    kept_lines: list[str] = []
+    for line in sanitized.splitlines():
+        normalized = line.lower()
+        if any(marker in normalized for marker in _ENVIRONMENT_NOISE_MARKERS):
+            removed_lines += 1
+            continue
+        kept_lines.append(line)
+
+    sanitized = "\n".join(kept_lines)
+    sanitized = re.sub(r"\n{3,}", "\n\n", sanitized).strip()
+
+    if removed_lines:
+        logger.debug(
+            "Sanitized %d environment-noise lines from %s synthesis input",
+            removed_lines,
+            label,
+        )
+
+    return sanitized
+
+
+def _sanitize_antipattern_files(files: dict[str, str]) -> dict[str, str]:
+    """Sanitize loaded antipattern documents before synthesis uses them."""
+
+    return {
+        path: _sanitize_synthesis_input(content, label=f"antipattern:{path}")
+        for path, content in files.items()
+    }
+
+
+def _sanitize_review_content(content: str, reviewer_id: str) -> str:
+    """Sanitize reviewer content without dropping substantive findings."""
+
+    return _sanitize_synthesis_input(content, label=f"review:{reviewer_id}")
 
 
 class CodeReviewSynthesisCompiler:
@@ -260,7 +325,7 @@ class CodeReviewSynthesisCompiler:
         # 1b. Include code antipatterns - synthesis should reference known issues
         from bmad_assist.compiler.strategic_context import load_antipatterns
 
-        files.update(load_antipatterns(context, "code"))
+        files.update(_sanitize_antipattern_files(load_antipatterns(context, "code")))
 
         # 1c. TEA Context (test-review findings) for synthesis decisions
         files.update(collect_tea_context(context, "code_review_synthesis", resolved))
@@ -306,7 +371,7 @@ class CodeReviewSynthesisCompiler:
         for r in sorted_reviews:
             # Use reviewer ID as virtual path (e.g., "[Reviewer A]")
             review_path = f"[{r.validator_id}]"
-            files[review_path] = r.content
+            files[review_path] = _sanitize_review_content(r.content, r.validator_id)
             logger.debug("Added review to synthesis context: %s", review_path)
 
         # 3. Git diff (embedded as section) - LIMITED for synthesis

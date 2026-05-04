@@ -3,7 +3,6 @@
 Tests organized by Acceptance Criteria from the tech-spec.
 """
 
-import asyncio
 import json
 import os
 import threading
@@ -167,6 +166,13 @@ def _run_invoke_with_mock(
             return provider.invoke(prompt, **invoke_kwargs)  # type: ignore[union-attr]
 
 
+def _close_coro_and_raise(coro: object, exc: Exception) -> None:
+    """Close an unconsumed coroutine before simulating runner failure."""
+    if hasattr(coro, "close"):
+        coro.close()  # type: ignore[union-attr]
+    raise exc
+
+
 # =============================================================================
 # AC1-AC3: Structure Tests
 # =============================================================================
@@ -297,7 +303,7 @@ class TestOpenCodeSDKProviderErrors:
             ),
             patch(
                 "bmad_assist.core.async_utils.run_async_in_thread",
-                side_effect=TimeoutError,
+                side_effect=lambda coro: _close_coro_and_raise(coro, TimeoutError()),
             ),
         ):
             with pytest.raises(ProviderTimeoutError):
@@ -332,7 +338,10 @@ class TestOpenCodeSDKProviderErrors:
             ),
             patch(
                 "bmad_assist.core.async_utils.run_async_in_thread",
-                side_effect=ConnectionError("refused"),
+                side_effect=lambda coro: _close_coro_and_raise(
+                    coro,
+                    ConnectionError("refused"),
+                ),
             ),
         ):
             with pytest.raises(ProviderError, match="connection error"):
@@ -352,7 +361,10 @@ class TestOpenCodeSDKProviderErrors:
             ),
             patch(
                 "bmad_assist.core.async_utils.run_async_in_thread",
-                side_effect=ImportError("No module named 'opencode_ai'"),
+                side_effect=lambda coro: _close_coro_and_raise(
+                    coro,
+                    ImportError("No module named 'opencode_ai'"),
+                ),
             ),
         ):
             with pytest.raises(ProviderError, match="opencode-ai package not installed"):

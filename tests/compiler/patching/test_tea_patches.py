@@ -436,6 +436,63 @@ class TestTeaWorkflowPatches:
             assert git_intel.get("enabled", True), f"{patch_name} git_intelligence should be enabled"
             assert "commands" in git_intel, f"{patch_name} should have git commands"
 
+    def test_testarch_atdd_validation_matches_markdown_workflow(self) -> None:
+        """ATDD validation should require Markdown steps, not XML step tags."""
+        patch_path = Path(".bmad-assist/patches/testarch-atdd.patch.yaml")
+        content = patch_path.read_text(encoding="utf-8")
+        data = yaml.safe_load(content)
+
+        must_contain = data["validation"]["must_contain"]
+
+        assert "<step" not in must_contain
+        assert "/^##\\s+Step\\s+1[:.]/" in must_contain
+
+    def test_dev_story_normalizes_red_green_refactor_variants_before_validation(self) -> None:
+        """Dev-story should not retry compilation for punctuation-only TDD phrase drift."""
+        from bmad_assist.compiler.patching.discovery import load_patch
+        from bmad_assist.compiler.patching.transforms import post_process_compiled
+        from bmad_assist.compiler.patching.validation import validate_output
+
+        patch = load_patch(Path(".bmad-assist/patches/dev-story.patch.yaml"))
+        content = """
+<workflow>
+  <step n="5" goal="Implement task following Red / Green / Refactor cycle">
+    <critical>Test implementation behavior</critical>
+    <action>Plan implementation following red green refactor cycle</action>
+  </step>
+</workflow>
+"""
+
+        processed = post_process_compiled(content, patch.post_process)
+
+        assert "Red / Green / Refactor" not in processed
+        assert "red green refactor" not in processed
+        assert processed.count("red-green-refactor") == 2
+        assert validate_output(processed, patch.validation) == []
+
+    def test_dev_story_injects_missing_red_green_refactor_marker(self) -> None:
+        """Dev-story should preserve TDD semantics even when the marker is omitted."""
+        from bmad_assist.compiler.patching.discovery import load_patch
+        from bmad_assist.compiler.patching.transforms import post_process_compiled
+        from bmad_assist.compiler.patching.validation import validate_output
+
+        patch = load_patch(Path(".bmad-assist/patches/dev-story.patch.yaml"))
+        content = """
+<workflow>
+  <step n="5" goal="Implement task">
+    <critical>Test implementation behavior</critical>
+    <action>Plan implementation</action>
+  </step>
+</workflow>
+"""
+
+        processed = post_process_compiled(content, patch.post_process)
+
+        assert '<step n="2" goal="Implement task following red-green-refactor cycle">' in processed
+        assert "<action>Plan implementation following red-green-refactor cycle</action>" in processed
+        assert processed.count("red-green-refactor") == 2
+        assert validate_output(processed, patch.validation) == []
+
 
 class TestPostProcessRuleApplication:
     """Tests for post_process rule application."""

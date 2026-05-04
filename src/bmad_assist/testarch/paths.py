@@ -51,16 +51,29 @@ ARTIFACT_CONFIGS: dict[str, tuple[str, list[str]]] = {
     "test-review": (
         "test-reviews",
         [
-            "test-review-{story_dotted}.md",
-            "test-review-{story_hyphen}.md",
+            "test-review*{story_dotted}*.md",
+            "test-review*{story_hyphen}*.md",
         ],
     ),
     "trace": (
         "traceability",
         [
             "trace-matrix-epic-{epic_id}.md",
+            "trace-{epic_id}-*.md",
+            "trace-{epic_id}.md",
         ],
     ),
+}
+
+# Legacy/fallback artifact locations. Handlers historically saved some TEA
+# reports under output_folder while the context resolvers searched
+# implementation_artifacts. Keep the canonical subdir first, then broaden.
+ARTIFACT_SEARCH_DIRS: dict[str, list[str]] = {
+    "test-design": ["test-designs"],
+    "test-design-system": [""],
+    "atdd": ["atdd-checklists", "test-artifacts", ""],
+    "test-review": ["test-reviews", "test-review", ""],
+    "trace": ["traceability"],
 }
 
 # For backward compatibility: simple pattern mapping (flattened)
@@ -124,6 +137,26 @@ def get_artifact_dir(artifact_type: str) -> str:
     if artifact_type not in ARTIFACT_CONFIGS:
         return ""
     return ARTIFACT_CONFIGS[artifact_type][0]
+
+
+def get_artifact_search_dirs(artifact_type: str) -> list[str]:
+    """Get ordered subdirectories to search for an artifact type.
+
+    The first entry is always the canonical artifact directory. Additional
+    entries cover legacy BMAD Assist output locations so synthesis can consume
+    artifacts produced by earlier phases without manual file moves.
+    """
+    primary = get_artifact_dir(artifact_type)
+    candidates = [primary, *ARTIFACT_SEARCH_DIRS.get(artifact_type, [])]
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        result.append(candidate)
+    return result
 
 
 def get_artifact_patterns(

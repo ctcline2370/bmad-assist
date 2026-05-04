@@ -761,9 +761,10 @@ def find_epic_file(context: CompilerContext, epic_num: Any) -> Path | None:
     """Find epic file for given epic number.
 
     Searches in multiple locations with priority:
-    1. output_folder/epics/epic-{epic_num}*.md (sharded epics)
-    2. output_folder/epics.md (single file)
-    3. output_folder/*epic*.md (glob fallback)
+    1. configured epics dir / epic-{epic_num}*.md (sharded epics)
+    2. planning/knowledge epics.md (single file)
+    3. known epic roots/*epic*.md (glob fallback)
+    4. output_folder/*epic*.md (legacy fallback)
 
     Args:
         context: Compilation context with paths.
@@ -773,23 +774,48 @@ def find_epic_file(context: CompilerContext, epic_num: Any) -> Path | None:
         Path to epic file or None if not found.
 
     """
+    def _dedupe(paths: list[Path]) -> list[Path]:
+        seen: set[Path] = set()
+        deduped: list[Path] = []
+        for candidate in paths:
+            resolved = candidate.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                deduped.append(candidate)
+        return deduped
+
+    epics_dir = get_epics_dir(context)
+    planning_dir = get_planning_artifacts_dir(context)
+
+    knowledge_roots = [planning_dir]
+    try:
+        from bmad_assist.core.paths import get_paths
+
+        paths = get_paths()
+        knowledge_roots.extend([paths.project_knowledge, paths.project_docs_fallback])
+    except RuntimeError:
+        knowledge_roots.append(context.output_folder)
+
+    epic_roots = _dedupe([epics_dir, *knowledge_roots, context.output_folder])
+
     # Search 1: Sharded epics directory
-    epics_dir = context.output_folder / "epics"
     if epics_dir.exists():
         pattern = f"epic-{epic_num}*.md"
         matches = sorted(epics_dir.glob(pattern))
         if matches:
             return matches[0]
 
-    # Search 2: Single epics.md file
-    single_epic = context.output_folder / "epics.md"
-    if single_epic.exists():
-        return single_epic
+    # Search 2: Single epics.md file in planning or knowledge roots
+    for root in epic_roots:
+        single_epic = root / "epics.md"
+        if single_epic.exists():
+            return single_epic
 
-    # Search 3: Glob fallback - any file with 'epic' in name
-    matches = sorted(context.output_folder.glob("*epic*.md"))
-    if matches:
-        return matches[0]
+    # Search 3: Glob fallback - any file with 'epic' in known roots
+    for root in epic_roots:
+        matches = sorted(root.glob("*epic*.md"))
+        if matches:
+            return matches[0]
 
     return None
 

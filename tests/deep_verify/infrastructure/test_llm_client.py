@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -23,7 +23,6 @@ from bmad_assist.core.exceptions import (
 )
 from bmad_assist.deep_verify.config import LLMConfig
 from bmad_assist.deep_verify.infrastructure import (
-    CostSummary,
     LLMCallRecord,
     LLMClient,
     RetryConfig,
@@ -578,12 +577,13 @@ def test_model_pricing_contains_known_models():
     assert "haiku" in MODEL_PRICING
     assert "sonnet" in MODEL_PRICING
     assert "opus" in MODEL_PRICING
+    assert "gpt-5.5" in MODEL_PRICING
     assert "gpt-4o" in MODEL_PRICING
 
 
 def test_model_pricing_has_input_output():
     """Test that each model has input and output pricing."""
-    for model, pricing in MODEL_PRICING.items():
+    for _model, pricing in MODEL_PRICING.items():
         assert len(pricing) == 2
         assert pricing[0] >= 0  # input price
         assert pricing[1] >= 0  # output price

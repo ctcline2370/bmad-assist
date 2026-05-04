@@ -32,7 +32,6 @@ from bmad_assist.sprint.scanner import (
     _scan_validations,
 )
 
-
 # ============================================================================
 # Fixtures
 # ============================================================================
@@ -183,6 +182,14 @@ class TestSynthesisPattern:
         match = SYNTHESIS_PATTERN.match("synthesis-20-1-20260107T154829.md")
         assert match is not None
         assert match.group("timestamp") == "20260107T154829"
+
+    def test_synthesis_with_utc_z_timestamp(self) -> None:
+        """Test synthesis filename with BMAD Assist UTC Z timestamp."""
+        match = SYNTHESIS_PATTERN.match("synthesis-8-1-20260424T151047Z.md")
+        assert match is not None
+        assert match.group("epic") == "8"
+        assert match.group("story") == "1"
+        assert match.group("timestamp") == "20260424T151047Z"
 
     def test_synthesis_without_timestamp(self) -> None:
         """Test synthesis filename without timestamp."""

@@ -16,12 +16,10 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
 
 from bmad_assist.bmad.parser import EpicDocument, EpicStory
-from bmad_assist.core.exceptions import ParserError
 from bmad_assist.sprint import EntryType
 from bmad_assist.sprint.generator import (
     GeneratedEntries,
@@ -737,6 +735,31 @@ No explicit status.
         assert entries_by_key["1-1-done-story"].status == "done"
         assert entries_by_key["1-2-in-progress"].status == "in-progress"
         assert entries_by_key["1-3-backlog-story"].status == "backlog"
+
+    def test_multi_epic_file_skips_epic_list_section_heading(self, tmp_path: Path) -> None:
+        """Consolidated planning files must not create synthetic epic-List entries."""
+        docs_dir = tmp_path / "docs"
+        docs_dir.mkdir(parents=True)
+        (docs_dir / "epics.md").write_text(
+            """# Project Epic Breakdown
+
+## Epic List
+
+- Epic 8: Observability Enforcement
+
+## Epic 8: Observability Enforcement
+
+### Story 8.1: Runtime Assertions
+"""
+        )
+
+        result = generate_from_epics(tmp_path, auto_exclude_legacy=False)
+        keys = {entry.key for entry in result.entries}
+
+        assert "epic-List" not in keys
+        assert "epic-List-retrospective" not in keys
+        assert "epic-8" in keys
+        assert "8-1-runtime-assertions" in keys
 
     def test_generated_entries_dataclass(self, tmp_path):
         """GeneratedEntries has correct field types."""

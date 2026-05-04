@@ -320,6 +320,63 @@ Evidence Score: -4.0
         # 3.0 + 1.0 = 4.0
         assert report.total_score == 4.0
 
+    def test_parse_table_with_github_emoji_aliases(self) -> None:
+        """Detailed tables support GitHub emoji aliases and scored clean-pass rows."""
+        content = """
+## Evidence Score Summary
+
+| Severity | Description | Source | Score |
+|----------|-------------|--------|-------|
+| :red_circle: CRITICAL | Hidden skip helper | tests.py:10 | +3 |
+| :orange_circle: IMPORTANT | Missing telemetry source | src.py:20 | +1 |
+| :green_circle: CLEAN PASS | 4 clean categories | - | -2.0 |
+
+### Evidence Score: 2.0
+
+```markdown
+### Critical: Example heading from a recommended fix
+1. This fenced example must not be parsed as a finding.
+2. Nor should this line inflate the score.
+```
+"""
+        report = parse_evidence_findings(content, "Validator H")
+
+        assert report is not None
+        assert len(report.findings) == 2
+        assert report.clean_passes == 4
+        assert report.total_score == 2.0
+
+    def test_parse_clean_pass_detail_row_without_count_cell(self) -> None:
+        """A detailed CLEAN PASS row can derive its count from the negative score."""
+        content = """
+## Evidence Score Summary
+
+| Severity | Description | Source | Score |
+|----------|-------------|--------|-------|
+| 🟠 IMPORTANT | Missing explicit metadata source | AC3 | +1 |
+| 🟢 CLEAN PASS | Valuable criterion is clear | Story | -0.5 |
+
+### Evidence Score: 0.5
+"""
+        report = parse_evidence_findings(content, "Validator I")
+
+        assert report is not None
+        assert len(report.findings) == 1
+        assert report.clean_passes == 1
+        assert report.total_score == 0.5
+
+    def test_section_header_fallback_ignores_fenced_examples(self) -> None:
+        """Fallback parsing ignores markdown examples inside fenced code blocks."""
+        content = """
+```markdown
+### Critical: Example heading from a recommended fix
+1. This line is an example, not a validator finding.
+```
+"""
+        report = parse_evidence_findings(content, "Validator J")
+
+        assert report is None
+
 
 # =============================================================================
 # Aggregation Tests

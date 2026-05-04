@@ -10,6 +10,7 @@ import logging
 import re
 import subprocess
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,12 @@ DEFAULT_EXCLUDE_PATTERNS: tuple[str, ...] = (
     # BMAD generated artifacts (run tracking, benchmarks, reports, state)
     ".bmad-assist/*",
     "_bmad-output/*",
+    ".agents/*",
+    ".codex/*",
+    ".claude/*",
+    "AGENTS.md",
+    "AGENTS.override.md",
+    "CLAUDE.md",
     # Cache and metadata
     "*.cache",
     "*.meta.yaml",
@@ -238,14 +245,16 @@ def capture_filtered_diff(
         # Git pathspec magic: :(exclude)pattern excludes matching files
         pathspec_excludes = [f":(exclude){p}" for p in exclude_patterns]
 
-        # Capture stat summary separately (lightweight, always included)
+        # Capture stat summary separately (lightweight, always included).
+        # Compare the base commit to the working tree, not just HEAD, because
+        # BMAD code-review commonly runs before the dev-story changes are
+        # committed.
         stat_cmd = [
             "git",
             "diff",
             "--no-ext-diff",
             "--stat",
             base,
-            "HEAD",
             "--",
             *pathspec_excludes,
         ]
@@ -259,14 +268,13 @@ def capture_filtered_diff(
         )
         stat_section = stat_result.stdout if stat_result.returncode == 0 else ""
 
-        # Capture patch separately (will be prioritized)
+        # Capture patch separately (will be prioritized).
         patch_cmd = [
             "git",
             "diff",
             "--no-ext-diff",
             "-p",
             base,
-            "HEAD",
             "--",
             *pathspec_excludes,
         ]
@@ -285,6 +293,17 @@ def capture_filtered_diff(
             return ""
 
         patch_content = result.stdout
+
+        untracked_stat, untracked_patch = _capture_untracked_diff(
+            project_root,
+            exclude_patterns,
+        )
+
+        if untracked_stat.strip():
+            stat_section = _join_non_empty_sections(stat_section, untracked_stat)
+        if untracked_patch.strip():
+            patch_content = _join_non_empty_sections(patch_content, untracked_patch)
+
         if not patch_content.strip() and not stat_section.strip():
             return ""
 
@@ -315,9 +334,141 @@ def capture_filtered_diff(
         return ""
 
 
+def _join_non_empty_sections(*sections: str) -> str:
+    """Join non-empty text sections with a blank line."""
+    return "\n\n".join(section.rstrip("\n") for section in sections if section.strip())
+
+
+def _normalize_diff_path(path: str) -> str:
+    """Normalize a repository-relative path for filtering."""
+    normalized = path.replace("\\", "/").strip()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
+def _path_matches_pattern(path: str, pattern: str) -> bool:
+    """Return True when a normalized path matches a git-style glob enough for filters."""
+    normalized = _normalize_diff_path(path)
+    normalized_pattern = _normalize_diff_path(pattern)
+
+    if not normalized or not normalized_pattern:
+        return False
+
+    if fnmatchcase(normalized, normalized_pattern):
+        return True
+
+    # Patterns like "AGENTS.md" are intended to match the basename anywhere.
+    if "/" not in normalized_pattern and fnmatchcase(Path(normalized).name, normalized_pattern):
+        return True
+
+    # Patterns like ".bmad-assist/*" should exclude nested descendants too.
+    if normalized_pattern.endswith("/*"):
+        prefix = normalized_pattern[:-1]
+        return normalized.startswith(prefix)
+
+    return False
+
+
+def _is_excluded_diff_path(path: str, exclude_patterns: tuple[str, ...]) -> bool:
+    """Return True when a repo-relative path should be excluded from review diffs."""
+    return any(_path_matches_pattern(path, pattern) for pattern in exclude_patterns)
+
+
+def _list_untracked_files(
+    project_root: Path,
+    exclude_patterns: tuple[str, ...],
+) -> list[str]:
+    """Return eligible untracked file paths, excluding ignored/generated files."""
+    result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        timeout=_GIT_TIMEOUT,
+        errors="replace",
+    )
+    if result.returncode != 0:
+        stderr_msg = result.stderr[:200] if result.stderr else "unknown"
+        logger.warning("git ls-files for untracked files failed: %s", stderr_msg)
+        return []
+
+    files = [
+        _normalize_diff_path(path)
+        for path in result.stdout.split("\0")
+        if path.strip()
+    ]
+
+    eligible: list[str] = []
+    for path in files:
+        if _is_excluded_diff_path(path, exclude_patterns):
+            continue
+        if not (project_root / path).is_file():
+            continue
+        eligible.append(path)
+
+    return sorted(eligible)
+
+
+def _run_no_index_diff(project_root: Path, path: str, stat: bool) -> str:
+    """Return a no-index diff for one untracked file.
+
+    Git returns exit code 1 when differences are found in --no-index mode, so
+    0 and 1 are both successful outcomes here.
+    """
+    cmd = ["git", "diff", "--no-ext-diff", "--no-index"]
+    if stat:
+        cmd.append("--stat")
+    else:
+        cmd.append("-p")
+    cmd.extend(["--", "/dev/null", path])
+
+    result = subprocess.run(
+        cmd,
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        timeout=_GIT_TIMEOUT,
+        errors="replace",
+    )
+
+    if result.returncode in (0, 1):
+        return result.stdout
+
+    stderr_msg = result.stderr[:200] if result.stderr else "unknown"
+    logger.warning("git diff --no-index failed for %s: %s", path, stderr_msg)
+    return ""
+
+
+def _capture_untracked_diff(
+    project_root: Path,
+    exclude_patterns: tuple[str, ...],
+) -> tuple[str, str]:
+    """Capture stat and patch sections for eligible untracked files."""
+    untracked_files = _list_untracked_files(project_root, exclude_patterns)
+    if not untracked_files:
+        return "", ""
+
+    stat_sections: list[str] = []
+    patch_sections: list[str] = []
+    for path in untracked_files:
+        stat_output = _run_no_index_diff(project_root, path, stat=True)
+        patch_output = _run_no_index_diff(project_root, path, stat=False)
+
+        if stat_output.strip():
+            stat_sections.append(stat_output)
+        if patch_output.strip():
+            patch_sections.append(patch_output)
+
+    return _join_non_empty_sections(*stat_sections), _join_non_empty_sections(*patch_sections)
+
+
 # File extensions considered source code (highest priority in diff)
 _SOURCE_EXTENSIONS: frozenset[str] = frozenset(
     {
+        ".cs",
+        ".fs",
+        ".vb",
         ".py",
         ".go",
         ".rs",

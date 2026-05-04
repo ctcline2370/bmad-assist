@@ -26,6 +26,8 @@ class TestDesignResolver(BaseResolver):
 
     """
 
+    __test__ = False
+
     @property
     def artifact_type(self) -> str:
         """Return artifact type identifier."""

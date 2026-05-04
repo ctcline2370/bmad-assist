@@ -6,7 +6,9 @@ Story 6.5: Main Loop Runner
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import signal
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
@@ -56,11 +58,12 @@ class TestRunLoopStub:
         # Story 6.5 update: run_loop now requires epic_list and epic_stories_loader
         with patch("bmad_assist.core.loop.runner.load_state", return_value=State()):
             with patch("bmad_assist.core.loop.runner.execute_phase", return_value=PhaseResult.ok()):
-                with patch("bmad_assist.core.loop.runner.save_state"):
-                    with patch("bmad_assist.core.loop.runner.handle_epic_completion") as mock_epic:
-                        mock_epic.return_value = (State(), True)
+                with patch("bmad_assist.core.loop.epic_phases.execute_phase", return_value=PhaseResult.ok()):
+                    with patch("bmad_assist.core.loop.runner.save_state"):
+                        with patch("bmad_assist.core.loop.runner.handle_epic_completion") as mock_epic:
+                            mock_epic.return_value = (State(), True)
 
-                        run_loop(valid_config, tmp_path, [1], lambda x: ["1.1"])
+                            run_loop(valid_config, tmp_path, [1], lambda x: ["1.1"])
 
     def test_run_loop_returns_completed(self, valid_config: Config, tmp_path: Path) -> None:
         """AC5: run_loop returns LoopExitReason.COMPLETED (blocking call that completes)."""
@@ -71,11 +74,12 @@ class TestRunLoopStub:
         # Story 6.6 update: run_loop returns LoopExitReason instead of None
         with patch("bmad_assist.core.loop.runner.load_state", return_value=State()):
             with patch("bmad_assist.core.loop.runner.execute_phase", return_value=PhaseResult.ok()):
-                with patch("bmad_assist.core.loop.runner.save_state"):
-                    with patch("bmad_assist.core.loop.runner.handle_epic_completion") as mock_epic:
-                        mock_epic.return_value = (State(), True)
+                with patch("bmad_assist.core.loop.epic_phases.execute_phase", return_value=PhaseResult.ok()):
+                    with patch("bmad_assist.core.loop.runner.save_state"):
+                        with patch("bmad_assist.core.loop.runner.handle_epic_completion") as mock_epic:
+                            mock_epic.return_value = (State(), True)
 
-                        result = run_loop(valid_config, tmp_path, [1], lambda x: ["1.1"])
+                            result = run_loop(valid_config, tmp_path, [1], lambda x: ["1.1"])
 
         assert result == LoopExitReason.COMPLETED
 
@@ -89,12 +93,13 @@ class TestRunLoopStub:
         # Story 6.5 update: run_loop now requires epic_list and epic_stories_loader
         with patch("bmad_assist.core.loop.runner.load_state", return_value=State()):
             with patch("bmad_assist.core.loop.runner.execute_phase", return_value=PhaseResult.ok()):
-                with patch("bmad_assist.core.loop.runner.save_state"):
-                    with patch("bmad_assist.core.loop.runner.handle_epic_completion") as mock_epic:
-                        mock_epic.return_value = (State(), True)
+                with patch("bmad_assist.core.loop.epic_phases.execute_phase", return_value=PhaseResult.ok()):
+                    with patch("bmad_assist.core.loop.runner.save_state"):
+                        with patch("bmad_assist.core.loop.runner.handle_epic_completion") as mock_epic:
+                            mock_epic.return_value = (State(), True)
 
-                        with caplog.at_level(logging.DEBUG):
-                            run_loop(valid_config, tmp_path, [1], lambda x: ["1.1"])
+                            with caplog.at_level(logging.DEBUG):
+                                run_loop(valid_config, tmp_path, [1], lambda x: ["1.1"])
 
         # Should log provider info
         assert "claude" in caplog.text.lower()
@@ -718,10 +723,10 @@ class TestRunLoopFailureHandling:
         # Guardian halt returns GUARDIAN_HALT exit reason
         assert result == LoopExitReason.GUARDIAN_HALT
 
-    def test_run_loop_retrospective_failure_moves_to_next_epic(
+    def test_run_loop_retrospective_failure_halts_without_advancing_epic(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """RETROSPECTIVE failure should log warning and move to next epic or complete project."""
+        """Resumed teardown failure should halt without calling epic completion."""
         from bmad_assist.core.config import load_config
         from bmad_assist.core.loop import LoopExitReason, PhaseResult, run_loop
         from bmad_assist.core.state import Phase, State
@@ -733,55 +738,316 @@ class TestRunLoopFailureHandling:
             }
         )
 
-        # Start with an epic in RETROSPECTIVE phase, and a next epic available
+        # Start with an epic in RETROSPECTIVE phase to simulate resume during teardown
         initial_state = State(
             current_epic=1,
             current_story="1.1",
             current_phase=Phase.RETROSPECTIVE,
-            completed_epics=[],  # Epic 1 is not yet completed in state
+            completed_epics=[],
         )
-
-        # State after handle_epic_completion for the *next* epic
-        next_epic_state = State(
-            current_epic=2,
-            current_story="2.1",
-            current_phase=Phase.CREATE_STORY,
-            completed_epics=[1],  # Epic 1 now completed
-        )
-
-        # Use a callable for side_effect to handle arbitrary number of calls after the first failure
-        call_count = [0]
-
-        def execute_phase_side_effect(state):
-            call_count[0] += 1
-            if call_count[0] == 1:
-                return PhaseResult.fail("Retrospective analysis failed")
-            return PhaseResult.ok()
 
         with patch("bmad_assist.core.loop.runner.load_state", return_value=initial_state):
             with patch(
                 "bmad_assist.core.loop.runner.execute_phase",
-                side_effect=execute_phase_side_effect,
-            ) as mock_execute_phase:
+                return_value=PhaseResult.fail("Retrospective analysis failed"),
+            ):
                 with patch("bmad_assist.core.loop.runner.save_state") as mock_save_state:
                     with patch(
-                        "bmad_assist.core.loop.runner.handle_epic_completion",
-                        # First time, move to next epic (not project complete)
-                        # Second time (after completing next epic's phases), project complete
-                        side_effect=[
-                            (next_epic_state, False),
-                            (next_epic_state.model_copy(update={"completed_epics": [1, 2]}), True),
-                        ],
+                        "bmad_assist.core.loop.runner.handle_epic_completion"
                     ) as mock_handle_epic_completion:
                         with caplog.at_level(logging.WARNING):
                             result = run_loop(config, tmp_path, [1, 2], lambda x: [f"{x}.1"])
 
-        # Assertions - look for either old or new log format
         assert "RETROSPECTIVE" in caplog.text and "failed" in caplog.text
-        # handle_epic_completion is called once for the failed retrospective, and once for the subsequent epic's completion
-        assert mock_handle_epic_completion.call_count == 2
-        mock_save_state.assert_called()  # Should have saved state at least once
+        mock_handle_epic_completion.assert_not_called()
+        mock_save_state.assert_called()
+        assert result == LoopExitReason.GUARDIAN_HALT
+
+
+class TestRunLoopRunTracking:
+    """Persist terminal run status truthfully for diagnostics and resume."""
+
+    @pytest.fixture
+    def config(self, tmp_path: Path) -> Config:
+        """Create a minimal config suitable for runner-level persistence tests."""
+        return load_config(
+            {
+                "providers": {"master": {"provider": "claude", "model": "opus_4"}},
+                "state_path": str(tmp_path / "state.yaml"),
+            }
+        )
+
+    @pytest.mark.parametrize(
+        ("exit_reason", "expected_status"),
+        [
+            ("completed", "completed"),
+            ("cancelled", "cancelled"),
+            ("guardian_halt", "halted"),
+            ("interrupted_sigint", "interrupted"),
+            ("interrupted_sigterm", "interrupted"),
+        ],
+    )
+    def test_run_loop_persists_terminal_status(
+        self,
+        tmp_path: Path,
+        config: Config,
+        exit_reason: str,
+        expected_status: str,
+    ) -> None:
+        """run_loop should persist the true terminal status for non-error exits."""
+        from copy import deepcopy
+
+        from bmad_assist.core.loop.runner import run_loop
+        from bmad_assist.core.loop.types import LoopExitReason
+
+        saved_logs = []
+
+        def capture_run_log(run_log, *_args, **_kwargs):
+            saved_logs.append(deepcopy(run_log))
+            return tmp_path / ".bmad-assist" / "runs" / "dummy.yaml"
+
+        with patch(
+            "bmad_assist.core.config.load_loop_config",
+            return_value=MagicMock(epic_setup=[], story=[], epic_teardown=[]),
+        ):
+            with patch("bmad_assist.core.config.set_loop_config"):
+                with patch("bmad_assist.core.loop.runner.init_handlers"):
+                    with patch("bmad_assist.core.loop.runner._ensure_sprint_sync_callback"):
+                        with patch(
+                            "bmad_assist.core.loop.runner._running_lock",
+                            return_value=contextlib.nullcontext(),
+                        ):
+                            with patch(
+                                "bmad_assist.core.loop.runner._run_loop_body",
+                                return_value=LoopExitReason(exit_reason),
+                            ):
+                                with patch(
+                                    "bmad_assist.core.loop.runner.save_run_log",
+                                    side_effect=capture_run_log,
+                                ):
+                                    result = run_loop(
+                                        config,
+                                        tmp_path,
+                                        [1],
+                                        lambda _epic: ["1.1"],
+                                        skip_signal_handlers=True,
+                                        ipc_enabled=False,
+                                    )
+
+        assert result == LoopExitReason(exit_reason)
+        assert len(saved_logs) == 2
+        assert saved_logs[0].status.value == "running"
+        assert saved_logs[0].exit_reason is None
+        assert saved_logs[-1].status.value == expected_status
+        assert saved_logs[-1].exit_reason == exit_reason
+        assert saved_logs[-1].ended_at is not None
+
+    def test_run_loop_persists_crash_status_on_unhandled_exception(
+        self, tmp_path: Path, config: Config
+    ) -> None:
+        """run_loop should persist crash metadata when _run_loop_body raises."""
+        from copy import deepcopy
+
+        from bmad_assist.core.loop.runner import run_loop
+
+        saved_logs = []
+
+        def capture_run_log(run_log, *_args, **_kwargs):
+            saved_logs.append(deepcopy(run_log))
+            return tmp_path / ".bmad-assist" / "runs" / "dummy.yaml"
+
+        with pytest.raises(RuntimeError, match="boom"):
+            with patch(
+                "bmad_assist.core.config.load_loop_config",
+                return_value=MagicMock(epic_setup=[], story=[], epic_teardown=[]),
+            ):
+                with patch("bmad_assist.core.config.set_loop_config"):
+                    with patch("bmad_assist.core.loop.runner.init_handlers"):
+                        with patch("bmad_assist.core.loop.runner._ensure_sprint_sync_callback"):
+                            with patch(
+                                "bmad_assist.core.loop.runner._running_lock",
+                                return_value=contextlib.nullcontext(),
+                            ):
+                                with patch(
+                                    "bmad_assist.core.loop.runner._run_loop_body",
+                                    side_effect=RuntimeError("boom"),
+                                ):
+                                    with patch(
+                                        "bmad_assist.core.loop.runner.save_run_log",
+                                        side_effect=capture_run_log,
+                                    ):
+                                        run_loop(
+                                            config,
+                                            tmp_path,
+                                            [1],
+                                            lambda _epic: ["1.1"],
+                                            skip_signal_handlers=True,
+                                            ipc_enabled=False,
+                                        )
+
+        assert len(saved_logs) == 2
+        assert saved_logs[-1].status.value == "crashed"
+        assert saved_logs[-1].exit_reason == "error"
+        assert saved_logs[-1].ended_at is not None
+
+    def test_run_loop_does_not_persist_running_log_when_lock_acquisition_fails(
+        self, tmp_path: Path, config: Config
+    ) -> None:
+        """run_loop should not create a RUNNING log if the process lock is denied."""
+        from bmad_assist.core.loop.runner import run_loop
+
+        with pytest.raises(StateError, match="already running"):
+            with patch(
+                "bmad_assist.core.config.load_loop_config",
+                return_value=MagicMock(epic_setup=[], story=[], epic_teardown=[]),
+            ):
+                with patch("bmad_assist.core.config.set_loop_config"):
+                    with patch("bmad_assist.core.loop.runner.init_handlers"):
+                        with patch("bmad_assist.core.loop.runner._ensure_sprint_sync_callback"):
+                            with patch(
+                                "bmad_assist.core.loop.runner._running_lock",
+                                side_effect=StateError("already running"),
+                            ):
+                                with patch("bmad_assist.core.loop.runner.save_run_log") as mock_save:
+                                    run_loop(
+                                        config,
+                                        tmp_path,
+                                        [1],
+                                        lambda _epic: ["1.1"],
+                                        skip_signal_handlers=True,
+                                        ipc_enabled=False,
+                                    )
+
+        mock_save.assert_not_called()
+
+    def test_run_loop_persists_running_log_only_after_lock_acquired(
+        self, tmp_path: Path, config: Config
+    ) -> None:
+        """run_loop should enter the process lock before persisting RUNNING state."""
+        from bmad_assist.core.loop.runner import run_loop
+        from bmad_assist.core.loop.types import LoopExitReason
+
+        events: list[str] = []
+
+        @contextlib.contextmanager
+        def tracking_lock(_project_path: Path):
+            events.append("lock_enter")
+            try:
+                yield
+            finally:
+                events.append("lock_exit")
+
+        def capture_run_log(run_log, *_args, **_kwargs):
+            events.append(f"save:{run_log.status.value}")
+            return tmp_path / ".bmad-assist" / "runs" / "dummy.yaml"
+
+        with patch(
+            "bmad_assist.core.config.load_loop_config",
+            return_value=MagicMock(epic_setup=[], story=[], epic_teardown=[]),
+        ):
+            with patch("bmad_assist.core.config.set_loop_config"):
+                with patch("bmad_assist.core.loop.runner.init_handlers"):
+                    with patch("bmad_assist.core.loop.runner._ensure_sprint_sync_callback"):
+                        with patch(
+                            "bmad_assist.core.loop.runner._running_lock",
+                            side_effect=tracking_lock,
+                        ):
+                            with patch(
+                                "bmad_assist.core.loop.runner._run_loop_body",
+                                return_value=LoopExitReason.COMPLETED,
+                            ):
+                                with patch(
+                                    "bmad_assist.core.loop.runner.save_run_log",
+                                    side_effect=capture_run_log,
+                                ):
+                                    result = run_loop(
+                                        config,
+                                        tmp_path,
+                                        [1],
+                                        lambda _epic: ["1.1"],
+                                        skip_signal_handlers=True,
+                                        ipc_enabled=False,
+                                    )
+
         assert result == LoopExitReason.COMPLETED
+        assert events.index("lock_enter") < events.index("save:running")
+        assert events.count("save:running") == 1
+        assert events[-1] == "lock_exit"
+
+    def test_run_loop_pre_exit_finalizer_marks_run_interrupted_and_removes_lock(
+        self, tmp_path: Path, config: Config
+    ) -> None:
+        """Hard signal cleanup should finalize the active run before os._exit."""
+        from copy import deepcopy
+
+        from bmad_assist.core.loop.runner import run_loop
+
+        lock_path = tmp_path / ".bmad-assist" / "running.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text("1234\n2026-01-01T00:00:00+00:00\n", encoding="utf-8")
+
+        saved_logs = []
+        captured_callback = {}
+        unregistered_callbacks = []
+
+        def capture_run_log(run_log, *_args, **_kwargs):
+            saved_logs.append(deepcopy(run_log))
+            return tmp_path / ".bmad-assist" / "runs" / "dummy.yaml"
+
+        def register_callback(callback):
+            captured_callback["fn"] = callback
+
+        def unregister_callback(callback):
+            unregistered_callbacks.append(callback)
+
+        def stop_with_signal(*_args, **_kwargs):
+            captured_callback["fn"](signal.SIGTERM)
+            raise SystemExit(143)
+
+        with pytest.raises(SystemExit) as exc_info:
+            with patch(
+                "bmad_assist.core.config.load_loop_config",
+                return_value=MagicMock(epic_setup=[], story=[], epic_teardown=[]),
+            ):
+                with patch("bmad_assist.core.config.set_loop_config"):
+                    with patch("bmad_assist.core.loop.runner.init_handlers"):
+                        with patch("bmad_assist.core.loop.runner._ensure_sprint_sync_callback"):
+                            with patch(
+                                "bmad_assist.core.loop.runner._running_lock",
+                                return_value=contextlib.nullcontext(),
+                            ):
+                                with patch(
+                                    "bmad_assist.core.loop.runner.register_pre_exit_cleanup",
+                                    side_effect=register_callback,
+                                ):
+                                    with patch(
+                                        "bmad_assist.core.loop.runner.unregister_pre_exit_cleanup",
+                                        side_effect=unregister_callback,
+                                    ):
+                                        with patch(
+                                            "bmad_assist.core.loop.runner._run_loop_body",
+                                            side_effect=stop_with_signal,
+                                        ):
+                                            with patch(
+                                                "bmad_assist.core.loop.runner.save_run_log",
+                                                side_effect=capture_run_log,
+                                            ):
+                                                run_loop(
+                                                    config,
+                                                    tmp_path,
+                                                    [1],
+                                                    lambda _epic: ["1.1"],
+                                                    skip_signal_handlers=True,
+                                                    ipc_enabled=False,
+                                                )
+
+        assert exc_info.value.code == 143
+        assert lock_path.exists() is False
+        assert captured_callback["fn"] in unregistered_callbacks
+        assert any(
+            log.status.value == "interrupted" and log.exit_reason == "interrupted_sigterm"
+            for log in saved_logs
+        )
 
 
 class TestRunLoopStatePersistence:
@@ -929,6 +1195,301 @@ class TestRunLoopIntegrationFull:
         assert phases_executed[-1] == Phase.RETROSPECTIVE
 
 
+class TestCodeReviewReworkPolicy:
+    """Tests for strict handling of unresolved negative code review verdicts."""
+
+    def test_run_loop_completes_negative_verdict_with_zero_unresolved_action_items(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A resolved synthesis should not re-enter dev-story on stale review verdict."""
+        from bmad_assist.core.config import LoopConfig
+        from bmad_assist.core.loop import LoopExitReason, PhaseResult, run_loop
+        from bmad_assist.core.state import Phase, State
+
+        config = load_config(
+            {
+                "providers": {"master": {"provider": "claude", "model": "opus_4"}},
+                "state_path": str(tmp_path / "state.yaml"),
+                "loop": {
+                    "story": ["dev_story", "code_review", "code_review_synthesis"],
+                    "code_review_rework": True,
+                    "max_rework_attempts": 2,
+                },
+            }
+        )
+
+        state = State(
+            current_epic=1,
+            current_story="1.1",
+            current_phase=Phase.CODE_REVIEW_SYNTHESIS,
+            code_review_rework_count=0,
+        )
+        completed_state = State(
+            current_epic=1,
+            current_story="1.1",
+            current_phase=Phase.CODE_REVIEW_SYNTHESIS,
+            completed_stories=["1.1"],
+        )
+        final_state = State(
+            current_epic=1,
+            current_story="1.1",
+            current_phase=Phase.RETROSPECTIVE,
+            completed_epics=[1],
+        )
+        loop_config = LoopConfig(
+            epic_setup=[],
+            story=["dev_story", "code_review", "code_review_synthesis"],
+            epic_teardown=[],
+            code_review_rework=True,
+            max_rework_attempts=2,
+        )
+
+        phase_result = PhaseResult.ok(
+            {
+                "verdict": "MAJOR_REWORK",
+                "unresolved_code_review_action_items": 0,
+            }
+        )
+
+        with (
+            patch("bmad_assist.core.loop.runner.load_state", return_value=state),
+            patch("bmad_assist.core.config.load_loop_config", return_value=loop_config),
+            patch(
+                "bmad_assist.core.loop.runner.execute_phase",
+                return_value=phase_result,
+            ) as mock_execute_phase,
+            patch("bmad_assist.git.auto_commit_phase"),
+            patch("bmad_assist.core.loop.runner.save_state"),
+            patch("bmad_assist.core.loop.runner._run_archive_artifacts"),
+            patch(
+                "bmad_assist.core.loop.runner.handle_story_completion"
+            ) as mock_story_completion,
+            patch("bmad_assist.core.loop.runner.handle_epic_completion") as mock_epic_completion,
+            caplog.at_level(logging.INFO),
+        ):
+            mock_story_completion.return_value = (completed_state, True)
+            mock_epic_completion.return_value = (final_state, True)
+            result = run_loop(
+                config,
+                tmp_path,
+                [1],
+                lambda x: ["1.1"],
+            )
+
+        assert result == LoopExitReason.COMPLETED
+        assert mock_execute_phase.call_count == 1
+        assert "zero unresolved synthesis action items" in caplog.text
+        assert "looping back to DEV_STORY" not in caplog.text
+        mock_story_completion.assert_called_once()
+
+    def test_run_loop_reworks_negative_verdict_when_resolution_count_unknown(
+        self, tmp_path: Path
+    ) -> None:
+        """Ambiguous synthesis output should keep fail-closed rework behavior."""
+        from bmad_assist.core.config import LoopConfig
+        from bmad_assist.core.loop import LoopExitReason, PhaseResult, run_loop
+        from bmad_assist.core.state import Phase, State
+
+        config = load_config(
+            {
+                "providers": {"master": {"provider": "claude", "model": "opus_4"}},
+                "state_path": str(tmp_path / "state.yaml"),
+                "loop": {
+                    "story": ["dev_story", "code_review", "code_review_synthesis"],
+                    "code_review_rework": True,
+                    "max_rework_attempts": 2,
+                },
+            }
+        )
+
+        state = State(
+            current_epic=1,
+            current_story="1.1",
+            current_phase=Phase.CODE_REVIEW_SYNTHESIS,
+            code_review_rework_count=0,
+        )
+        loop_config = LoopConfig(
+            epic_setup=[],
+            story=["dev_story", "code_review", "code_review_synthesis"],
+            epic_teardown=[],
+            code_review_rework=True,
+            max_rework_attempts=2,
+        )
+        saved_states: list[State] = []
+
+        def capture_state(next_state: State, *_args) -> None:
+            saved_states.append(next_state)
+
+        with (
+            patch("bmad_assist.core.loop.runner.load_state", return_value=state),
+            patch("bmad_assist.core.config.load_loop_config", return_value=loop_config),
+            patch(
+                "bmad_assist.core.loop.runner.execute_phase",
+                side_effect=[
+                    PhaseResult.ok({"verdict": "MAJOR_REWORK"}),
+                    PhaseResult.fail("stop after proving rework loop"),
+                ],
+            ) as mock_execute_phase,
+            patch("bmad_assist.git.auto_commit_phase"),
+            patch(
+                "bmad_assist.core.loop.runner.save_state",
+                side_effect=capture_state,
+            ),
+            patch("bmad_assist.core.loop.runner._run_archive_artifacts") as mock_archive,
+            patch(
+                "bmad_assist.core.loop.runner.handle_story_completion"
+            ) as mock_story_completion,
+        ):
+            result = run_loop(config, tmp_path, [1], lambda x: ["1.1"])
+
+        assert result == LoopExitReason.GUARDIAN_HALT
+        assert mock_execute_phase.call_count == 2
+        assert any(
+            saved_state.current_phase == Phase.DEV_STORY
+            and saved_state.code_review_rework_count == 1
+            for saved_state in saved_states
+        )
+        mock_archive.assert_not_called()
+        mock_story_completion.assert_not_called()
+
+    def test_run_loop_stops_when_negative_verdict_remains_unresolved(
+        self, tmp_path: Path
+    ) -> None:
+        """Runner fails closed after exhausting rework attempts by default."""
+        from bmad_assist.core.config import LoopConfig
+        from bmad_assist.core.loop import PhaseResult, run_loop
+        from bmad_assist.core.state import Phase, State
+
+        config = load_config(
+            {
+                "providers": {"master": {"provider": "claude", "model": "opus_4"}},
+                "state_path": str(tmp_path / "state.yaml"),
+                "loop": {
+                    "story": ["dev_story", "code_review", "code_review_synthesis"],
+                    "code_review_rework": True,
+                    "max_rework_attempts": 2,
+                },
+            }
+        )
+
+        state = State(
+            current_epic=1,
+            current_story="1.1",
+            current_phase=Phase.CODE_REVIEW_SYNTHESIS,
+            code_review_rework_count=2,
+        )
+        loop_config = LoopConfig(
+            epic_setup=[],
+            story=["dev_story", "code_review", "code_review_synthesis"],
+            epic_teardown=[],
+            code_review_rework=True,
+            max_rework_attempts=2,
+        )
+
+        with patch("bmad_assist.core.loop.runner.load_state", return_value=state):
+            with patch("bmad_assist.core.config.load_loop_config", return_value=loop_config):
+                with patch(
+                    "bmad_assist.core.loop.runner.execute_phase",
+                    return_value=PhaseResult.ok({"verdict": "MAJOR_REWORK"}),
+                ):
+                    with patch("bmad_assist.git.auto_commit_phase"):
+                        with patch("bmad_assist.core.loop.runner.save_state"):
+                            with patch(
+                                "bmad_assist.core.loop.runner._run_archive_artifacts"
+                            ) as mock_archive:
+                                with patch(
+                                    "bmad_assist.core.loop.runner.handle_story_completion"
+                                ) as mock_story_completion:
+                                    with pytest.raises(
+                                        StateError,
+                                        match="remains unresolved after max rework attempts",
+                                    ):
+                                        run_loop(config, tmp_path, [1], lambda x: ["1.1"])
+
+        mock_archive.assert_not_called()
+        mock_story_completion.assert_not_called()
+
+    def test_run_loop_can_explicitly_continue_after_negative_verdict(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Legacy continue behavior requires an explicit config opt-out."""
+        from bmad_assist.core.config import LoopConfig
+        from bmad_assist.core.loop import LoopExitReason, PhaseResult, run_loop
+        from bmad_assist.core.state import Phase, State
+
+        config = load_config(
+            {
+                "providers": {"master": {"provider": "claude", "model": "opus_4"}},
+                "state_path": str(tmp_path / "state.yaml"),
+                "loop": {
+                    "story": ["dev_story", "code_review", "code_review_synthesis"],
+                    "code_review_rework": True,
+                    "max_rework_attempts": 2,
+                    "fail_on_unresolved_negative_code_review": False,
+                },
+            }
+        )
+
+        state = State(
+            current_epic=1,
+            current_story="1.1",
+            current_phase=Phase.CODE_REVIEW_SYNTHESIS,
+            code_review_rework_count=2,
+        )
+        completed_state = State(
+            current_epic=1,
+            current_story="1.1",
+            current_phase=Phase.CODE_REVIEW_SYNTHESIS,
+            completed_stories=["1.1"],
+        )
+        final_state = State(
+            current_epic=1,
+            current_story="1.1",
+            current_phase=Phase.RETROSPECTIVE,
+            completed_epics=[1],
+        )
+        loop_config = LoopConfig(
+            epic_setup=[],
+            story=["dev_story", "code_review", "code_review_synthesis"],
+            epic_teardown=[],
+            code_review_rework=True,
+            max_rework_attempts=2,
+            fail_on_unresolved_negative_code_review=False,
+        )
+
+        with patch("bmad_assist.core.loop.runner.load_state", return_value=state):
+            with patch("bmad_assist.core.config.load_loop_config", return_value=loop_config):
+                with patch(
+                    "bmad_assist.core.loop.runner.execute_phase",
+                    return_value=PhaseResult.ok({"verdict": "MAJOR_REWORK"}),
+                ):
+                    with patch("bmad_assist.git.auto_commit_phase"):
+                        with patch("bmad_assist.core.loop.runner.save_state"):
+                            with patch(
+                                "bmad_assist.core.loop.runner._run_archive_artifacts"
+                            ) as mock_archive:
+                                with patch(
+                                    "bmad_assist.core.loop.runner.handle_story_completion"
+                                ) as mock_story_completion:
+                                    mock_story_completion.return_value = (completed_state, True)
+                                    with patch(
+                                        "bmad_assist.core.loop.runner.handle_epic_completion"
+                                    ) as mock_epic_completion:
+                                        mock_epic_completion.return_value = (final_state, True)
+                                        with caplog.at_level(logging.WARNING):
+                                            result = run_loop(
+                                                config, tmp_path, [1], lambda x: ["1.1"]
+                                            )
+
+        assert result == LoopExitReason.COMPLETED
+        assert (
+            "continuing because loop.fail_on_unresolved_negative_code_review=false"
+            in caplog.text
+        )
+        mock_archive.assert_called_once()
+        mock_story_completion.assert_called_once()
+
+
 class TestPhaseTimingReset:
     """Story standalone-03: Phase timing is reset before each phase execution."""
 
@@ -981,7 +1542,9 @@ class TestPhaseTimingReset:
                     side_effect=track_execute_phase,
                 ):
                     with patch("bmad_assist.core.loop.runner.save_state"):
-                        with patch("bmad_assist.core.loop.runner.handle_epic_completion") as mock_epic:
+                        with patch(
+                            "bmad_assist.core.loop.runner.handle_epic_completion"
+                        ) as mock_epic:
                             mock_epic.return_value = (state, True)
 
                             run_loop(config, tmp_path, [1], lambda x: ["1.1"])

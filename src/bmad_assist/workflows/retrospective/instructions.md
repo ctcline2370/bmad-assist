@@ -261,7 +261,8 @@ Bob (Scrum Master): "We'll get to all of it. But first, let me load the previous
 <action>Calculate previous epic number: {{prev_epic_num}} = {{epic_number}} - 1</action>
 
 <check if="{{prev_epic_num}} >= 1">
-  <action>Search for previous retrospective using pattern: {retrospectives_folder}/epic-{{prev_epic_num}}-retro-*.md</action>
+  <action>Search the canonical retrospectives folder using pattern: {retrospectives_folder}/epic-{{prev_epic_num}}-retro-*.md</action>
+  <action>If not found, search the legacy implementation-artifacts root for epic-{{prev_epic_num}}-retro-*.md</action>
 
   <check if="previous retro found">
     <output>

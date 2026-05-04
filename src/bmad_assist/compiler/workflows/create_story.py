@@ -13,7 +13,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from bmad_assist.compiler.context import ContextBuilder
+from bmad_assist.bmad.parser import extract_epic_markdown, extract_markdown_sections
 from bmad_assist.compiler.filtering import filter_instructions
 from bmad_assist.compiler.output import generate_output
 from bmad_assist.compiler.shared_utils import (
@@ -37,6 +37,34 @@ from bmad_assist.core.exceptions import CompilerError
 # Patterns for variable substitution
 _DOUBLE_BRACE_PATTERN = re.compile(r"\{\{([a-zA-Z_][a-zA-Z0-9_-]*)\}\}")
 _SINGLE_BRACE_PATTERN = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_-]*)\}")
+_MARKDOWN_HEADER_PATTERN = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
+_REVIEW_HEADING_PATTERN = re.compile(r"\breview\b", re.IGNORECASE)
+_TOKEN_SPLIT_PATTERN = re.compile(r"[^a-z0-9]+")
+_PREVIOUS_STORY_SECTION_HEADINGS = [
+    "Story",
+    "Acceptance Criteria",
+    "Validation Requirements",
+    "Tasks / Subtasks",
+    "Completion Notes List",
+    "File List",
+]
+_PREVIOUS_STORY_FILE_MATCH_LIMIT = 2
+_PREVIOUS_STORY_FILE_FALLBACK_LIMIT = 1
+_STORY_TOPIC_STOPWORDS = {
+    "and",
+    "asset",
+    "create",
+    "deliver",
+    "for",
+    "from",
+    "governed",
+    "implement",
+    "implementation",
+    "into",
+    "story",
+    "the",
+    "with",
+}
 
 
 def _substitute_variables(text: str, variables: dict[str, Any]) -> str:
@@ -66,6 +94,16 @@ def _substitute_variables(text: str, variables: dict[str, Any]) -> str:
     result = _DOUBLE_BRACE_PATTERN.sub(replace_var, text)
     result = _SINGLE_BRACE_PATTERN.sub(replace_var, result)
     return result
+
+
+def _normalize_topic_token(token: str) -> str:
+    """Normalize story-title and file-path tokens for overlap checks."""
+    normalized = token.lower().strip()
+    if normalized.endswith("ies") and len(normalized) > 4:
+        return normalized[:-3] + "y"
+    if normalized.endswith("s") and len(normalized) > 4:
+        return normalized[:-1]
+    return normalized
 
 
 logger = logging.getLogger(__name__)
@@ -341,7 +379,7 @@ class CreateStoryCompiler:
         """Build context files dict with recency-bias ordering.
 
         Uses StrategicContextService for strategic docs (project-context, PRD, architecture, UX)
-        and ContextBuilder for previous stories and epic files.
+        and direct file loading for previous stories and epic files.
 
         Files are ordered from general (early) to specific (late):
         1. Strategic docs via StrategicContextService (project-context, prd, architecture, ux)
@@ -361,7 +399,7 @@ class CreateStoryCompiler:
         files: dict[str, str] = {}
         epic_num = resolved.get("epic_num")
 
-        # Store resolved variables in context for ContextBuilder to use
+        # Preserve resolved variables on context for downstream consumers.
         context.resolved_variables = resolved
 
         # 1. Strategic docs via StrategicContextService
@@ -376,22 +414,17 @@ class CreateStoryCompiler:
 
         files.update(load_antipatterns(context, "story"))
 
-        # 3. Previous stories via ContextBuilder
-        builder = ContextBuilder(context)
-        builder = builder.add_previous_stories(count=1)
-        prev_stories_files = builder.build()
-        files.update(prev_stories_files)
-
-        # Get previous stories for source file collection using shared utility
+        # 3. Previous stories (trimmed to continuity-critical sections)
         prev_stories = find_previous_stories(context, resolved, max_stories=1)
-
-        # Collect file paths from all previous stories' File Lists
         file_list_paths: list[str] = []
         for story_path in prev_stories:
             try:
                 story_content = story_path.read_text(encoding="utf-8")
+                files[str(story_path)] = self._trim_previous_story_context(story_content)
                 paths = extract_file_paths_from_story(story_content)
-                file_list_paths.extend(paths)
+                file_list_paths.extend(
+                    self._select_previous_story_file_paths(paths, resolved)
+                )
             except (OSError, UnicodeDecodeError) as e:
                 logger.debug("Could not read story %s: %s", story_path, e)
 
@@ -403,12 +436,145 @@ class CreateStoryCompiler:
 
         # 5. Epic files (LAST - most specific context)
         if epic_num is not None:
-            epic_builder = ContextBuilder(context)
-            epic_builder = epic_builder.add_epic_files(epic_num=epic_num)
-            epic_files = epic_builder.build()
-            files.update(epic_files)
+            for epic_path in self._find_epic_context_files(context, resolved):
+                try:
+                    epic_content = epic_path.read_text(encoding="utf-8")
+                    files[str(epic_path)] = self._trim_epic_context(epic_path, epic_content, epic_num)
+                except (OSError, UnicodeDecodeError) as e:
+                    logger.debug("Could not read epic context %s: %s", epic_path, e)
 
         return files
+
+    def _trim_previous_story_context(self, content: str) -> str:
+        """Reduce previous-story context to the sections needed for continuity."""
+        trimmed = extract_markdown_sections(content, _PREVIOUS_STORY_SECTION_HEADINGS).strip()
+        latest_review = self._extract_latest_review_section(content)
+
+        parts: list[str] = []
+        if trimmed:
+            parts.append(trimmed)
+        if latest_review and latest_review not in trimmed:
+            parts.append(latest_review)
+
+        return "\n\n".join(parts) if parts else content
+
+    def _select_previous_story_file_paths(
+        self,
+        file_list_paths: list[str],
+        resolved: dict[str, Any],
+    ) -> list[str]:
+        """Keep only story-relevant previous-story files for continuity context."""
+        unique_paths = list(dict.fromkeys(path for path in file_list_paths if path))
+        if not unique_paths:
+            return []
+
+        markers = self._build_story_topic_markers(resolved)
+        if not markers:
+            return unique_paths[:_PREVIOUS_STORY_FILE_FALLBACK_LIMIT]
+
+        scored_paths = [
+            (self._score_previous_story_file_path(path, markers), index, path)
+            for index, path in enumerate(unique_paths)
+        ]
+        matching_paths = [
+            (score, index, path)
+            for score, index, path in scored_paths
+            if score > 0
+        ]
+
+        if not matching_paths:
+            logger.debug(
+                "No previous-story files matched story markers %s; using conservative fallback",
+                sorted(markers),
+            )
+            return unique_paths[:_PREVIOUS_STORY_FILE_FALLBACK_LIMIT]
+
+        matching_paths.sort(key=lambda item: (-item[0], item[1]))
+        selected = [
+            path
+            for _, _, path in matching_paths[:_PREVIOUS_STORY_FILE_MATCH_LIMIT]
+        ]
+        logger.debug(
+            "Selected previous-story files for create_story using markers %s: %s",
+            sorted(markers),
+            selected,
+        )
+        return selected
+
+    def _build_story_topic_markers(self, resolved: dict[str, Any]) -> set[str]:
+        """Extract normalized story-title markers for continuity matching."""
+        story_title = str(resolved.get("story_title") or "")
+        raw_tokens = _TOKEN_SPLIT_PATTERN.split(story_title.lower())
+        return {
+            normalized
+            for token in raw_tokens
+            if token
+            for normalized in [_normalize_topic_token(token)]
+            if len(normalized) >= 4 and normalized not in _STORY_TOPIC_STOPWORDS
+        }
+
+    def _score_previous_story_file_path(
+        self,
+        path: str,
+        markers: set[str],
+    ) -> int:
+        """Rank a previous-story file path by overlap with the current story topic."""
+        path_tokens = {
+            normalized
+            for token in _TOKEN_SPLIT_PATTERN.split(path.lower())
+            if token
+            for normalized in [_normalize_topic_token(token)]
+        }
+        filename_tokens = {
+            normalized
+            for token in _TOKEN_SPLIT_PATTERN.split(Path(path).stem.lower())
+            if token
+            for normalized in [_normalize_topic_token(token)]
+        }
+
+        shared_tokens = markers & path_tokens
+        shared_filename_tokens = markers & filename_tokens
+        return (len(shared_tokens) * 4) + (len(shared_filename_tokens) * 2)
+
+    def _trim_epic_context(self, path: Path, content: str, epic_num: Any) -> str:
+        """Collapse consolidated epic files to the current epic block only."""
+        try:
+            numeric_epic = int(epic_num)
+        except (TypeError, ValueError):
+            return content
+
+        trimmed = extract_epic_markdown(content, numeric_epic)
+        if trimmed is not None:
+            if trimmed != content:
+                logger.debug("Trimmed epic context %s to epic %s block", path, numeric_epic)
+            return trimmed
+        return content
+
+    def _extract_latest_review_section(self, content: str) -> str:
+        """Return the latest review-oriented markdown section if present."""
+        headers = list(_MARKDOWN_HEADER_PATTERN.finditer(content))
+        latest_match: re.Match[str] | None = None
+
+        for match in headers:
+            heading = match.group(2).strip()
+            if _REVIEW_HEADING_PATTERN.search(heading):
+                latest_match = match
+
+        if latest_match is None:
+            return ""
+
+        start = latest_match.start()
+        current_level = len(latest_match.group(1))
+        end = len(content)
+
+        for match in headers:
+            if match.start() <= start:
+                continue
+            if len(match.group(1)) <= current_level:
+                end = match.start()
+                break
+
+        return content[start:end].strip()
 
     def _find_epic_context_files(
         self,

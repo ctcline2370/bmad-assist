@@ -10,7 +10,6 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from bmad_assist.core import loop
 from bmad_assist.core.loop import (
     LoopExitReason,
     Phase,
@@ -20,14 +19,15 @@ from bmad_assist.core.loop import (
     _handle_sigint,
     _handle_sigterm,
     get_received_signal,
+    register_pre_exit_cleanup,
     register_signal_handlers,
     request_shutdown,
     reset_shutdown,
     run_loop,
     shutdown_requested,
+    unregister_pre_exit_cleanup,
     unregister_signal_handlers,
 )
-
 
 # =============================================================================
 # Fixtures
@@ -209,8 +209,8 @@ class TestSignalHandlers:
         if not hasattr(signal, "SIGHUP"):
             pytest.skip("SIGHUP not available on this platform")
 
-        from bmad_assist.core.loop.signals import _handle_sighup
         import bmad_assist.core.loop.signals as sig_module
+        from bmad_assist.core.loop.signals import _handle_sighup
 
         call_order: list[str] = []
         original_cleanup = sig_module._ipc_signal_safe_cleanup
@@ -246,6 +246,84 @@ class TestSignalHandlers:
 
             mock_kill.assert_called_once()
         finally:
+            sig_module._kill_all_child_pgids = original_kill
+
+    def test_sigterm_handler_runs_pre_exit_cleanup_before_kill_and_exit(self):
+        """SIGTERM handler finalizes run state before hard-kill cleanup."""
+        import bmad_assist.core.loop.signals as sig_module
+
+        call_order: list[str] = []
+        original_kill = sig_module._kill_all_child_pgids
+
+        def cleanup(signum: int) -> None:
+            call_order.append(f"cleanup:{signum}")
+
+        try:
+            register_pre_exit_cleanup(cleanup)
+            sig_module._kill_all_child_pgids = lambda: call_order.append("children")
+
+            with patch(
+                "bmad_assist.core.loop.signals.os._exit",
+                side_effect=lambda code: call_order.append(f"exit:{code}"),
+            ):
+                with patch(
+                    "bmad_assist.core.loop.signals.os.killpg",
+                    side_effect=lambda *_: call_order.append("process_group"),
+                ):
+                    with patch("bmad_assist.core.loop.signals.os.getpid", return_value=1234):
+                        with patch("bmad_assist.core.loop.signals.os.getpgid", return_value=1234):
+                            _handle_sigterm(signal.SIGTERM, None)
+
+            assert call_order.index(f"cleanup:{signal.SIGTERM}") < call_order.index("children")
+            assert call_order.index(f"cleanup:{signal.SIGTERM}") < call_order.index(
+                "process_group"
+            )
+            assert call_order[-1] == "exit:143"
+        finally:
+            unregister_pre_exit_cleanup(cleanup)
+            sig_module._kill_all_child_pgids = original_kill
+
+    def test_pre_exit_cleanup_failure_does_not_block_hard_exit(self):
+        """Pre-exit cleanup exceptions are suppressed before hard exit."""
+
+        def cleanup(_signum: int) -> None:
+            raise RuntimeError("cleanup failed")
+
+        try:
+            register_pre_exit_cleanup(cleanup)
+            with patch("bmad_assist.core.loop.signals.os._exit") as mock_exit:
+                with patch("bmad_assist.core.loop.signals.os.killpg"):
+                    _handle_sigint(signal.SIGINT, None)
+
+            mock_exit.assert_called_once_with(130)
+        finally:
+            unregister_pre_exit_cleanup(cleanup)
+
+    def test_cleanup_failures_do_not_block_pre_exit_cleanup_or_hard_exit(self):
+        """IPC and child cleanup failures cannot bypass run finalization."""
+        import bmad_assist.core.loop.signals as sig_module
+
+        call_order: list[str] = []
+        original_ipc = sig_module._ipc_signal_safe_cleanup
+        original_kill = sig_module._kill_all_child_pgids
+
+        def cleanup(signum: int) -> None:
+            call_order.append(f"cleanup:{signum}")
+
+        try:
+            sig_module._ipc_signal_safe_cleanup = MagicMock(side_effect=RuntimeError("ipc failed"))
+            sig_module._kill_all_child_pgids = MagicMock(side_effect=RuntimeError("kill failed"))
+            register_pre_exit_cleanup(cleanup)
+
+            with patch("bmad_assist.core.loop.signals.os._exit") as mock_exit:
+                with patch("bmad_assist.core.loop.signals.os.killpg"):
+                    _handle_sigterm(signal.SIGTERM, None)
+
+            assert call_order == [f"cleanup:{signal.SIGTERM}"]
+            mock_exit.assert_called_once_with(143)
+        finally:
+            unregister_pre_exit_cleanup(cleanup)
+            sig_module._ipc_signal_safe_cleanup = original_ipc
             sig_module._kill_all_child_pgids = original_kill
 
 

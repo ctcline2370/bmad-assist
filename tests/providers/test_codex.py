@@ -17,8 +17,10 @@ Tests cover:
 - AC12: Settings file handling
 """
 
+import logging
+import signal
+import threading
 from pathlib import Path
-from subprocess import TimeoutExpired
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -29,12 +31,9 @@ from bmad_assist.core.exceptions import (
     ProviderTimeoutError,
 )
 from bmad_assist.providers import BaseProvider, CodexProvider, ProviderResult
-from bmad_assist.providers.codex import (
-    DEFAULT_TIMEOUT,
-    PROMPT_TRUNCATE_LENGTH,
-    _truncate_prompt,
-)
-from .conftest import create_codex_mock_process, make_codex_json_output
+from bmad_assist.providers.codex import DEFAULT_TIMEOUT, _idle_progress_interval
+
+from .conftest import create_codex_mock_process
 
 
 class TestCodexProviderStructure:
@@ -136,6 +135,37 @@ class TestCodexProviderInvoke:
 
         # Prompt is passed via stdin, not as a command argument
         assert command == ["codex", "exec", "--json", "--full-auto", "-m", "o3-mini"]
+
+    def test_invoke_uses_read_only_sandbox_for_allowed_tools(
+        self, provider: CodexProvider, mock_popen_success: MagicMock
+    ) -> None:
+        """allowed_tools defaults Codex CLI to a read-only sandbox."""
+        provider.invoke("Review code", model="o3-mini", allowed_tools=["Read", "Write"])
+
+        command = mock_popen_success.call_args[0][0]
+        assert command == ["codex", "exec", "--json", "--sandbox", "read-only", "-m", "o3-mini"]
+
+    def test_invoke_uses_explicit_sandbox_mode_over_allowed_tools(
+        self, provider: CodexProvider, mock_popen_success: MagicMock
+    ) -> None:
+        """Explicit sandbox selection overrides the implicit read-only default."""
+        provider.invoke(
+            "Apply fixes",
+            model="o3-mini",
+            allowed_tools=["Read", "Edit", "Write", "Bash"],
+            sandbox_mode="workspace-write",
+        )
+
+        command = mock_popen_success.call_args[0][0]
+        assert command == [
+            "codex",
+            "exec",
+            "--json",
+            "--sandbox",
+            "workspace-write",
+            "-m",
+            "o3-mini",
+        ]
 
     def test_invoke_writes_prompt_to_stdin(
         self, provider: CodexProvider, mock_popen_success: MagicMock
@@ -240,8 +270,8 @@ class TestCodexProviderInvoke:
         result = provider.invoke("Hello", model="o3")
 
         assert isinstance(result.command, tuple)
-        # Command now includes --json flag
-        assert result.command == ("codex", "exec", "Hello", "--json", "--full-auto", "-m", "o3")
+        # Prompt is passed via stdin and must never reappear in command metadata.
+        assert result.command == ("codex", "exec", "--json", "--full-auto", "-m", "o3")
 
 
 class TestCodexProviderErrors:
@@ -252,7 +282,9 @@ class TestCodexProviderErrors:
         """Create CodexProvider instance."""
         return CodexProvider()
 
-    def test_invoke_raises_provider_timeout_error_on_timeout(self, provider: CodexProvider) -> None:
+    def test_invoke_raises_provider_timeout_error_on_timeout(
+        self, provider: CodexProvider, accelerated_time: None
+    ) -> None:
         """Test AC7: invoke() raises ProviderTimeoutError on wait timeout."""
         with patch("bmad_assist.providers.codex.Popen") as mock_popen:
             mock_popen.return_value = create_codex_mock_process(
@@ -264,8 +296,10 @@ class TestCodexProviderErrors:
 
             assert "timeout" in str(exc_info.value).lower()
 
-    def test_invoke_timeout_error_includes_truncated_prompt(self, provider: CodexProvider) -> None:
-        """Test AC7: Timeout error includes prompt (truncated if > 100 chars)."""
+    def test_invoke_timeout_error_uses_metadata_not_prompt_contents(
+        self, provider: CodexProvider, accelerated_time: None
+    ) -> None:
+        """Test AC7: Timeout errors surface metadata without echoing prompt contents."""
         long_prompt = "x" * 150
 
         with patch("bmad_assist.providers.codex.Popen") as mock_popen:
@@ -277,14 +311,30 @@ class TestCodexProviderErrors:
                 provider.invoke(long_prompt, timeout=5)
 
             error_msg = str(exc_info.value)
-            # Should be truncated
-            assert "x" * 100 in error_msg
-            assert "..." in error_msg
-            # Should NOT contain full prompt
-            assert "x" * 150 not in error_msg
+            assert "Codex CLI timeout after 5s" in error_msg
+            assert "prompt_len=150" in error_msg
+            assert "stdout_chars=" in error_msg
+            assert "stderr_chars=" in error_msg
+            assert long_prompt not in error_msg
+            assert "xxxxxxxxxx" not in error_msg
 
-    def test_invoke_timeout_error_short_prompt_not_truncated(self, provider: CodexProvider) -> None:
-        """Test AC7: Short prompts are not truncated in timeout error."""
+            partial = exc_info.value.partial_result
+            assert partial is not None
+            assert partial.command == (
+                "codex",
+                "exec",
+                "--json",
+                "--full-auto",
+                "-m",
+                "gpt-5.1-codex-max",
+            )
+            assert f"stdout_chars={len(partial.stdout)}" in error_msg
+            assert f"stderr_chars={len(partial.stderr)}" in error_msg
+
+    def test_invoke_timeout_error_short_prompt_still_avoids_echoing_prompt(
+        self, provider: CodexProvider, accelerated_time: None
+    ) -> None:
+        """Test AC7: Short prompts are also omitted from timeout errors."""
         short_prompt = "Hello world"
 
         with patch("bmad_assist.providers.codex.Popen") as mock_popen:
@@ -296,11 +346,13 @@ class TestCodexProviderErrors:
                 provider.invoke(short_prompt, timeout=5)
 
             error_msg = str(exc_info.value)
-            assert "Hello world" in error_msg
+            assert "Codex CLI timeout after 5s" in error_msg
+            assert "prompt_len=11" in error_msg
+            assert short_prompt not in error_msg
             assert "..." not in error_msg
 
     def test_invoke_timeout_exception_includes_partial_result(
-        self, provider: CodexProvider
+        self, provider: CodexProvider, accelerated_time: None
     ) -> None:
         """Test AC7: Timeout error includes partial_result with collected data."""
         with patch("bmad_assist.providers.codex.Popen") as mock_popen:
@@ -314,6 +366,78 @@ class TestCodexProviderErrors:
             # Timeout should include partial result
             assert exc_info.value.partial_result is not None
             assert exc_info.value.partial_result.exit_code == -1
+
+    def test_invoke_logs_metadata_only_idle_warning_before_timeout(
+        self, provider: CodexProvider, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Long silent Codex runs emit liveness metadata before timing out."""
+        secret_prompt = "secret prompt contents"
+        clock_values = iter([0.0, 6.0, 24.0])
+
+        def mock_perf_counter() -> float:
+            return next(clock_values)
+
+        with (
+            patch("bmad_assist.providers.codex.Popen") as mock_popen,
+            patch("bmad_assist.providers.codex.time.perf_counter", side_effect=mock_perf_counter),
+        ):
+            mock_popen.return_value = create_codex_mock_process(
+                stdout_content="",
+                stderr_content="",
+                never_finish=True,
+            )
+
+            with (
+                caplog.at_level(logging.WARNING, logger="bmad_assist.providers.codex"),
+                pytest.raises(ProviderTimeoutError),
+            ):
+                provider.invoke(secret_prompt, timeout=20)
+
+        assert "Codex CLI still running with no new output" in caplog.text
+        assert "prompt_len=22" in caplog.text
+        assert secret_prompt not in caplog.text
+
+    def test_timeout_kills_registered_process_group(
+        self, provider: CodexProvider, accelerated_time: None
+    ) -> None:
+        """Timeout kills the whole Codex process group, not just the parent process."""
+        with (
+            patch("bmad_assist.providers.codex.Popen") as mock_popen,
+            patch("bmad_assist.providers.codex.os.getpgid", return_value=4321),
+            patch("bmad_assist.providers.codex.os.killpg") as killpg_mock,
+            patch("bmad_assist.providers.codex.register_child_pgid") as register_mock,
+            patch("bmad_assist.providers.codex.unregister_child_pgid") as unregister_mock,
+        ):
+            mock_popen.return_value = create_codex_mock_process(never_finish=True)
+
+            with pytest.raises(ProviderTimeoutError):
+                provider.invoke("Hello", timeout=5)
+
+            register_mock.assert_called_once_with(4321)
+            killpg_mock.assert_called_once_with(4321, signal.SIGKILL)
+            unregister_mock.assert_called_once_with(4321)
+
+    def test_cancel_token_kills_registered_process_group(self, provider: CodexProvider) -> None:
+        """Cancellation returns a non-zero result and kills the whole process group."""
+        cancel_token = threading.Event()
+        cancel_token.set()
+
+        with (
+            patch("bmad_assist.providers.codex.Popen") as mock_popen,
+            patch("bmad_assist.providers.codex.os.getpgid", return_value=4321),
+            patch("bmad_assist.providers.codex.os.killpg") as killpg_mock,
+            patch("bmad_assist.providers.codex.register_child_pgid") as register_mock,
+            patch("bmad_assist.providers.codex.unregister_child_pgid") as unregister_mock,
+        ):
+            mock_popen.return_value = create_codex_mock_process(never_finish=True)
+
+            result = provider.invoke("Hello", timeout=300, cancel_token=cancel_token)
+
+            assert result.exit_code == -15
+            assert result.stderr == "Cancelled by orchestration"
+            register_mock.assert_called_once_with(4321)
+            killpg_mock.assert_called_once_with(4321, signal.SIGKILL)
+            unregister_mock.assert_called_once_with(4321)
 
     def test_invoke_raises_exit_code_error_on_nonzero_exit(self, provider: CodexProvider) -> None:
         """Test AC8: invoke() raises ProviderExitCodeError on non-zero exit code."""
@@ -378,7 +502,6 @@ class TestCodexProviderErrors:
             assert exc_info.value.command == (
                 "codex",
                 "exec",
-                "Hello",
                 "--json",
                 "--full-auto",
                 "-m",
@@ -670,34 +793,6 @@ class TestCodexProviderUnicode:
             assert isinstance(result.stdout, str)
 
 
-class TestTruncatePromptHelper:
-    """Test _truncate_prompt() helper function."""
-
-    def test_truncate_prompt_short_unchanged(self) -> None:
-        """Test short prompts are not truncated."""
-        prompt = "Hello"
-        result = _truncate_prompt(prompt)
-
-        assert result == "Hello"
-
-    def test_truncate_prompt_exact_length_unchanged(self) -> None:
-        """Test prompts at exactly PROMPT_TRUNCATE_LENGTH are not truncated."""
-        prompt = "x" * PROMPT_TRUNCATE_LENGTH
-        result = _truncate_prompt(prompt)
-
-        assert result == prompt
-        assert "..." not in result
-
-    def test_truncate_prompt_over_length_truncated(self) -> None:
-        """Test prompts over PROMPT_TRUNCATE_LENGTH are truncated."""
-        prompt = "x" * (PROMPT_TRUNCATE_LENGTH + 1)
-        result = _truncate_prompt(prompt)
-
-        assert len(result) == PROMPT_TRUNCATE_LENGTH + 3  # +3 for "..."
-        assert result.endswith("...")
-        assert result.startswith("x" * PROMPT_TRUNCATE_LENGTH)
-
-
 class TestConstants:
     """Test module constants."""
 
@@ -705,9 +800,11 @@ class TestConstants:
         """Test DEFAULT_TIMEOUT is 300 seconds (5 minutes)."""
         assert DEFAULT_TIMEOUT == 300
 
-    def test_prompt_truncate_length_is_100(self) -> None:
-        """Test PROMPT_TRUNCATE_LENGTH is 100."""
-        assert PROMPT_TRUNCATE_LENGTH == 100
+    def test_idle_progress_interval_is_bounded(self) -> None:
+        """Provider idle warnings stay useful without flooding logs."""
+        assert _idle_progress_interval(4) == 5.0
+        assert _idle_progress_interval(20) == 5.0
+        assert _idle_progress_interval(3600) == 60.0
 
 
 class TestDocstringsExist:

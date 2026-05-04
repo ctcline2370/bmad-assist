@@ -20,6 +20,7 @@ from bmad_assist.core.config import (
     MultiProviderConfig,
     ProviderConfig,
 )
+from bmad_assist.core.exceptions import ProviderTimeoutError
 from bmad_assist.core.state import Phase, State
 from bmad_assist.providers.base import ProviderResult
 
@@ -42,6 +43,124 @@ _MOCK_SYNTHESIS_OUTPUT = (
     "## Changes Applied\n\n"
     "Applied fixes for critical input validation issue.\n"
 )
+
+
+class TestCodeReviewSynthesisActionItemExtraction:
+    """Tests for unresolved review action item extraction from synthesis output."""
+
+    def test_extracts_explicit_zero_action_items(self) -> None:
+        """Explicit zero is required before a negative verdict can complete."""
+        from bmad_assist.core.loop.handlers.code_review_synthesis import (
+            extract_unresolved_code_review_action_items,
+        )
+
+        content = """
+## Final Review Outcome
+
+- **Action Items Created:** 0
+"""
+
+        assert extract_unresolved_code_review_action_items(content) == 0
+
+    def test_extracts_last_explicit_action_item_count(self) -> None:
+        """The final summary count wins if earlier narrative mentions a count."""
+        from bmad_assist.core.loop.handlers.code_review_synthesis import (
+            extract_unresolved_code_review_action_items,
+        )
+
+        content = """
+Action Items Created: 4
+
+## Final Review Outcome
+
+**Action Items Created:** 2
+"""
+
+        assert extract_unresolved_code_review_action_items(content) == 2
+
+    def test_counts_unchecked_ai_review_tasks_when_count_missing(self) -> None:
+        """Unchecked AI-review tasks are unresolved even without a summary count."""
+        from bmad_assist.core.loop.handlers.code_review_synthesis import (
+            extract_unresolved_code_review_action_items,
+        )
+
+        content = """
+## Action Items
+
+- [ ] [AI-Review] HIGH: Fix tenant telemetry scoping (src/example.cs)
+- [x] [AI-Review] LOW: Already completed follow-up
+- [ ] [P1] [AI-Review] Activate skipped ATDD tests (tests/example.cs)
+"""
+
+        assert extract_unresolved_code_review_action_items(content) == 2
+
+    def test_ambiguous_zero_without_contract_returns_none(self) -> None:
+        """Ambiguous prose cannot suppress a negative verdict rework loop."""
+        from bmad_assist.core.loop.handlers.code_review_synthesis import (
+            extract_unresolved_code_review_action_items,
+        )
+
+        content = "All issues appear fixed and no further work is expected."
+
+        assert extract_unresolved_code_review_action_items(content) is None
+
+    def test_extracts_count_from_new_story_review_section(self) -> None:
+        """A newly appended story review section can reconcile missing report counts."""
+        from bmad_assist.core.loop.handlers.code_review_synthesis import (
+            extract_latest_story_review_action_items,
+        )
+
+        before = """
+# Story
+
+## Senior Developer Review (AI)
+
+### Review: 2026-04-24
+- **Action Items Created:** 2
+"""
+        after = (
+            before
+            + """
+
+## Senior Developer Review (AI)
+
+### Review: 2026-04-25
+- **Action Items Created:** 0
+"""
+        )
+
+        assert (
+            extract_latest_story_review_action_items(
+                after,
+                previous_story_content=before,
+            )
+            == 0
+        )
+
+    def test_story_review_fallback_requires_new_section(self) -> None:
+        """Old story review counts cannot complete a new negative review."""
+        from bmad_assist.core.loop.handlers.code_review_synthesis import (
+            extract_latest_story_review_action_items,
+        )
+
+        before = """
+# Story
+
+## Senior Developer Review (AI)
+
+### Review: 2026-04-24
+- **Action Items Created:** 0
+"""
+        after = before + "\n## Change Log\n\n- Synthesis touched other story text.\n"
+
+        assert (
+            extract_latest_story_review_action_items(
+                after,
+                previous_story_content=before,
+            )
+            is None
+        )
+
 
 # =============================================================================
 # Fixtures
@@ -325,6 +444,137 @@ class TestCodeReviewSynthesisHandler:
             assert "response" in result.outputs
             assert "Synthesis Summary" in result.outputs["response"]
 
+    def test_execute_outputs_unresolved_action_item_count(
+        self,
+        synthesis_config: Config,
+        project_with_story: Path,
+        state_for_synthesis: State,
+        cached_reviews: str,
+    ) -> None:
+        """Successful synthesis exposes action-item count for rework policy."""
+        from bmad_assist.core.loop.handlers.code_review_synthesis import (
+            CodeReviewSynthesisHandler,
+        )
+
+        handler = CodeReviewSynthesisHandler(synthesis_config, project_with_story)
+        synthesis_output = (
+            _MOCK_SYNTHESIS_OUTPUT
+            + "\n## Final Review Outcome\n\n"
+            + "- **Action Items Created:** 0\n"
+        )
+
+        with (
+            patch.object(handler, "render_prompt") as mock_render,
+            patch.object(handler, "invoke_provider") as mock_invoke,
+            patch("bmad_assist.core.debug_logger.save_prompt"),
+        ):
+            mock_render.return_value = "<compiled>test synthesis prompt</compiled>"
+            mock_invoke.return_value = ProviderResult(
+                stdout=synthesis_output,
+                stderr="",
+                exit_code=0,
+                duration_ms=5000,
+                model="opus-4",
+                command=("claude", "--print"),
+            )
+
+            result = handler.execute(state_for_synthesis)
+
+        assert result.success
+        assert result.outputs["unresolved_code_review_action_items"] == 0
+
+    def test_execute_recovers_action_item_count_from_story_review_section(
+        self,
+        synthesis_config: Config,
+        project_with_story: Path,
+        state_for_synthesis: State,
+        cached_reviews: str,
+    ) -> None:
+        """Successful synthesis can reconcile action count from the edited story."""
+        from bmad_assist.core.loop.handlers.code_review_synthesis import (
+            CodeReviewSynthesisHandler,
+        )
+
+        handler = CodeReviewSynthesisHandler(synthesis_config, project_with_story)
+        story_file = (
+            project_with_story
+            / "_bmad-output"
+            / "implementation-artifacts"
+            / "14-10-code-review-synthesis-handler.md"
+        )
+
+        def append_story_review(*_args, **_kwargs) -> ProviderResult:
+            story_file.write_text(
+                story_file.read_text(encoding="utf-8")
+                + "\n## Senior Developer Review (AI)\n\n"
+                + "### Review: 2026-04-25\n"
+                + "- **Reviewer:** AI Code Review Synthesis\n"
+                + "- **Action Items Created:** 0\n",
+                encoding="utf-8",
+            )
+            return ProviderResult(
+                stdout=_MOCK_SYNTHESIS_OUTPUT,
+                stderr="",
+                exit_code=0,
+                duration_ms=5000,
+                model="opus-4",
+                command=("claude", "--print"),
+            )
+
+        with (
+            patch.object(handler, "render_prompt") as mock_render,
+            patch.object(handler, "invoke_provider", side_effect=append_story_review),
+            patch("bmad_assist.core.debug_logger.save_prompt"),
+        ):
+            mock_render.return_value = "<compiled>test synthesis prompt</compiled>"
+
+            result = handler.execute(state_for_synthesis)
+
+        assert result.success
+        assert result.outputs["unresolved_code_review_action_items"] == 0
+
+    def test_execute_timeout_includes_partial_artifact(
+        self,
+        synthesis_config: Config,
+        project_with_story: Path,
+        state_for_synthesis: State,
+        cached_reviews: str,
+    ) -> None:
+        """Provider timeouts preserve partial output for autonomous diagnosis."""
+        from bmad_assist.core.loop.handlers.code_review_synthesis import (
+            CodeReviewSynthesisHandler,
+        )
+
+        handler = CodeReviewSynthesisHandler(synthesis_config, project_with_story)
+        partial = ProviderResult(
+            stdout="partial code review synthesis output",
+            stderr="provider timed out after partial edits",
+            exit_code=-1,
+            duration_ms=300_000,
+            model="opus-4",
+            command=("claude", "--print"),
+        )
+
+        with (
+            patch.object(handler, "render_prompt") as mock_render,
+            patch.object(handler, "invoke_provider") as mock_invoke,
+        ):
+            mock_render.return_value = "<compiled>test synthesis prompt</compiled>"
+            mock_invoke.side_effect = ProviderTimeoutError(
+                "code review synthesis timed out",
+                partial_result=partial,
+            )
+
+            result = handler.execute(state_for_synthesis)
+
+        assert not result.success
+        assert result.error is not None
+        assert "Provider timeout" in result.error
+        artifact_path = Path(result.outputs["timeout_artifact"])
+        content = artifact_path.read_text(encoding="utf-8")
+        assert "partial code review synthesis output" in content
+        assert "provider timed out after partial edits" in content
+
     def test_execute_fails_when_no_session_found(
         self,
         synthesis_config: Config,
@@ -421,7 +671,9 @@ This is a synthesis of code reviews.
             paths = get_paths()
             # Report filename includes timestamp: synthesis-{epic}-{story}-{timestamp}.md
             synthesis_files = list(paths.code_reviews_dir.glob("synthesis-14-10-*.md"))
-            assert len(synthesis_files) == 1, f"Expected 1 synthesis file, found {len(synthesis_files)}"
+            assert len(synthesis_files) == 1, (
+                f"Expected 1 synthesis file, found {len(synthesis_files)}"
+            )
             report_path = synthesis_files[0]
 
             content = report_path.read_text()

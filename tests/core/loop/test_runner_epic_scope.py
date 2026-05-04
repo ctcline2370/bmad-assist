@@ -462,12 +462,12 @@ class TestEpicTeardown:
         qa_exec_idx = executed_phases.index("QA_PLAN_EXECUTE")
         assert retro_idx < qa_gen_idx < qa_exec_idx
 
-    def test_epic_teardown_failure_logs_warning(
+    def test_epic_teardown_failure_halts_with_error(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """AC5: Teardown failure logs warning."""
+        """AC5: Teardown failure surfaces as a halt with explicit error logging."""
         from bmad_assist.core.config import load_config
-        from bmad_assist.core.loop import run_loop
+        from bmad_assist.core.loop import LoopExitReason, run_loop
 
         config = load_config(
             {
@@ -523,20 +523,22 @@ class TestEpicTeardown:
                                 ),
                             ):
                                 with patch(
-                                    "bmad_assist.core.loop.runner.handle_epic_completion",
-                                    return_value=(State(completed_epics=[1]), True),
-                                ):
-                                    with caplog.at_level(logging.WARNING):
-                                        run_loop(config, tmp_path, [1], lambda _: ["1.1"])
+                                    "bmad_assist.core.loop.runner.handle_epic_completion"
+                                ) as mock_handle_epic_completion:
+                                    with caplog.at_level(logging.ERROR):
+                                        result = run_loop(
+                                            config, tmp_path, [1], lambda _: ["1.1"]
+                                        )
 
-        # Should log warning about teardown failure
-        assert "failed" in caplog.text.lower()
-        assert "retrospective" in caplog.text.lower() or "teardown" in caplog.text.lower()
+        assert result == LoopExitReason.GUARDIAN_HALT
+        assert "teardown failed" in caplog.text.lower()
+        assert "retrospective" in caplog.text.lower()
+        mock_handle_epic_completion.assert_not_called()
 
-    def test_epic_teardown_failure_continues_to_next_epic(self, tmp_path: Path) -> None:
-        """AC5: Teardown failure advances to next epic."""
+    def test_epic_teardown_failure_blocks_next_epic(self, tmp_path: Path) -> None:
+        """AC5: Teardown failure must halt before epic completion or advancement."""
         from bmad_assist.core.config import load_config
-        from bmad_assist.core.loop import run_loop
+        from bmad_assist.core.loop import LoopExitReason, run_loop
 
         config = load_config(
             {
@@ -553,32 +555,12 @@ class TestEpicTeardown:
         )
 
         executed_phases: list[str] = []
-        epic_completion_calls: list[int] = []
-
         def mock_execute_phase(state: State) -> PhaseResult:
             phase_name = state.current_phase.name if state.current_phase else "None"
             executed_phases.append(phase_name)
             if state.current_phase == Phase.RETROSPECTIVE and state.current_epic == 1:
                 return PhaseResult.fail("Epic 1 retrospective failed")
             return PhaseResult.ok()
-
-        def mock_handle_epic_completion(state, epic_list, epic_stories_loader, state_path):
-            epic_completion_calls.append(state.current_epic)
-            if len(epic_completion_calls) == 1:
-                # First call - advance to epic 2
-                return (
-                    State(
-                        current_epic=2,
-                        current_story="2.1",
-                        current_phase=Phase.CREATE_STORY,
-                        completed_epics=[1],
-                        epic_setup_complete=False,
-                    ),
-                    False,  # Not project complete
-                )
-            else:
-                # Second call - project complete
-                return (State(completed_epics=[1, 2]), True)
 
         test_loop_config = LoopConfig(
             epic_setup=[],
@@ -615,17 +597,15 @@ class TestEpicTeardown:
                                 ),
                             ):
                                 with patch(
-                                    "bmad_assist.core.loop.runner.handle_epic_completion",
-                                    side_effect=mock_handle_epic_completion,
-                                ):
+                                    "bmad_assist.core.loop.runner.handle_epic_completion"
+                                ) as mock_handle_epic_completion:
                                     result = run_loop(
                                         config, tmp_path, [1, 2], lambda x: [f"{x}.1"]
                                     )
 
-        # Should complete project despite teardown failure
-        assert result == LoopExitReason.COMPLETED
-        # Epic completion should have been called
-        assert len(epic_completion_calls) >= 1
+        assert "RETROSPECTIVE" in executed_phases
+        assert result == LoopExitReason.GUARDIAN_HALT
+        mock_handle_epic_completion.assert_not_called()
 
 
 # =============================================================================

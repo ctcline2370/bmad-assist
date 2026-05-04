@@ -25,6 +25,7 @@ __all__ = [
     "CompilerError",
     "TokenBudgetError",
     "PatchError",
+    "NonTransientProviderPatchError",
     "AmbiguousFileError",
     "VariableError",
     "PreflightError",
@@ -253,6 +254,16 @@ class PatchError(CompilerError):
     - Validation fails after retries (must_contain/must_not_contain)
     - Success threshold not met (< 75% transforms succeeded)
     - Cache directory is not writable
+    """
+
+    pass
+
+
+class NonTransientProviderPatchError(PatchError):
+    """Workflow patch failed because the provider hit a non-retryable exit error.
+
+    This separates deterministic CLI startup/configuration failures from LLM
+    transform or validation failures that may be worth retrying.
     """
 
     pass

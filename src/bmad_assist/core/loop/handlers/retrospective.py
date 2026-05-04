@@ -76,13 +76,18 @@ class RetrospectiveHandler(BaseHandler):
         # Run parent's execute() for actual retrospective
         result = super().execute(state)
 
-        # Extract and save retrospective report if successful
+        # Retrospective completion is not trustworthy unless the report is
+        # durably persisted. Fail closed if persistence cannot be proven.
         if result.success and state.current_epic is not None:
-            self._save_retrospective_report(result, state)
+            save_error = self._save_retrospective_report(result, state)
+            if save_error is not None:
+                outputs = dict(result.outputs)
+                outputs["report_persistence_error"] = save_error
+                return PhaseResult(success=False, error=save_error, outputs=outputs)
 
         return result
 
-    def _save_retrospective_report(self, result: PhaseResult, state: State) -> None:
+    def _save_retrospective_report(self, result: PhaseResult, state: State) -> str | None:
         """Extract and save retrospective report from LLM output.
 
         Bug Fix: Retrospective Report Persistence (AC #3)
@@ -91,12 +96,20 @@ class RetrospectiveHandler(BaseHandler):
             result: Successful PhaseResult with response in outputs.
             state: Current loop state with epic information.
 
+        Returns:
+            None on success, otherwise a blocking error message describing why
+            report persistence could not be proven.
+
         """
         try:
             raw_output = result.outputs.get("response", "")
             if not raw_output:
-                logger.warning("No response in retrospective result, skipping save")
-                return
+                error = (
+                    f"Retrospective for epic {state.current_epic} did not produce a "
+                    "response payload, so no durable report could be saved"
+                )
+                logger.error(error)
+                return error
 
             # Extract report using markers or fallback heuristics
             report_content = extract_retrospective_report(raw_output)
@@ -123,13 +136,12 @@ class RetrospectiveHandler(BaseHandler):
             result.outputs["report_file"] = str(report_path)
 
             logger.info("Retrospective report saved: %s", report_path)
+            return None
 
         except Exception as e:
-            # Non-blocking: log error but don't fail the retrospective
-            # AC #5: graceful degradation
+            error = f"Failed to save retrospective report for epic {state.current_epic}: {e}"
             logger.error(
-                "Failed to save retrospective report for epic %s: %s",
-                state.current_epic,
-                e,
+                error,
                 exc_info=True,  # Include traceback for debugging
             )
+            return error

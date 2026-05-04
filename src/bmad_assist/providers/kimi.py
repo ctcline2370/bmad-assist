@@ -205,10 +205,7 @@ def _is_kimi_transient_error(stderr: str, exit_code: int) -> bool:
             return True
 
     # Empty stderr with exit 1 = likely transient (network issue)
-    if not stderr.strip() and exit_code == 1:
-        return True
-
-    return False  # Unknown error = don't retry
+    return not stderr.strip() and exit_code == 1
 
 
 def _calculate_retry_delay(attempt: int) -> float:
@@ -732,10 +729,12 @@ class KimiProvider(BaseProvider):
                         debug_json_logger,
                         color_index,
                     ),
+                    daemon=True,
                 )
                 stderr_thread = threading.Thread(
                     target=read_stderr,
                     args=(process.stderr, stderr_chunks, color_index),
+                    daemon=True,
                 )
                 stdout_thread.start()
                 stderr_thread.start()

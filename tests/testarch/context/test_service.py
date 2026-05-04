@@ -1,7 +1,7 @@
 """Tests for TEA context service."""
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -131,7 +131,138 @@ class TestTEAContextService:
 
         assert len(result) >= 1
         # At least test-design should be loaded
-        assert any("test-design" in path for path in result.keys())
+        assert any("test-design" in path for path in result)
+
+    def test_collect_loads_atdd_from_output_folder_legacy_location(
+        self,
+        tmp_path: Path,
+        base_testarch_config: TestarchConfig,
+    ) -> None:
+        """Test collect bridges handler output_folder paths and resolver paths."""
+        from bmad_assist.core.paths import init_paths
+
+        paths = init_paths(tmp_path)
+        paths.implementation_artifacts.mkdir(parents=True)
+        legacy_dir = paths.output_folder / "test-artifacts"
+        legacy_dir.mkdir(parents=True)
+        (legacy_dir / "atdd-checklist-25.1.md").write_text("# Legacy ATDD")
+
+        context = CompilerContext(
+            project_root=tmp_path,
+            output_folder=paths.output_folder,
+        )
+
+        resolved = {"epic_num": 25, "story_id": "25.1"}
+        service = TEAContextService(
+            context, "dev_story", base_testarch_config, resolved
+        )
+        result = service.collect()
+
+        assert any("test-artifacts" in path for path in result)
+        assert any("# Legacy ATDD" in content for content in result.values())
+
+    def test_code_review_synthesis_default_collects_existing_atdd(
+        self,
+        tmp_path: Path,
+        base_testarch_config: TestarchConfig,
+    ) -> None:
+        """Test synthesis defaults use prior ATDD instead of future test-review."""
+        from bmad_assist.core.paths import init_paths
+
+        paths = init_paths(tmp_path)
+        paths.implementation_artifacts.mkdir(parents=True)
+        atdd_dir = paths.output_folder / "atdd-checklists"
+        atdd_dir.mkdir(parents=True)
+        (atdd_dir / "atdd-checklist-25.1.md").write_text("# ATDD for synthesis")
+        test_review_dir = paths.output_folder / "test-reviews"
+        test_review_dir.mkdir(parents=True)
+        (test_review_dir / "test-review-25.1.md").write_text("# Future review")
+
+        context = CompilerContext(
+            project_root=tmp_path,
+            output_folder=paths.output_folder,
+        )
+
+        resolved = {"epic_num": 25, "story_id": "25.1"}
+        service = TEAContextService(
+            context,
+            "code_review_synthesis",
+            base_testarch_config,
+            resolved,
+        )
+        result = service.collect()
+
+        assert any("atdd-checklist" in path for path in result)
+        assert any("# ATDD for synthesis" in content for content in result.values())
+        assert not any("test-review" in path for path in result)
+
+    def test_collect_loads_sibling_atdd_when_context_uses_implementation_artifacts(
+        self,
+        tmp_path: Path,
+        base_testarch_config: TestarchConfig,
+    ) -> None:
+        """Test synthesis finds ATDD saved beside implementation-artifacts."""
+        from bmad_assist.core.paths import init_paths
+
+        paths = init_paths(tmp_path)
+        paths.implementation_artifacts.mkdir(parents=True)
+        atdd_dir = paths.output_folder / "atdd-checklists"
+        atdd_dir.mkdir(parents=True)
+        (atdd_dir / "atdd-checklist-25.1.md").write_text("# Sibling ATDD")
+
+        context = CompilerContext(
+            project_root=tmp_path,
+            output_folder=paths.implementation_artifacts,
+        )
+
+        resolved = {"epic_num": 25, "story_id": "25.1"}
+        service = TEAContextService(
+            context,
+            "code_review_synthesis",
+            base_testarch_config,
+            resolved,
+        )
+        result = service.collect()
+
+        assert any("atdd-checklists" in path for path in result)
+        assert any("# Sibling ATDD" in content for content in result.values())
+
+    def test_collect_fallback_loads_sibling_atdd_without_paths_singleton(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Test fallback base paths expand implementation-artifacts to output root."""
+        from bmad_assist.core.paths import _reset_paths
+
+        _reset_paths()
+        output_root = tmp_path / "_bmad-output"
+        impl_artifacts = output_root / "implementation-artifacts"
+        impl_artifacts.mkdir(parents=True)
+        atdd_dir = output_root / "atdd-checklists"
+        atdd_dir.mkdir(parents=True)
+        (atdd_dir / "atdd-checklist-25.1.md").write_text("# Fallback ATDD")
+
+        context = CompilerContext(
+            project_root=tmp_path,
+            output_folder=impl_artifacts,
+        )
+        config = TestarchConfig(
+            context=TEAContextConfig(
+                enabled=True,
+                workflows={
+                    "code_review_synthesis": TEAContextWorkflowConfig(
+                        include=["atdd"]
+                    ),
+                },
+            ),
+        )
+
+        resolved = {"epic_num": 25, "story_id": "25.1"}
+        service = TEAContextService(context, "code_review_synthesis", config, resolved)
+        result = service.collect()
+
+        assert any("atdd-checklists" in path for path in result)
+        assert any("# Fallback ATDD" in content for content in result.values())
 
     def test_collect_respects_budget(
         self,

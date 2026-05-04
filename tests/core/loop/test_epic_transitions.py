@@ -268,18 +268,21 @@ class TestAdvanceToNextEpic:
 
         assert "final epic" in caplog.text.lower()
 
-    def test_advance_to_next_epic_skips_epics_with_no_stories(self) -> None:
-        """Epics with no stories are skipped (returns None if all are empty)."""
+    def test_advance_to_next_epic_raises_state_error_when_next_epic_has_no_stories(self) -> None:
+        """An epic with no story inventory is a control-plane error, not a skippable state."""
         from bmad_assist.core.loop import advance_to_next_epic
+        from bmad_assist.core.exceptions import StateError
         from bmad_assist.core.state import State
 
         state = State(current_epic=2, current_story="2.4")
         epic_list = [1, 2, 3, 4]
         epic_stories_loader = MagicMock(return_value=[])  # No stories!
 
-        # Should return None (project complete) since all remaining epics have no stories
-        result = advance_to_next_epic(state, epic_list, epic_stories_loader)
-        assert result is None
+        with pytest.raises(
+            StateError,
+            match="Cannot advance to epic 3: no stories are defined for that epic",
+        ):
+            advance_to_next_epic(state, epic_list, epic_stories_loader)
 
     def test_advance_to_next_epic_skips_completed_epics(self) -> None:
         """Skips epics that are already in completed_epics."""
@@ -366,10 +369,11 @@ class TestAdvanceToNextEpic:
         assert "Skipping epic 20" in caplog.text
         assert "already in completed_epics" in caplog.text
 
-    def test_advance_to_next_epic_all_stories_done_goes_to_retrospective(self) -> None:
-        """When all stories in next epic are done, go directly to RETROSPECTIVE."""
+    def test_advance_to_next_epic_all_stories_done_raises_state_error(self) -> None:
+        """Rejects implicit epic completion when next epic teardown has not run."""
         from bmad_assist.core.loop import advance_to_next_epic
-        from bmad_assist.core.state import Phase, State
+        from bmad_assist.core.exceptions import StateError
+        from bmad_assist.core.state import State
 
         # All stories in epic 20 are already completed
         state = State(
@@ -381,13 +385,11 @@ class TestAdvanceToNextEpic:
         epic_list = [19, 20]
         epic_stories_loader = MagicMock(return_value=["20.1", "20.2", "20.3"])
 
-        new_state = advance_to_next_epic(state, epic_list, epic_stories_loader)
-
-        assert new_state is not None
-        assert new_state.current_epic == 20
-        assert new_state.current_story == "20.3"  # Last story
-        # Minimal loop: RETROSPECTIVE is first (and only) in epic_teardown
-        assert new_state.current_phase == Phase.RETROSPECTIVE
+        with pytest.raises(
+            StateError,
+            match="Cannot advance to epic 20: all stories are already completed but epic teardown has not explicitly completed the epic",
+        ):
+            advance_to_next_epic(state, epic_list, epic_stories_loader)
 
     def test_advance_to_next_epic_some_stories_done_starts_at_first_incomplete(
         self,

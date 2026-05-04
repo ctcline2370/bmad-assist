@@ -912,6 +912,32 @@ class OpenCodeSDKProvider(BaseProvider):
         # SDK completed
         return sdk_task.result()
 
+    async def _invoke_async_with_timeout(
+        self,
+        prompt: str,
+        model: str,
+        cwd: Path | None,
+        allowed_tools: list[str] | None,
+        timeout: int,
+        color_index: int | None = None,
+        display_model: str | None = None,
+        guard: "ToolCallGuard | None" = None,
+    ) -> tuple[str, str | None]:
+        """Execute SDK query with a coroutine-local timeout wrapper."""
+        return await asyncio.wait_for(
+            self._invoke_async(
+                prompt,
+                model,
+                cwd,
+                allowed_tools,
+                color_index,
+                display_model,
+                timeout,
+                guard=guard,
+            ),
+            timeout=timeout,
+        )
+
     def invoke(
         self,
         prompt: str,
@@ -1033,42 +1059,40 @@ class OpenCodeSDKProvider(BaseProvider):
         start_time = time.perf_counter()
         command: tuple[str, ...] = ("opencode-sdk", "session.chat", effective_model)
         session_id: str | None = None
+        invoke_coro: Any | None = None
 
         try:
             from bmad_assist.core.async_utils import run_async_in_thread
 
             if cancel_token is not None:
-                response_text, session_id = run_async_in_thread(
-                    self._invoke_with_cancel(
-                        prompt,
-                        effective_model,
-                        cwd,
-                        allowed_tools,
-                        cancel_token,
-                        effective_timeout,
-                        color_index,
-                        display_model,
-                        guard=guard,
-                    )
+                invoke_coro = self._invoke_with_cancel(
+                    prompt,
+                    effective_model,
+                    cwd,
+                    allowed_tools,
+                    cancel_token,
+                    effective_timeout,
+                    color_index,
+                    display_model,
+                    guard=guard,
                 )
+                response_text, session_id = run_async_in_thread(invoke_coro)
             else:
-                response_text, session_id = run_async_in_thread(
-                    asyncio.wait_for(
-                        self._invoke_async(
-                            prompt,
-                            effective_model,
-                            cwd,
-                            allowed_tools,
-                            color_index,
-                            display_model,
-                            effective_timeout,
-                            guard=guard,
-                        ),
-                        timeout=effective_timeout,
-                    )
+                invoke_coro = self._invoke_async_with_timeout(
+                    prompt,
+                    effective_model,
+                    cwd,
+                    allowed_tools,
+                    effective_timeout,
+                    color_index,
+                    display_model,
+                    guard=guard,
                 )
+                response_text, session_id = run_async_in_thread(invoke_coro)
 
         except asyncio.CancelledError:
+            if invoke_coro is not None:
+                invoke_coro.close()
             duration_ms = int((time.perf_counter() - start_time) * 1000)
             logger.info("OpenCode SDK cancelled after %dms", duration_ms)
             return ProviderResult(
@@ -1081,15 +1105,21 @@ class OpenCodeSDKProvider(BaseProvider):
             )
 
         except ImportError as e:
+            if invoke_coro is not None:
+                invoke_coro.close()
             raise ProviderError(
                 "opencode-ai package not installed. Install with: "
                 "pip install 'opencode-ai>=0.1.0a36,<0.2.0'"
             ) from e
 
         except ProviderTimeoutError:
+            if invoke_coro is not None:
+                invoke_coro.close()
             raise
 
         except ProviderError as e:
+            if invoke_coro is not None:
+                invoke_coro.close()
             # Check if this is a server startup failure (set cooldown)
             error_str = str(e)
             if "failed to start" in error_str.lower() or "not found" in error_str.lower():
@@ -1098,18 +1128,26 @@ class OpenCodeSDKProvider(BaseProvider):
             raise
 
         except FileNotFoundError as e:
+            if invoke_coro is not None:
+                invoke_coro.close()
             _sdk_init_failed_at = time.monotonic()
             raise ProviderError("OpenCode CLI not found. Is 'opencode' in PATH?") from e
 
         except ConnectionError as e:
+            if invoke_coro is not None:
+                invoke_coro.close()
             # Runtime connection error -- NO cooldown (F9)
             raise ProviderError(f"OpenCode SDK connection error: {e}") from e
 
         except TimeoutError as e:
+            if invoke_coro is not None:
+                invoke_coro.close()
             duration_ms = int((time.perf_counter() - start_time) * 1000)
             raise ProviderTimeoutError(f"OpenCode SDK timeout after {effective_timeout}s") from e
 
         except Exception as e:
+            if invoke_coro is not None:
+                invoke_coro.close()
             # Generic error -- NO cooldown for app-level errors
             logger.error("Unexpected OpenCode SDK error: %s", e)
             raise ProviderError(f"Unexpected OpenCode SDK error: {e}") from e

@@ -15,9 +15,10 @@ Tests cover:
 """
 
 import inspect
-from abc import ABC, abstractmethod
+from abc import ABC
 from dataclasses import FrozenInstanceError, fields, is_dataclass
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -287,6 +288,31 @@ class TestBaseProviderStructure:
         assert fget is not None
         assert fget.__doc__ is not None
         assert "default" in fget.__doc__.lower()
+
+    def test_stream_reader_threads_are_daemon(self) -> None:
+        """Stream reader helpers must not keep an orchestrator process alive."""
+        from bmad_assist.providers.base import start_stream_reader_threads
+
+        process = MagicMock()
+        process.stdout.readline.side_effect = ["stdout\n", ""]
+        process.stderr.readline.side_effect = ["stderr\n", ""]
+
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+
+        stdout_thread, stderr_thread = start_stream_reader_threads(
+            process,
+            stdout_chunks,
+            stderr_chunks,
+        )
+
+        assert stdout_thread.daemon is True
+        assert stderr_thread.daemon is True
+
+        stdout_thread.join(timeout=1)
+        stderr_thread.join(timeout=1)
+        assert stdout_chunks == ["stdout\n"]
+        assert stderr_chunks == ["stderr\n"]
 
 
 class TestBaseProviderAbstractMethods:

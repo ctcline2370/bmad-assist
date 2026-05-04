@@ -3,9 +3,6 @@
 Story 26.16: Validate Story Integration Hook
 """
 
-import json
-import uuid
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -24,15 +21,14 @@ from bmad_assist.deep_verify.core.types import (
     deserialize_validation_result,
     serialize_validation_result,
 )
-from bmad_assist.deep_verify.integration.validate_story_hook import (
-    run_deep_verify_validation,
-)
 from bmad_assist.deep_verify.integration.reports import (
     _format_finding_detail,
     _format_findings_table,
     save_deep_verify_report,
 )
-
+from bmad_assist.deep_verify.integration.validate_story_hook import (
+    run_deep_verify_validation,
+)
 
 # =============================================================================
 # Fixtures
@@ -747,21 +743,20 @@ class TestLogging:
         """Test that execution is logged at INFO level."""
         import logging
 
-        with caplog.at_level(logging.INFO):
-            with patch(
-                "bmad_assist.deep_verify.integration.validate_story_hook.DeepVerifyEngine"
-            ) as mock_engine_class:
-                mock_engine = MagicMock()
-                mock_engine.verify = AsyncMock(return_value=sample_verdict)
-                mock_engine_class.return_value = mock_engine
+        with caplog.at_level(logging.INFO), patch(
+            "bmad_assist.deep_verify.integration.validate_story_hook.DeepVerifyEngine"
+        ) as mock_engine_class:
+            mock_engine = MagicMock()
+            mock_engine.verify = AsyncMock(return_value=sample_verdict)
+            mock_engine_class.return_value = mock_engine
 
-                await run_deep_verify_validation(
-                    artifact_text="test content",
-                    config=mock_config,
-                    project_path=temp_project_path,
-                    epic_num=26,
-                    story_num=16,
-                )
+            await run_deep_verify_validation(
+                artifact_text="test content",
+                config=mock_config,
+                project_path=temp_project_path,
+                epic_num=26,
+                story_num=16,
+            )
 
         assert any("Deep Verify" in msg for msg in caplog.messages)
 
@@ -801,15 +796,17 @@ class TestLoadStoryArtifact:
 
     def test_story_file_not_found(self, mock_paths, caplog):
         """Test when story file doesn't exist - returns None with warning."""
+        import logging
+
         from bmad_assist.deep_verify.integration.validate_story_hook import (
             _load_story_artifact,
         )
-        import logging
 
-        with caplog.at_level(logging.WARNING):
-            with patch("bmad_assist.core.paths.get_paths") as mock_get_paths:
-                mock_get_paths.return_value = mock_paths
-                result = _load_story_artifact(99, 99)
+        with caplog.at_level(logging.WARNING), patch(
+            "bmad_assist.core.paths.get_paths"
+        ) as mock_get_paths:
+            mock_get_paths.return_value = mock_paths
+            result = _load_story_artifact(99, 99)
 
         assert result is None
         assert any("No story file found" in msg for msg in caplog.messages)
@@ -834,19 +831,21 @@ class TestLoadStoryArtifact:
 
     def test_encoding_error_returns_replacement(self, mock_paths, caplog):
         """Test that encoding errors are handled with replacement chars."""
+        import logging
+
         from bmad_assist.deep_verify.integration.validate_story_hook import (
             _load_story_artifact,
         )
-        import logging
 
         # Create file with non-UTF-8 bytes
         story_file = mock_paths.stories_dir / "26-16-bad-encoding.md"
         story_file.write_bytes(b"Content with bad bytes: \x80\x81\x82")
 
-        with caplog.at_level(logging.WARNING):
-            with patch("bmad_assist.core.paths.get_paths") as mock_get_paths:
-                mock_get_paths.return_value = mock_paths
-                result = _load_story_artifact(26, 16)
+        with caplog.at_level(logging.WARNING), patch(
+            "bmad_assist.core.paths.get_paths"
+        ) as mock_get_paths:
+            mock_get_paths.return_value = mock_paths
+            result = _load_story_artifact(26, 16)
 
         # Should return content with replacement chars
         assert result is not None
@@ -857,36 +856,42 @@ class TestLoadStoryArtifact:
 
     def test_oserror_returns_none(self, mock_paths, caplog):
         """Test that OSError (e.g., permission denied) returns None with warning."""
+        import logging
+
         from bmad_assist.deep_verify.integration.validate_story_hook import (
             _load_story_artifact,
         )
-        import logging
 
         # Create story file then make it unreadable by mocking read_text
         story_file = mock_paths.stories_dir / "26-16-unreadable.md"
         story_file.write_text("Content")
 
-        with caplog.at_level(logging.WARNING):
-            with patch("bmad_assist.core.paths.get_paths") as mock_get_paths:
-                mock_get_paths.return_value = mock_paths
-                # Mock the Path.read_text to raise OSError
-                with patch.object(type(story_file), "read_text", side_effect=OSError("Permission denied")):
-                    result = _load_story_artifact(26, 16)
+        with caplog.at_level(logging.WARNING), patch(
+            "bmad_assist.core.paths.get_paths"
+        ) as mock_get_paths:
+            mock_get_paths.return_value = mock_paths
+            # Mock the Path.read_text to raise OSError
+            with patch.object(
+                type(story_file), "read_text", side_effect=OSError("Permission denied")
+            ):
+                result = _load_story_artifact(26, 16)
 
         assert result is None
         assert any("Error reading story file" in msg for msg in caplog.messages)
 
     def test_paths_not_initialized(self, caplog):
         """Test when paths are not initialized - returns None with warning."""
+        import logging
+
         from bmad_assist.deep_verify.integration.validate_story_hook import (
             _load_story_artifact,
         )
-        import logging
 
-        with caplog.at_level(logging.WARNING):
-            with patch("bmad_assist.core.paths.get_paths") as mock_get_paths:
-                mock_get_paths.side_effect = RuntimeError("Paths not initialized")
-                result = _load_story_artifact(26, 16)
+        with caplog.at_level(logging.WARNING), patch(
+            "bmad_assist.core.paths.get_paths"
+        ) as mock_get_paths:
+            mock_get_paths.side_effect = RuntimeError("Paths not initialized")
+            result = _load_story_artifact(26, 16)
 
         assert result is None
         assert any("Paths not initialized" in msg for msg in caplog.messages)
@@ -974,11 +979,12 @@ class TestLoadContextDocuments:
 
     def test_document_missing_logs_warning(self, mock_paths_with_docs, caplog):
         """Test that missing documents are logged and skipped."""
+        import logging
+
         from bmad_assist.deep_verify.config import DeepVerifyContextConfig
         from bmad_assist.deep_verify.integration.validate_story_hook import (
             _load_context_documents,
         )
-        import logging
 
         # Don't create any doc files
         config = DeepVerifyContextConfig(
@@ -987,21 +993,23 @@ class TestLoadContextDocuments:
             include_project_context=False,
         )
 
-        with caplog.at_level(logging.WARNING):
-            with patch("bmad_assist.core.paths.get_paths") as mock_get_paths:
-                mock_get_paths.return_value = mock_paths_with_docs
-                result = _load_context_documents(config)
+        with caplog.at_level(logging.WARNING), patch(
+            "bmad_assist.core.paths.get_paths"
+        ) as mock_get_paths:
+            mock_get_paths.return_value = mock_paths_with_docs
+            result = _load_context_documents(config)
 
         assert result == ""
         assert any("not found" in msg for msg in caplog.messages)
 
     def test_size_limit_exceeded(self, mock_paths_with_docs, caplog):
         """Test that documents exceeding size limit are skipped."""
+        import logging
+
         from bmad_assist.deep_verify.config import DeepVerifyContextConfig
         from bmad_assist.deep_verify.integration.validate_story_hook import (
             _load_context_documents,
         )
-        import logging
 
         # Create a large PRD (bigger than limit)
         large_content = "x" * 60000  # 60KB
@@ -1014,10 +1022,11 @@ class TestLoadContextDocuments:
             max_context_size=51200,  # 50KB limit
         )
 
-        with caplog.at_level(logging.WARNING):
-            with patch("bmad_assist.core.paths.get_paths") as mock_get_paths:
-                mock_get_paths.return_value = mock_paths_with_docs
-                result = _load_context_documents(config)
+        with caplog.at_level(logging.WARNING), patch(
+            "bmad_assist.core.paths.get_paths"
+        ) as mock_get_paths:
+            mock_get_paths.return_value = mock_paths_with_docs
+            result = _load_context_documents(config)
 
         # PRD should be skipped due to size
         assert result == ""
@@ -1025,18 +1034,20 @@ class TestLoadContextDocuments:
 
     def test_paths_not_initialized(self, caplog):
         """Test when paths not initialized - returns empty string."""
+        import logging
+
         from bmad_assist.deep_verify.config import DeepVerifyContextConfig
         from bmad_assist.deep_verify.integration.validate_story_hook import (
             _load_context_documents,
         )
-        import logging
 
         config = DeepVerifyContextConfig(include_prd=True)
 
-        with caplog.at_level(logging.WARNING):
-            with patch("bmad_assist.core.paths.get_paths") as mock_get_paths:
-                mock_get_paths.side_effect = RuntimeError("Paths not initialized")
-                result = _load_context_documents(config)
+        with caplog.at_level(logging.WARNING), patch(
+            "bmad_assist.core.paths.get_paths"
+        ) as mock_get_paths:
+            mock_get_paths.side_effect = RuntimeError("Paths not initialized")
+            result = _load_context_documents(config)
 
         assert result == ""
         assert any("Paths not initialized" in msg for msg in caplog.messages)
@@ -1060,6 +1071,76 @@ class TestLoadContextDocuments:
 
         with patch("bmad_assist.core.paths.get_paths") as mock_get_paths:
             mock_get_paths.return_value = mock_paths_with_docs
+            result = _load_context_documents(config)
+
+        assert "<!-- DV Context: Project Context -->" in result
+        assert pc_content in result
+
+    def test_project_context_output_folder_fallback(self, tmp_path):
+        """Test project context is found in the BMAD output root."""
+        from bmad_assist.deep_verify.config import DeepVerifyContextConfig
+        from bmad_assist.deep_verify.integration.validate_story_hook import (
+            _load_context_documents,
+        )
+
+        mock_project_paths = MagicMock()
+        mock_project_paths.project_knowledge = tmp_path / "missing-docs"
+        mock_project_paths.prd_file = tmp_path / "missing-docs" / "prd.md"
+        mock_project_paths.architecture_file = tmp_path / "missing-docs" / "architecture.md"
+        mock_project_paths.project_context_file = (
+            tmp_path / "missing-docs" / "project_context.md"
+        )
+        mock_project_paths.output_folder = tmp_path / "_bmad-output"
+        mock_project_paths.output_folder.mkdir(parents=True)
+
+        pc_content = "# Project Context\n\nOutput-root rules."
+        (mock_project_paths.output_folder / "project-context.md").write_text(pc_content)
+
+        config = DeepVerifyContextConfig(
+            include_prd=False,
+            include_architecture=False,
+            include_project_context=True,
+        )
+
+        with patch("bmad_assist.core.paths.get_paths") as mock_get_paths:
+            mock_get_paths.return_value = mock_project_paths
+            result = _load_context_documents(config)
+
+        assert "<!-- DV Context: Project Context -->" in result
+        assert pc_content in result
+
+    def test_project_context_implementation_parent_fallback(self, tmp_path):
+        """Test project context is found beside implementation artifacts."""
+        from bmad_assist.deep_verify.config import DeepVerifyContextConfig
+        from bmad_assist.deep_verify.integration.validate_story_hook import (
+            _load_context_documents,
+        )
+
+        mock_project_paths = MagicMock()
+        mock_project_paths.project_knowledge = tmp_path / "missing-docs"
+        mock_project_paths.prd_file = tmp_path / "missing-docs" / "prd.md"
+        mock_project_paths.architecture_file = tmp_path / "missing-docs" / "architecture.md"
+        mock_project_paths.project_context_file = (
+            tmp_path / "missing-docs" / "project_context.md"
+        )
+        mock_project_paths.implementation_artifacts = (
+            tmp_path / "_bmad-output" / "implementation-artifacts"
+        )
+        mock_project_paths.implementation_artifacts.mkdir(parents=True)
+
+        pc_content = "# Project Context\n\nImplementation-parent rules."
+        (mock_project_paths.implementation_artifacts.parent / "project-context.md").write_text(
+            pc_content
+        )
+
+        config = DeepVerifyContextConfig(
+            include_prd=False,
+            include_architecture=False,
+            include_project_context=True,
+        )
+
+        with patch("bmad_assist.core.paths.get_paths") as mock_get_paths:
+            mock_get_paths.return_value = mock_project_paths
             result = _load_context_documents(config)
 
         assert "<!-- DV Context: Project Context -->" in result
@@ -1109,7 +1190,7 @@ class TestStoryArtifactIntegration:
             with patch("bmad_assist.core.paths.get_paths") as mock_get_paths:
                 mock_get_paths.return_value = mock_paths_with_story
 
-                result = await run_deep_verify_validation(
+                await run_deep_verify_validation(
                     artifact_text=None,  # Hook should load story file
                     config=mock_config,
                     project_path=temp_project_path,
@@ -1133,17 +1214,18 @@ class TestStoryArtifactIntegration:
         for f in mock_paths_with_story.stories_dir.iterdir():
             f.unlink()
 
-        with caplog.at_level(logging.WARNING):
-            with patch("bmad_assist.core.paths.get_paths") as mock_get_paths:
-                mock_get_paths.return_value = mock_paths_with_story
+        with caplog.at_level(logging.WARNING), patch(
+            "bmad_assist.core.paths.get_paths"
+        ) as mock_get_paths:
+            mock_get_paths.return_value = mock_paths_with_story
 
-                result = await run_deep_verify_validation(
-                    artifact_text=None,
-                    config=mock_config,
-                    project_path=temp_project_path,
-                    epic_num=26,
-                    story_num=16,
-                )
+            result = await run_deep_verify_validation(
+                artifact_text=None,
+                config=mock_config,
+                project_path=temp_project_path,
+                epic_num=26,
+                story_num=16,
+            )
 
         assert result.verdict == VerdictDecision.ACCEPT
         assert result.error is not None

@@ -38,19 +38,26 @@ _DV_PLACEHOLDER_TOKENS = 2000
 _GIT_DIFF_CAP_TOKENS = 5000
 
 
-def estimate_base_context_tokens(project_path: Path, config: Any, phase_name: str) -> int:
+def estimate_base_context_tokens(
+    project_path: Path,
+    config: Any,
+    phase_name: str,
+    *,
+    epic_num: int | str | None = None,
+    story_num: int | str | None = None,
+) -> int:
     """Estimate token count for base context (everything except reviews).
 
     Reads strategic doc files, antipattern files, and story file from
     configured project paths. Applies estimate_tokens() to each file's
     content and returns the total.
 
-    For code_review_synthesis: includes strategic docs + antipatterns +
-    story + security placeholder (~2K) + DV placeholder (~2K) + git diff
-    cap (5K).
+    For code_review_synthesis: includes strategic docs + current story +
+    source context budget + current epic code antipatterns + security
+    placeholder (~2K) + DV placeholder (~2K) + git diff cap (5K).
 
-    For validate_story_synthesis: includes strategic docs + story + DV
-    placeholder.
+    For validate_story_synthesis: includes strategic docs + current story +
+    source context budget + DV placeholder.
 
     Does NOT include source files (Step 0 target) or reviews (compression
     target).
@@ -60,12 +67,16 @@ def estimate_base_context_tokens(project_path: Path, config: Any, phase_name: st
         config: Application configuration (BmadAssistConfig or similar).
         phase_name: Phase name -- either "code_review_synthesis" or
             "validate_story_synthesis".
+        epic_num: Current epic number. Enables exact story and antipattern lookup.
+        story_num: Current story number. Enables exact story lookup.
 
     Returns:
         Estimated token count for base context components.
 
     """
     total = 0
+
+    paths = None
 
     # Read strategic context files from project_knowledge directory
     try:
@@ -83,18 +94,15 @@ def estimate_base_context_tokens(project_path: Path, config: Any, phase_name: st
         if content:
             total += estimate_tokens(content)
 
-    # Story file -- try to find from state, but since we don't have state here,
-    # use a heuristic estimate based on typical story file size (~3K tokens).
-    # The actual story file path resolution depends on epic/story numbers
-    # which are not available in this utility function's scope. We use
-    # a conservative estimate instead.
-    # In practice, story files are typically 8-15K chars (~2-4K tokens).
-    total += 3000  # Conservative story file estimate
+    # Story file: use the real current story when state identifies it. Fall back
+    # to a conservative estimate for standalone tests and legacy callers.
+    story_content = _find_story_content(project_path, paths, epic_num, story_num)
+    total += estimate_tokens(story_content) if story_content else 3000
+
+    total += _get_source_context_budget(config, phase_name)
 
     if phase_name == "code_review_synthesis":
-        # Antipatterns file
-        antipatterns_path = project_path / ".bmad-assist" / "cache" / "antipatterns-code.md"
-        content = _safe_read(antipatterns_path)
+        content = _find_antipattern_content(project_path, paths, epic_num, "code")
         if content:
             total += estimate_tokens(content)
 
@@ -112,6 +120,103 @@ def estimate_base_context_tokens(project_path: Path, config: Any, phase_name: st
         total += _DV_PLACEHOLDER_TOKENS
 
     return total
+
+
+def _get_source_context_budget(config: Any, phase_name: str) -> int:
+    """Return configured source-context budget for a synthesis workflow."""
+    try:
+        return int(config.compiler.source_context.budgets.get_budget(phase_name))
+    except (AttributeError, TypeError, ValueError):
+        defaults = {
+            "code_review_synthesis": 5000,
+            "validate_story_synthesis": 10000,
+        }
+        return defaults.get(phase_name, 0)
+
+
+def _find_story_content(
+    project_path: Path,
+    paths: Any,
+    epic_num: int | str | None,
+    story_num: int | str | None,
+) -> str:
+    """Read the active story file when epic/story identifiers are available."""
+    if epic_num is None or story_num is None:
+        return ""
+
+    candidate_dirs: list[Path] = []
+    if paths is not None:
+        stories_dir = getattr(paths, "stories_dir", None)
+        implementation_artifacts = getattr(paths, "implementation_artifacts", None)
+        if isinstance(stories_dir, Path):
+            candidate_dirs.append(stories_dir)
+        if isinstance(implementation_artifacts, Path):
+            candidate_dirs.append(implementation_artifacts / "stories")
+
+    candidate_dirs.extend(
+        [
+            project_path / "_bmad-output" / "implementation-artifacts" / "stories",
+            project_path / "_bmad-output" / "planning-artifacts" / "stories",
+            project_path / "docs" / "sprint-artifacts",
+        ]
+    )
+
+    pattern = f"{epic_num}-{story_num}-*.md"
+    for stories_dir in _dedupe_paths(candidate_dirs):
+        if not stories_dir.exists():
+            continue
+        matches = sorted(stories_dir.glob(pattern))
+        for story_path in matches:
+            content = _safe_read(story_path)
+            if content:
+                return content
+
+    return ""
+
+
+def _find_antipattern_content(
+    project_path: Path,
+    paths: Any,
+    epic_num: int | str | None,
+    antipattern_type: str,
+) -> str:
+    """Read the same epic-scoped antipattern file the compiler will load."""
+    if epic_num is None:
+        return ""
+
+    candidate_dirs: list[Path] = []
+    if paths is not None:
+        implementation_artifacts = getattr(paths, "implementation_artifacts", None)
+        if isinstance(implementation_artifacts, Path):
+            candidate_dirs.append(implementation_artifacts)
+
+    candidate_dirs.append(project_path / "_bmad-output" / "implementation-artifacts")
+
+    filename = f"epic-{epic_num}-{antipattern_type}-antipatterns.md"
+    for impl_artifacts in _dedupe_paths(candidate_dirs):
+        for candidate in (
+            impl_artifacts / "antipatterns" / filename,
+            impl_artifacts / filename,
+        ):
+            content = _safe_read(candidate)
+            if content:
+                return content
+
+    # Legacy cache path retained for older projects.
+    legacy = project_path / ".bmad-assist" / "cache" / f"antipatterns-{antipattern_type}.md"
+    return _safe_read(legacy)
+
+
+def _dedupe_paths(paths: list[Path]) -> list[Path]:
+    """Deduplicate paths while preserving order."""
+    seen: set[Path] = set()
+    result: list[Path] = []
+    for path in paths:
+        resolved = path.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            result.append(path)
+    return result
 
 
 def estimate_synthesis_tokens(
@@ -222,11 +327,10 @@ def validate_extraction_completeness(
     extracted_reviews: list[AnonymizedValidation],
     log: logging.Logger,
 ) -> None:
-    """Check extraction completeness using heading-count heuristic (FM-1).
+    """Check extraction completeness using finding-marker heuristic (FM-1).
 
-    Counts markdown heading patterns (##, ###, **Issue**, **Finding**) in
-    raw vs extracted content. Logs WARNING if extracted count < 80% of
-    raw count.
+    Counts finding-like headings and labels in raw vs extracted content. Logs
+    WARNING if extracted count < 80% of raw count.
 
     Does not raise -- this is an observability check only.
 
@@ -245,7 +349,7 @@ def validate_extraction_completeness(
     ratio = extracted_count / raw_count
     if ratio < 0.8:
         log.warning(
-            "Extraction completeness check: extracted %d/%d heading patterns "
+            "Extraction completeness check: extracted %d/%d finding markers "
             "(%.0f%%). Possible finding loss detected.",
             extracted_count,
             raw_count,
@@ -253,7 +357,7 @@ def validate_extraction_completeness(
         )
     else:
         log.info(
-            "Extraction completeness check passed: %d/%d heading patterns (%.0f%%)",
+            "Extraction completeness check passed: %d/%d finding markers (%.0f%%)",
             extracted_count,
             raw_count,
             ratio * 100,
@@ -531,27 +635,42 @@ def _safe_read(filepath: Path) -> str:
 
 
 def _count_heading_patterns(content: str) -> int:
-    """Count markdown heading and finding patterns in content.
+    """Count finding-like markdown headings and labels in content.
 
-    Counts occurrences of:
-    - ## and ### headings
-    - **Issue** and **Finding** bold patterns
+    Generic section headings such as "Summary" or "Review Notes" are not
+    findings. Counting them causes false extraction-loss warnings for normal
+    review reports. This heuristic intentionally counts only headings or labels
+    that look like actionable review findings.
 
     Args:
         content: Text content to analyze.
 
     Returns:
-        Total count of heading/finding patterns.
+        Total count of finding-like patterns.
 
     """
-    patterns = [
-        r"^#{2,3}\s+",  # ## and ### headings
-        r"\*\*Issue\*\*",  # **Issue** bold pattern
-        r"\*\*Finding\*\*",  # **Finding** bold pattern
-    ]
+    finding_terms = (
+        "finding",
+        "issue",
+        "bug",
+        "risk",
+        "blocker",
+        "concern",
+        "recommendation",
+    )
     count = 0
-    for pattern in patterns:
-        count += len(re.findall(pattern, content, re.MULTILINE))
+    for match in re.finditer(r"^#{2,6}\s+(.+)$", content, re.MULTILINE):
+        heading = match.group(1).strip().lower()
+        if any(term in heading for term in finding_terms):
+            count += 1
+
+    count += len(
+        re.findall(
+            r"\*\*(?:Finding|Issue|Risk|Blocker|Concern|Recommendation)\b[^*]*\*\*",
+            content,
+            re.IGNORECASE,
+        )
+    )
     return count
 
 

@@ -377,6 +377,29 @@ class TestSourceContextService:
         paths = list(result.keys())
         assert "in_both.py" in paths[0]
 
+    def test_dev_story_excludes_generated_story_docs(self, tmp_project: Path) -> None:
+        """dev_story keeps source files and prunes generated story artifacts."""
+        generated = tmp_project / "_bmad-output" / "implementation-artifacts"
+        generated.mkdir(parents=True)
+        (generated / "story-7.2.md").write_text("# Generated story artifact\n")
+
+        src = tmp_project / "src"
+        (src / "main.py").write_text("def main():\n    return 7\n")
+
+        context = create_test_context(tmp_project)
+        service = SourceContextService(context, "dev_story")
+
+        result = service.collect_files(
+            ["_bmad-output/implementation-artifacts/story-7.2.md", "src/main.py"],
+            None,
+        )
+
+        assert len(result) == 1
+        retained_path = next(iter(result))
+        assert retained_path.endswith("src/main.py")
+        assert "story-7.2.md" not in retained_path
+        assert "return 7" in result[retained_path]
+
     def test_disabled_returns_empty(
         self, tmp_project: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

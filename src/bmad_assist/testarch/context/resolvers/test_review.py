@@ -1,7 +1,7 @@
 """Test review artifact resolver.
 
 Resolves test-review-{story}.md artifacts.
-Used in code_review_synthesis to include test quality findings.
+Can include test quality findings in workflows that run after test review.
 """
 
 from __future__ import annotations
@@ -25,6 +25,8 @@ class TestReviewResolver(BaseResolver):
     Tries both dot and hyphen formats for story ID.
 
     """
+
+    __test__ = False
 
     @property
     def artifact_type(self) -> str:

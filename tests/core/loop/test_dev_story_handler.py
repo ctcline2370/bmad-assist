@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from bmad_assist.core.config import Config, MasterProviderConfig, ProviderConfig
+from bmad_assist.core.exceptions import ConfigError
 from bmad_assist.core.state import Phase, State
 from bmad_assist.providers.base import ProviderResult
 
@@ -154,6 +155,104 @@ class TestDevStoryCompilerIntegration:
 
             # Verify prompt contains compiled content
             assert "<compiled>" in prompt
+
+    def test_render_prompt_validates_budget_using_final_prompt_token_estimate(
+        self,
+        dev_story_config: Config,
+        project_with_story: Path,
+        state_for_dev_story: State,
+    ) -> None:
+        """render_prompt() validates the post-injection prompt token estimate."""
+        from bmad_assist.core.loop.handlers.dev_story import DevStoryHandler
+
+        handler = DevStoryHandler(dev_story_config, project_with_story)
+
+        mock_compiled = MagicMock()
+        mock_compiled.context = "<compiled>test dev-story prompt</compiled>"
+        mock_compiled.token_estimate = 2500
+        inflated_prompt = "<compiled>test dev-story prompt plus git intelligence</compiled>"
+
+        expected_budget = dev_story_config.compiler.source_context.budgets.get_budget(
+            "dev-story"
+        )
+
+        with (
+            patch("bmad_assist.compiler.compile_workflow", return_value=mock_compiled),
+            patch.object(
+                handler, "_inject_git_intelligence", return_value=inflated_prompt
+            ),
+            patch(
+                "bmad_assist.core.loop.handlers.base.estimate_tokens",
+                return_value=3200,
+            ),
+            patch(
+                "bmad_assist.core.loop.handlers.base.validate_token_budget"
+            ) as mock_validate,
+        ):
+            prompt = handler.render_prompt(state_for_dev_story)
+
+            assert prompt == inflated_prompt
+            mock_validate.assert_called_once_with(3200, expected_budget)
+
+    def test_render_prompt_raises_config_error_when_git_injection_pushes_prompt_over_budget(
+        self,
+        dev_story_config: Config,
+        project_with_story: Path,
+        state_for_dev_story: State,
+    ) -> None:
+        """render_prompt() fails fast when git injection pushes the final prompt over budget."""
+        from bmad_assist.core.exceptions import ConfigError, TokenBudgetError
+        from bmad_assist.core.loop.handlers.dev_story import DevStoryHandler
+
+        handler = DevStoryHandler(dev_story_config, project_with_story)
+
+        mock_compiled = MagicMock()
+        mock_compiled.context = "<compiled>test dev-story prompt</compiled>"
+        mock_compiled.token_estimate = 19000
+
+        with (
+            patch("bmad_assist.compiler.compile_workflow", return_value=mock_compiled),
+            patch.object(
+                handler,
+                "_inject_git_intelligence",
+                return_value="<compiled>inflated prompt</compiled>",
+            ),
+            patch(
+                "bmad_assist.core.loop.handlers.base.estimate_tokens",
+                return_value=25001,
+            ),
+            patch(
+                "bmad_assist.core.loop.handlers.base.validate_token_budget",
+                side_effect=TokenBudgetError("Token budget exceeded"),
+            ),
+        ):
+            with pytest.raises(
+                ConfigError, match="Compiled prompt exceeds configured workflow budget"
+            ):
+                handler.render_prompt(state_for_dev_story)
+
+    def test_render_prompt_preserves_compiler_config_error_context(
+        self,
+        dev_story_config: Config,
+        project_with_story: Path,
+        state_for_dev_story: State,
+    ) -> None:
+        """Compiler ConfigError messages should stay workflow-scoped and not be mislabeled."""
+        from bmad_assist.core.loop.handlers.dev_story import DevStoryHandler
+
+        handler = DevStoryHandler(dev_story_config, project_with_story)
+
+        with patch(
+            "bmad_assist.compiler.compile_workflow",
+            side_effect=ConfigError("Compiled prompt exceeds configured workflow budget"),
+        ):
+            with pytest.raises(ConfigError) as exc_info:
+                handler.render_prompt(state_for_dev_story)
+
+        error_msg = str(exc_info.value)
+        assert "Failed to compile workflow: dev-story" in error_msg
+        assert "Compiled prompt exceeds configured workflow budget" in error_msg
+        assert "Unexpected compiler error" not in error_msg
 
     def test_render_prompt_injects_git_intelligence(
         self,

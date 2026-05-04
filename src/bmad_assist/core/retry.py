@@ -24,6 +24,7 @@ def invoke_with_timeout_retry(
     phase_name: str,
     fallback_invoke_fn: Callable[..., T] | None = None,
     fallback_timeout_retries: int | None = None,
+    on_timeout: Callable[[ProviderTimeoutError, int, bool], None] | None = None,
     **kwargs: Any,
 ) -> T:
     """Invoke provider function with timeout retry logic.
@@ -42,6 +43,9 @@ def invoke_with_timeout_retry(
         fallback_invoke_fn: Optional fallback callable (e.g., subprocess provider).
             If primary fails after retries, fallback is invoked with reset retry count.
         fallback_timeout_retries: Retry count for fallback (defaults to timeout_retries).
+        on_timeout: Optional callback invoked on each timeout before retry/fallback/raise.
+            Receives the timeout error, 1-based attempt number, and whether another
+            provider invocation will be attempted.
         **kwargs: Arguments to pass to invoke_fn and fallback_invoke_fn.
 
     Returns:
@@ -72,19 +76,33 @@ def invoke_with_timeout_retry(
         # No retry - invoke once and let timeout propagate
         return invoke_fn(**kwargs)
 
-    # Retry is configured
+    # Retry is configured. A positive retry count means "retries after the
+    # initial attempt", so total attempts are retry_count + 1.
     timeout_attempt = 0
+    max_attempts = None if timeout_retries == 0 else timeout_retries + 1
 
     while True:
         timeout_attempt += 1
+        if timeout_attempt > 1:
+            if max_attempts is None:
+                attempt_status = f"attempt {timeout_attempt} (infinite retry budget)"
+            else:
+                attempt_status = f"attempt {timeout_attempt}/{max_attempts}"
+            logger.info(
+                "Starting provider timeout retry for %s phase (%s)",
+                phase_name,
+                attempt_status,
+            )
 
         try:
             return invoke_fn(**kwargs)
         except ProviderTimeoutError as e:
             # Check retry limit
-            if timeout_retries != 0 and timeout_attempt > timeout_retries:
+            if max_attempts is not None and timeout_attempt >= max_attempts:
                 # Primary retries exhausted - try fallback if available
                 if fallback_invoke_fn is not None:
+                    if on_timeout is not None:
+                        on_timeout(e, timeout_attempt, True)
                     logger.warning(
                         "Primary provider timeout in %s phase after %d attempts, "
                         "starting secondary provider...",
@@ -96,12 +114,15 @@ def invoke_with_timeout_retry(
                         timeout_retries=fallback_timeout_retries if fallback_timeout_retries is not None else timeout_retries,
                         phase_name=f"{phase_name}(fallback)",
                         fallback_invoke_fn=None,  # No second fallback
+                        on_timeout=on_timeout,
                         **kwargs,
                     )
 
                 # No fallback - raise error
+                if on_timeout is not None:
+                    on_timeout(e, timeout_attempt, False)
                 logger.error(
-                    "Provider timeout in %s phase after %d attempts (max %d configured): %s",
+                    "Provider timeout in %s phase after %d attempts (%d retries configured): %s",
                     phase_name,
                     timeout_attempt,
                     timeout_retries,
@@ -113,8 +134,14 @@ def invoke_with_timeout_retry(
             if timeout_retries == 0:
                 retry_status = "infinite retries"
             else:
-                remaining = timeout_retries - timeout_attempt
-                retry_status = f"{remaining} remaining"
+                retry_number = timeout_attempt
+                remaining_after_next = max(timeout_retries - retry_number, 0)
+                retry_status = (
+                    f"retry {retry_number}/{timeout_retries}; "
+                    f"{remaining_after_next} remaining after next attempt"
+                )
+            if on_timeout is not None:
+                on_timeout(e, timeout_attempt, True)
             logger.warning(
                 "Provider timeout in %s phase (attempt %d, %s): %s. Retrying...",
                 phase_name,

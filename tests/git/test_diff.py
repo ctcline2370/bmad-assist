@@ -6,7 +6,6 @@ Tests the P0/P1 fixes for the 92% false positive rate in code reviews:
 - P1: Diff quality validation (warns if too much garbage)
 """
 
-import subprocess
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -99,11 +98,17 @@ class TestPathFiltering:
     """Tests for path filtering in diff (P0)."""
 
     def test_default_exclude_patterns_include_cache_files(self) -> None:
-        """Default exclude patterns include cache, metadata, and BMAD artifact files."""
+        """Default exclude patterns include cache, metadata, and control-plane files."""
         assert "*.cache" in DEFAULT_EXCLUDE_PATTERNS
         assert "*.meta.yaml" in DEFAULT_EXCLUDE_PATTERNS
         assert ".bmad-assist/*" in DEFAULT_EXCLUDE_PATTERNS
         assert "_bmad-output/*" in DEFAULT_EXCLUDE_PATTERNS
+        assert ".agents/*" in DEFAULT_EXCLUDE_PATTERNS
+        assert ".codex/*" in DEFAULT_EXCLUDE_PATTERNS
+        assert ".claude/*" in DEFAULT_EXCLUDE_PATTERNS
+        assert "AGENTS.md" in DEFAULT_EXCLUDE_PATTERNS
+        assert "AGENTS.override.md" in DEFAULT_EXCLUDE_PATTERNS
+        assert "CLAUDE.md" in DEFAULT_EXCLUDE_PATTERNS
         assert "node_modules/*" in DEFAULT_EXCLUDE_PATTERNS
         assert "__pycache__/*" in DEFAULT_EXCLUDE_PATTERNS
 
@@ -124,10 +129,104 @@ class TestPathFiltering:
             result = capture_filtered_diff(tmp_path)
 
         # Verify pathspec exclusions are in the command
-        call_args = mock_run.call_args[0][0]
-        assert any(":(exclude)" in arg for arg in call_args)
-        assert "--no-ext-diff" in call_args
+        commands = [call.args[0] for call in mock_run.call_args_list]
+        git_diff_commands = [
+            command
+            for command in commands
+            if command[:3] == ["git", "diff", "--no-ext-diff"]
+        ]
+        assert any(
+            any(":(exclude)" in arg for arg in command)
+            for command in git_diff_commands
+        )
+        assert any("--no-ext-diff" in command for command in git_diff_commands)
         assert "<!-- GIT_DIFF_START -->" in result
+
+    def test_capture_filtered_diff_compares_base_to_worktree(self, tmp_path: Path) -> None:
+        """capture_filtered_diff includes tracked working-tree changes, not only HEAD."""
+        with (
+            patch("subprocess.run") as mock_run,
+            patch("bmad_assist.git.diff.get_merge_base") as mock_base,
+        ):
+            mock_base.return_value = "merge-base-sha"
+
+            mock_stat = Mock()
+            mock_stat.returncode = 0
+            mock_stat.stdout = " src/main.py | 1 +\n 1 file changed\n"
+
+            mock_patch = Mock()
+            mock_patch.returncode = 0
+            mock_patch.stdout = "diff --git a/src/main.py b/src/main.py\n+code"
+
+            mock_untracked = Mock()
+            mock_untracked.returncode = 0
+            mock_untracked.stdout = ""
+
+            mock_run.side_effect = [mock_stat, mock_patch, mock_untracked]
+
+            result = capture_filtered_diff(tmp_path)
+
+        commands = [call.args[0] for call in mock_run.call_args_list]
+        stat_command = next(command for command in commands if "--stat" in command)
+        patch_command = next(command for command in commands if "-p" in command)
+
+        assert "merge-base-sha" in stat_command
+        assert "HEAD" not in stat_command
+        assert "merge-base-sha" in patch_command
+        assert "HEAD" not in patch_command
+        assert "src/main.py" in result
+
+    def test_capture_filtered_diff_includes_eligible_untracked_files(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """capture_filtered_diff includes untracked source/test files in review context."""
+        new_test = tmp_path / "tests" / "new_test.py"
+        new_test.parent.mkdir()
+        new_test.write_text("def test_new():\n    assert True\n")
+
+        with (
+            patch("subprocess.run") as mock_run,
+            patch("bmad_assist.git.diff.get_merge_base") as mock_base,
+        ):
+            mock_base.return_value = "merge-base-sha"
+
+            mock_stat = Mock()
+            mock_stat.returncode = 0
+            mock_stat.stdout = ""
+
+            mock_patch = Mock()
+            mock_patch.returncode = 0
+            mock_patch.stdout = ""
+
+            mock_untracked = Mock()
+            mock_untracked.returncode = 0
+            mock_untracked.stdout = "tests/new_test.py\0_bmad-output/generated.yaml\0"
+
+            mock_untracked_stat = Mock()
+            mock_untracked_stat.returncode = 1
+            mock_untracked_stat.stdout = " tests/new_test.py | 2 ++\n 1 file changed\n"
+
+            mock_untracked_patch = Mock()
+            mock_untracked_patch.returncode = 1
+            mock_untracked_patch.stdout = (
+                "diff --git a/tests/new_test.py b/tests/new_test.py\n"
+                "new file mode 100644\n"
+                "+def test_new():\n"
+            )
+
+            mock_run.side_effect = [
+                mock_stat,
+                mock_patch,
+                mock_untracked,
+                mock_untracked_stat,
+                mock_untracked_patch,
+            ]
+
+            result = capture_filtered_diff(tmp_path)
+
+        assert "tests/new_test.py" in result
+        assert "_bmad-output/generated.yaml" not in result
 
 
 class TestDiffQualityValidation:
@@ -269,6 +368,9 @@ class TestClassifyFilePriority:
 
     def test_source_file_gets_priority_0(self) -> None:
         """Source code files should get highest priority (0)."""
+        assert _classify_file_priority("src/Program.cs") == 0
+        assert _classify_file_priority("src/Domain.fs") == 0
+        assert _classify_file_priority("src/Legacy.vb") == 0
         assert _classify_file_priority("src/lib/store.ts") == 0
         assert _classify_file_priority("app/main.py") == 0
         assert _classify_file_priority("lib/handler.go") == 0

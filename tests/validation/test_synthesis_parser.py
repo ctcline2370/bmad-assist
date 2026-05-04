@@ -84,7 +84,7 @@ Final section.
         assert result.consensus.false_positive_count == 0
 
     def test_returns_none_when_markers_missing(self, caplog: LogCaptureFixture) -> None:
-        """Returns None with warning when markers not found."""
+        """Returns None with debug note when optional metrics markers are not found."""
         from bmad_assist.validation.synthesis_parser import extract_synthesis_metrics
 
         output_without_markers = """## Synthesis Summary
@@ -93,11 +93,11 @@ This is a synthesis report without metrics markers.
 No JSON here.
 """
 
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.DEBUG):
             result = extract_synthesis_metrics(output_without_markers)
 
         assert result is None
-        assert "Markers not found" in caplog.text
+        assert "METRICS_JSON markers not found" in caplog.text
 
     def test_returns_none_on_invalid_json(self, caplog: LogCaptureFixture) -> None:
         """Returns None with warning when JSON is invalid."""
@@ -376,21 +376,19 @@ class TestSynthesisMetricsDataclass:
 class TestLoggingExcerpt:
     """Test logging includes output excerpt (AC4)."""
 
-    def test_log_includes_output_excerpt_on_missing_markers(
+    def test_log_omits_output_excerpt_on_missing_optional_markers(
         self, caplog: LogCaptureFixture
     ) -> None:
-        """Log includes first 500 chars when markers missing."""
+        """Missing optional metrics markers do not log synthesis output content."""
         from bmad_assist.validation.synthesis_parser import extract_synthesis_metrics
 
         output = "A" * 600  # More than 500 chars
 
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.DEBUG):
             extract_synthesis_metrics(output)
 
-        # Check log message includes excerpt
-        assert "Markers not found" in caplog.text
-        # Excerpt should be truncated to ~500 chars
-        assert "A" * 500 in caplog.text
+        assert "METRICS_JSON markers not found" in caplog.text
+        assert "A" * 500 not in caplog.text
 
 
 class TestCreateSynthesizerRecord:

@@ -17,8 +17,12 @@ from pathlib import Path
 from bmad_assist.compiler.patching.config import get_patcher_config
 from bmad_assist.compiler.patching.transforms import fix_xml_entities, format_transform_prompt
 from bmad_assist.compiler.patching.types import TransformResult
-from bmad_assist.core.exceptions import PatchError
-from bmad_assist.providers.base import BaseProvider
+from bmad_assist.core.exceptions import (
+    NonTransientProviderPatchError,
+    PatchError,
+    ProviderExitCodeError,
+)
+from bmad_assist.providers.base import BaseProvider, is_transient_error
 
 logger = logging.getLogger(__name__)
 
@@ -186,6 +190,26 @@ class PatchSession:
                 ]
 
                 return new_workflow, results
+
+            except ProviderExitCodeError as e:
+                session_error = e
+                if not is_transient_error(e.stderr, e.exit_status):
+                    logger.warning(
+                        "Session failed with non-transient provider exit code: %s",
+                        str(e),
+                    )
+                    raise NonTransientProviderPatchError(
+                        "Non-transient provider error while applying workflow patch: "
+                        f"{e}"
+                    ) from e
+
+                logger.warning(
+                    "Session crashed with transient provider error: %s, attempt %d/%d",
+                    str(e),
+                    attempt + 1,
+                    self.max_retries,
+                )
+                continue
 
             except Exception as e:
                 session_error = e

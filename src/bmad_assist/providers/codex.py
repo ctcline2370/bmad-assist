@@ -29,6 +29,8 @@ Example:
 import contextlib
 import json
 import logging
+import os
+import signal
 import threading
 import time
 from pathlib import Path
@@ -50,7 +52,9 @@ from bmad_assist.providers.base import (
     ProviderResult,
     format_tag,
     is_full_stream,
+    register_child_pgid,
     should_print_progress,
+    unregister_child_pgid,
     validate_settings_file,
     write_progress,
 )
@@ -63,27 +67,38 @@ logger = logging.getLogger(__name__)
 # Default timeout in seconds (5 minutes)
 DEFAULT_TIMEOUT: int = 300
 
-# Maximum prompt length in error messages before truncation
-PROMPT_TRUNCATE_LENGTH: int = 100
-
 # Maximum stderr length in error messages before truncation
 STDERR_TRUNCATE_LENGTH: int = 500
 
+# Long-running Codex turns can be silent for many minutes. Emit metadata-only
+# progress so autonomous runs can see liveness before the hard timeout path.
+IDLE_PROGRESS_MAX_INTERVAL_SECONDS: float = 60.0
+IDLE_PROGRESS_MIN_INTERVAL_SECONDS: float = 5.0
 
-def _truncate_prompt(prompt: str) -> str:
-    """Truncate prompt for error messages.
 
-    Args:
-        prompt: The original prompt text.
+def _idle_progress_interval(timeout_seconds: int) -> float:
+    """Return a bounded interval for provider silence warnings."""
+    return max(
+        IDLE_PROGRESS_MIN_INTERVAL_SECONDS,
+        min(IDLE_PROGRESS_MAX_INTERVAL_SECONDS, timeout_seconds / 4),
+    )
 
-    Returns:
-        Original prompt if <= PROMPT_TRUNCATE_LENGTH chars,
-        otherwise first PROMPT_TRUNCATE_LENGTH chars + "..."
 
-    """
-    if len(prompt) <= PROMPT_TRUNCATE_LENGTH:
-        return prompt
-    return prompt[:PROMPT_TRUNCATE_LENGTH] + "..."
+def _format_timeout_message(
+    timeout_seconds: int,
+    prompt_len: int,
+    partial_result: ProviderResult,
+    thread_id: str | None,
+) -> str:
+    """Build a timeout message without leaking prompt contents."""
+    details = [
+        f"prompt_len={prompt_len}",
+        f"stdout_chars={len(partial_result.stdout)}",
+        f"stderr_chars={len(partial_result.stderr)}",
+    ]
+    if thread_id:
+        details.append(f"thread_id={thread_id}")
+    return f"Codex CLI timeout after {timeout_seconds}s ({', '.join(details)})"
 
 
 class CodexProvider(BaseProvider):
@@ -200,6 +215,7 @@ class CodexProvider(BaseProvider):
         cwd: Path | None = None,
         disable_tools: bool = False,
         allowed_tools: list[str] | None = None,
+        sandbox_mode: str | None = None,
         no_cache: bool = False,
         color_index: int | None = None,
         display_model: str | None = None,
@@ -219,6 +235,8 @@ class CodexProvider(BaseProvider):
         Command Format:
             codex exec "<prompt>" --json --full-auto -m <model>     (normal mode)
             codex exec "<prompt>" --json --sandbox read-only -m <model>  (validator mode)
+            codex exec "<prompt>" --json --sandbox workspace-write -m <model>
+                (explicit writable sandbox)
 
         JSON Event Types:
             - thread.started: Session initialization with thread_id
@@ -239,7 +257,12 @@ class CodexProvider(BaseProvider):
             settings_file: Path to settings file (validated but not used by CLI).
             cwd: Working directory (ignored - Codex CLI doesn't support).
             disable_tools: Disable tools (ignored - Codex CLI doesn't support).
-            allowed_tools: List of allowed tools. When set, uses --sandbox read-only.
+            allowed_tools: List of allowed tools. When set, defaults to
+                --sandbox read-only unless sandbox_mode is explicitly provided.
+            sandbox_mode: Explicit Codex sandbox mode. When set, overrides the
+                implicit read-only sandbox used for allowed_tools and suppresses
+                --full-auto so callers can opt into workspace-write when edits
+                are required inside a guarded tool set.
             no_cache: Disable caching (ignored - Codex CLI doesn't support).
             color_index: Color index for terminal output differentiation.
             reasoning_effort: Reasoning effort level (minimal/low/medium/high/xhigh).
@@ -272,11 +295,19 @@ class CodexProvider(BaseProvider):
         # Validate and resolve settings file
         validated_settings = self._resolve_settings(settings_file, effective_model)
 
-        # Codex CLI uses sandbox modes for tool restrictions
-        use_sandbox = bool(allowed_tools)
-        if use_sandbox:
+        # Codex CLI uses sandbox modes for tool restrictions. Explicit sandbox
+        # selection wins so callers can request workspace-write for synthesis.
+        effective_sandbox = sandbox_mode
+        if effective_sandbox is None and allowed_tools:
+            effective_sandbox = "read-only"
             logger.debug(
                 "Codex CLI: using --sandbox read-only for tool restriction (requested: %s)",
+                allowed_tools,
+            )
+        elif effective_sandbox is not None:
+            logger.debug(
+                "Codex CLI: using explicit sandbox mode %s (requested tools: %s)",
+                effective_sandbox,
                 allowed_tools,
             )
 
@@ -286,7 +317,7 @@ class CodexProvider(BaseProvider):
             effective_timeout,
             len(prompt),
             validated_settings,
-            "read-only" if use_sandbox else "none",
+            effective_sandbox or "none",
         )
 
         # Validate reasoning_effort if provided
@@ -304,8 +335,8 @@ class CodexProvider(BaseProvider):
         # (Linux MAX_ARG_STRLEN is 128KB per argument, compiled prompts exceed this)
         command: list[str] = ["codex", "exec", "--json"]
 
-        if use_sandbox:
-            command.extend(["--sandbox", "read-only"])
+        if effective_sandbox is not None:
+            command.extend(["--sandbox", effective_sandbox])
         else:
             command.append("--full-auto")
 
@@ -315,16 +346,9 @@ class CodexProvider(BaseProvider):
         if reasoning_effort is not None:
             command.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
 
-        # For ProviderResult, store original command structure
-        original_command: tuple[str, ...] = (
-            "codex",
-            "exec",
-            prompt[:100] + "..." if len(prompt) > 100 else prompt,
-            "--json",
-            "--sandbox" if use_sandbox else "--full-auto",
-            "-m",
-            effective_model,
-        )
+        # Persist the actual executed argv. The prompt is written via stdin and
+        # must never be reintroduced into ProviderResult metadata.
+        original_command: tuple[str, ...] = tuple(command)
 
         if validated_settings is not None:
             logger.debug(
@@ -342,6 +366,7 @@ class CodexProvider(BaseProvider):
         thread_id: str | None = None
 
         start_time = time.perf_counter()
+        child_pgid: int | None = None
 
         try:
             process = Popen(
@@ -355,6 +380,11 @@ class CodexProvider(BaseProvider):
                 cwd=cwd,  # Use target project directory, not bmad-assist cwd
                 start_new_session=True,  # Own process group for safe termination
             )
+            try:
+                child_pgid = os.getpgid(process.pid)
+                register_child_pgid(child_pgid)
+            except (ProcessLookupError, PermissionError, OSError, TypeError):
+                logger.debug("Unable to register Codex child process group", exc_info=True)
 
             def process_json_stream(
                 stream: Any,
@@ -456,10 +486,12 @@ class CodexProvider(BaseProvider):
                     debug_json_logger,
                     color_index,
                 ),
+                daemon=True,
             )
             stderr_thread = threading.Thread(
                 target=read_stderr,
                 args=(process.stderr, stderr_chunks, color_index),
+                daemon=True,
             )
             stdout_thread.start()
             stderr_thread.start()
@@ -483,43 +515,158 @@ class CodexProvider(BaseProvider):
             stdin_thread = threading.Thread(
                 target=write_stdin,
                 args=(process.stdin, prompt),
+                daemon=True,
             )
             stdin_thread.start()
 
-            # Wait for process with timeout
-            try:
-                returncode = process.wait(timeout=effective_timeout)
-            except TimeoutExpired:
-                process.kill()
+            # Wait for process with timeout and cooperative cancellation.
+            deadline = start_time + effective_timeout
+            returncode: int | None = None
+            cancelled = False
+            idle_progress_interval = _idle_progress_interval(effective_timeout)
+            last_activity_at = start_time
+            next_idle_log_at = start_time + idle_progress_interval
+            last_stdout_line_count = 0
+            last_stderr_chunk_count = 0
+
+            while True:
+                now = time.perf_counter()
+                stdout_line_count = len(raw_stdout_lines)
+                stderr_chunk_count = len(stderr_chunks)
+                if (
+                    stdout_line_count != last_stdout_line_count
+                    or stderr_chunk_count != last_stderr_chunk_count
+                ):
+                    last_activity_at = now
+                    next_idle_log_at = now + idle_progress_interval
+                    last_stdout_line_count = stdout_line_count
+                    last_stderr_chunk_count = stderr_chunk_count
+                elif now >= next_idle_log_at:
+                    elapsed_seconds = int(now - start_time)
+                    idle_seconds = int(now - last_activity_at)
+                    logger.warning(
+                        "Codex CLI still running with no new output: "
+                        "provider=%s, model=%s, elapsed_seconds=%d, "
+                        "idle_seconds=%d, timeout=%ds, prompt_len=%d, "
+                        "stdout_chars=%d, stderr_chars=%d, thread_id=%s",
+                        self.provider_name,
+                        effective_model,
+                        elapsed_seconds,
+                        idle_seconds,
+                        effective_timeout,
+                        len(prompt),
+                        sum(len(line) for line in raw_stdout_lines),
+                        sum(len(chunk) for chunk in stderr_chunks),
+                        thread_id or "-",
+                    )
+                    next_idle_log_at = now + idle_progress_interval
+
+                if cancel_token is not None and cancel_token.is_set():
+                    logger.info("Cancel token set, terminating Codex subprocess")
+                    cancelled = True
+                    if child_pgid is not None:
+                        with contextlib.suppress(
+                            ProcessLookupError,
+                            PermissionError,
+                            OSError,
+                        ):
+                            os.killpg(child_pgid, signal.SIGKILL)
+                    else:
+                        with contextlib.suppress(
+                            ProcessLookupError,
+                            PermissionError,
+                            OSError,
+                        ):
+                            process.kill()
+                    with contextlib.suppress(
+                        TimeoutExpired,
+                        ProcessLookupError,
+                        OSError,
+                    ):
+                        process.wait(timeout=1)
+                    returncode = -15
+                    break
+
+                if now >= deadline:
+                    if child_pgid is not None:
+                        with contextlib.suppress(
+                            ProcessLookupError,
+                            PermissionError,
+                            OSError,
+                        ):
+                            os.killpg(child_pgid, signal.SIGKILL)
+                    else:
+                        with contextlib.suppress(
+                            ProcessLookupError,
+                            PermissionError,
+                            OSError,
+                        ):
+                            process.kill()
+                    with contextlib.suppress(
+                        TimeoutExpired,
+                        ProcessLookupError,
+                        OSError,
+                    ):
+                        process.wait(timeout=1)
+                    stdin_thread.join(timeout=1)
+                    stdout_thread.join(timeout=1)
+                    stderr_thread.join(timeout=1)
+                    duration_ms = int((now - start_time) * 1000)
+
+                    partial_result = ProviderResult(
+                        stdout="".join(response_text_parts),
+                        stderr="".join(stderr_chunks),
+                        exit_code=-1,
+                        duration_ms=duration_ms,
+                        model=effective_model,
+                        command=original_command,
+                    )
+                    timeout_message = _format_timeout_message(
+                        timeout_seconds=effective_timeout,
+                        prompt_len=len(prompt),
+                        partial_result=partial_result,
+                        thread_id=thread_id,
+                    )
+
+                    logger.warning(
+                        "Provider timeout: provider=%s, model=%s, timeout=%ds, "
+                        "duration_ms=%d, prompt_len=%d, stdout_chars=%d, "
+                        "stderr_chars=%d, thread_id=%s",
+                        self.provider_name,
+                        effective_model,
+                        effective_timeout,
+                        duration_ms,
+                        len(prompt),
+                        len(partial_result.stdout),
+                        len(partial_result.stderr),
+                        thread_id or "-",
+                    )
+
+                    raise ProviderTimeoutError(
+                        timeout_message,
+                        partial_result=partial_result,
+                    ) from None
+
+                try:
+                    returncode = process.wait(timeout=0.5)
+                    break
+                except TimeoutExpired:
+                    continue
+
+            if cancelled:
                 stdin_thread.join(timeout=1)
                 stdout_thread.join(timeout=1)
                 stderr_thread.join(timeout=1)
                 duration_ms = int((time.perf_counter() - start_time) * 1000)
-                truncated = _truncate_prompt(prompt)
-
-                partial_result = ProviderResult(
+                return ProviderResult(
                     stdout="".join(response_text_parts),
-                    stderr="".join(stderr_chunks),
-                    exit_code=-1,
+                    stderr="Cancelled by orchestration",
+                    exit_code=-15,
                     duration_ms=duration_ms,
                     model=effective_model,
                     command=original_command,
+                    provider_session_id=debug_json_logger.provider_session_id,
                 )
-
-                logger.warning(
-                    "Provider timeout: provider=%s, model=%s, timeout=%ds, "
-                    "duration_ms=%d, prompt=%s",
-                    self.provider_name,
-                    effective_model,
-                    effective_timeout,
-                    duration_ms,
-                    truncated,
-                )
-
-                raise ProviderTimeoutError(
-                    f"Codex CLI timeout after {effective_timeout}s: {truncated}",
-                    partial_result=partial_result,
-                ) from None
 
             # Wait for threads to finish (timeout prevents hang if reader stuck)
             stdin_thread.join(timeout=5)
@@ -530,6 +677,8 @@ class CodexProvider(BaseProvider):
             logger.error("Codex CLI not found in PATH")
             raise ProviderError("Codex CLI not found. Is 'codex' in PATH?") from e
         finally:
+            if child_pgid is not None:
+                unregister_child_pgid(child_pgid)
             debug_json_logger.close()
 
         duration_ms = int((time.perf_counter() - start_time) * 1000)

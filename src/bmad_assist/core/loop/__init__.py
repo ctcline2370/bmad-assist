@@ -66,10 +66,12 @@ from bmad_assist.core.loop.signals import (
     _handle_sigint,
     _handle_sigterm,
     get_received_signal,
+    register_pre_exit_cleanup,
     register_signal_handlers,
     request_shutdown,
     reset_shutdown,
     shutdown_requested,
+    unregister_pre_exit_cleanup,
     unregister_signal_handlers,
 )
 
@@ -121,8 +123,10 @@ __all__ = [
     "request_shutdown",
     "reset_shutdown",
     "get_received_signal",
+    "register_pre_exit_cleanup",
     "register_signal_handlers",
     "unregister_signal_handlers",
+    "unregister_pre_exit_cleanup",
     "_get_interrupt_exit_reason",
     "_handle_sigint",
     "_handle_sigterm",

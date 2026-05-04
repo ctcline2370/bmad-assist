@@ -5,19 +5,17 @@ file path extraction, retry behavior, guard stats, and edge cases.
 """
 
 import dataclasses
+import signal
 import subprocess
 import threading
 import time
-
-import pytest
+from unittest.mock import MagicMock, patch
 
 from bmad_assist.providers.tool_guard import (
-    GuardStats,
-    GuardVerdict,
     ToolCallGuard,
     start_guard_monitor,
+    terminate_process_tree,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -479,6 +477,61 @@ class TestGuardCounting:
 
 class TestGuardMonitorHelper:
     """start_guard_monitor() kills on signal, cleans up."""
+
+    def test_terminates_isolated_process_group(self):
+        """Process-group children are terminated as a group."""
+        process = MagicMock()
+        process.pid = 12345
+        process.poll.return_value = None
+        process.wait.return_value = None
+
+        with (
+            patch("bmad_assist.providers.tool_guard.os.getpgid", return_value=4321),
+            patch("bmad_assist.providers.tool_guard.os.getpgrp", return_value=9999),
+            patch("bmad_assist.providers.tool_guard.os.killpg") as killpg,
+        ):
+            terminate_process_tree(process)
+
+        killpg.assert_called_once_with(4321, signal.SIGTERM)
+        process.terminate.assert_not_called()
+        process.kill.assert_not_called()
+
+    def test_escalates_isolated_process_group_to_sigkill(self):
+        """Unresponsive process groups are escalated to SIGKILL."""
+        process = MagicMock()
+        process.pid = 12345
+        process.poll.return_value = None
+        process.wait.side_effect = subprocess.TimeoutExpired(cmd=["mock"], timeout=3)
+
+        with (
+            patch("bmad_assist.providers.tool_guard.os.getpgid", return_value=4321),
+            patch("bmad_assist.providers.tool_guard.os.getpgrp", return_value=9999),
+            patch("bmad_assist.providers.tool_guard.os.killpg") as killpg,
+        ):
+            terminate_process_tree(process)
+
+        killpg.assert_any_call(4321, signal.SIGTERM)
+        killpg.assert_any_call(4321, signal.SIGKILL)
+        process.terminate.assert_not_called()
+        process.kill.assert_not_called()
+
+    def test_falls_back_when_process_is_not_isolated(self):
+        """The current process group is never signaled as a group."""
+        process = MagicMock()
+        process.pid = 12345
+        process.poll.return_value = None
+        process.wait.return_value = None
+
+        with (
+            patch("bmad_assist.providers.tool_guard.os.getpgid", return_value=4321),
+            patch("bmad_assist.providers.tool_guard.os.getpgrp", return_value=4321),
+            patch("bmad_assist.providers.tool_guard.os.killpg") as killpg,
+        ):
+            terminate_process_tree(process)
+
+        killpg.assert_not_called()
+        process.terminate.assert_called_once_with()
+        process.kill.assert_not_called()
 
     def test_kills_on_signal(self):
         """Monitor kills process when kill_event is set."""

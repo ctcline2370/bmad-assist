@@ -89,6 +89,18 @@ def has_ruamel() -> bool:
     return True
 
 
+def _current_utc_timestamp() -> datetime:
+    """Return the current UTC timestamp for metadata fields."""
+    return datetime.now(UTC).replace(tzinfo=None, microsecond=0)
+
+
+def _format_utc_metadata_timestamp(value: datetime) -> str:
+    """Format a metadata timestamp as explicit UTC with a trailing Z."""
+    if value.tzinfo is not None:
+        value = value.astimezone(UTC).replace(tzinfo=None)
+    return f"{value.isoformat(timespec='seconds')}Z"
+
+
 # =============================================================================
 # Comment Loading (Task 4)
 # =============================================================================
@@ -193,6 +205,8 @@ def _build_output_data(
     data: dict[str, Any] = {
         "generated": status.metadata.generated.isoformat(),
     }
+    if status.metadata.last_updated:
+        data["last_updated"] = _format_utc_metadata_timestamp(status.metadata.last_updated)
 
     # Add optional metadata fields if present
     if status.metadata.project:
@@ -402,6 +416,7 @@ def _write_with_ruamel(
 
             # Update metadata fields in-place
             output_data["generated"] = data["generated"]
+            output_data["last_updated"] = data["last_updated"]
             for meta_key in ["project", "project_key", "tracking_system", "story_location"]:
                 if meta_key in data:
                     output_data[meta_key] = data[meta_key]
@@ -441,6 +456,7 @@ def _write_with_ruamel(
 
             # Add metadata
             output_data["generated"] = data["generated"]
+            output_data["last_updated"] = data["last_updated"]
             for meta_key in ["project", "project_key", "tracking_system", "story_location"]:
                 if meta_key in data:
                     output_data[meta_key] = data[meta_key]
@@ -583,6 +599,8 @@ def write_sprint_status(
     """
     path = Path(path).expanduser()
     project = status.metadata.project
+    metadata = status.metadata.model_copy(update={"last_updated": _current_utc_timestamp()})
+    status_to_write = status.model_copy(update={"metadata": metadata})
 
     # Load original comments if requested and ruamel available
     original_data: CommentedMap | None = None
@@ -598,7 +616,7 @@ def write_sprint_status(
                 original_data = original_data_result
 
     # Build output data structure
-    data = _build_output_data(status, comments)
+    data = _build_output_data(status_to_write, comments)
 
     # Choose backend - ruamel.yaml is required, so always use it when preserving comments
     if preserve_comments:

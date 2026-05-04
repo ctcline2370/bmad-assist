@@ -19,7 +19,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from bmad_assist.compiler.shared_utils import estimate_tokens
-from bmad_assist.testarch.paths import get_artifact_dir, validate_artifact_path
+from bmad_assist.testarch.paths import (
+    get_artifact_dir,
+    get_artifact_search_dirs,
+    validate_artifact_path,
+)
 
 if TYPE_CHECKING:
     from bmad_assist.core.types import EpicId
@@ -35,21 +39,42 @@ class BaseResolver(ABC):
     content loading with token budget management.
 
     Attributes:
-        _base_path: Base directory for artifact search.
+        _base_path: Primary base directory for artifact search.
+        _base_paths: Ordered base directories for artifact search.
         _max_tokens: Maximum tokens for this resolver's artifacts.
 
     """
 
-    def __init__(self, base_path: Path, max_tokens: int) -> None:
+    def __init__(self, base_path: Path | list[Path] | tuple[Path, ...], max_tokens: int) -> None:
         """Initialize resolver.
 
         Args:
-            base_path: Base directory for artifact search (usually testarch/).
+            base_path: Base directory or ordered base directories for artifact search.
             max_tokens: Maximum tokens budget for this resolver.
 
         """
-        self._base_path = base_path
+        if isinstance(base_path, Path):
+            base_paths = [base_path]
+        else:
+            base_paths = [Path(path) for path in base_path]
+
+        self._base_paths = self._dedupe_base_paths(base_paths)
+        self._base_path = self._base_paths[0]
         self._max_tokens = max_tokens
+
+    def _dedupe_base_paths(self, base_paths: list[Path]) -> tuple[Path, ...]:
+        """Return base paths with duplicates removed while preserving order."""
+        result: list[Path] = []
+        seen: set[Path] = set()
+        for base_path in base_paths:
+            resolved = base_path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            result.append(base_path)
+        if not result:
+            result.append(Path(".").resolve())
+        return tuple(result)
 
     @property
     @abstractmethod
@@ -131,12 +156,12 @@ class BaseResolver(ABC):
             - Skips empty files with warning
 
         """
-        # F17: Path traversal protection
-        if not validate_artifact_path(path, self._base_path):
+        # F17: Path traversal protection across every configured search root.
+        if not any(validate_artifact_path(path, base_path) for base_path in self._base_paths):
             logger.warning(
-                "Path traversal attempt blocked: %s (outside %s)",
+                "Path traversal attempt blocked: %s (outside TEA search roots: %s)",
                 path,
-                self._base_path,
+                ", ".join(str(base_path) for base_path in self._base_paths),
             )
             return None
 
@@ -167,12 +192,24 @@ class BaseResolver(ABC):
             List of matching paths, sorted by name.
 
         """
-        search_path = self._base_path / subdir if subdir else self._base_path
-        if not search_path.exists():
-            logger.debug("Search path does not exist: %s", search_path)
-            return []
+        search_subdirs = get_artifact_search_dirs(self.artifact_type) if subdir else [""]
+        matches: list[Path] = []
+        seen_paths: set[Path] = set()
 
-        matches = sorted(search_path.glob(pattern))
+        for base_path in self._base_paths:
+            for search_subdir in search_subdirs:
+                search_path = base_path / search_subdir if search_subdir else base_path
+                if not search_path.exists():
+                    logger.debug("Search path does not exist: %s", search_path)
+                    continue
+
+                for match in sorted(search_path.glob(pattern)):
+                    resolved = match.resolve()
+                    if resolved in seen_paths:
+                        continue
+                    seen_paths.add(resolved)
+                    matches.append(match)
+
         return matches
 
     def _get_artifact_dir(self) -> str:

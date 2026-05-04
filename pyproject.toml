@@ -107,6 +107,7 @@ addopts = "-v --tb=short --ignore=tests/fixtures -m \"not slow\""
 # LLM-optimized (token-saving): pytest -q --tb=line --no-header
 markers = [
     "real_debug_logger: mark test to use real DebugJsonLogger instead of mock",
+    "real_patch_compilation: mark test to use real patch compilation instead of mock",
     "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
     "slow: marks tests as slow (>5s) - deselect with '-m \"not slow\"'",
 ]

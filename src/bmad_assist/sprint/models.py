@@ -81,6 +81,7 @@ class SprintStatusMetadata(BaseModel):
 
     Attributes:
         generated: Timestamp when status was generated (required).
+        last_updated: Timestamp when status was last written.
         project: Project name.
         project_key: Short project identifier.
         tracking_system: Tracking system name (e.g., "BMAD").
@@ -96,6 +97,10 @@ class SprintStatusMetadata(BaseModel):
     generated: datetime = Field(
         ...,
         description="Timestamp when sprint-status was generated (UTC)",
+    )
+    last_updated: datetime | None = Field(
+        None,
+        description="Timestamp when sprint-status was last written (UTC)",
     )
     project: str | None = Field(
         None,
@@ -277,6 +282,8 @@ class SprintStatus(BaseModel):
         data: dict[str, object] = {
             "generated": self.metadata.generated.isoformat(),
         }
+        if self.metadata.last_updated:
+            data["last_updated"] = self.metadata.last_updated.isoformat()
 
         # Add optional metadata fields if present
         if self.metadata.project:

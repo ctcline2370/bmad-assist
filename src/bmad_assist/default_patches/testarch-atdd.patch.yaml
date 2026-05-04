@@ -66,6 +66,6 @@ validation:
   must_contain:
     - "/[Aa]cceptance/"
     - "/[Tt]est/"
-    - "<step"
+    - "/^##\\s+Step\\s+1[:.]/"
   must_not_contain:
     - "{installed_path}"

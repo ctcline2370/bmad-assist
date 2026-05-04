@@ -268,6 +268,19 @@ class TestLoopConfigModel:
         assert config.story == ["atdd", "dev_story"]
         assert config.epic_teardown == ["trace"]
 
+    def test_fail_on_unresolved_negative_code_review_defaults_to_true(self) -> None:
+        """Runs fail closed by default once negative review rework is exhausted."""
+        config = LoopConfig(story=["dev_story"])
+        assert config.fail_on_unresolved_negative_code_review is True
+
+    def test_fail_on_unresolved_negative_code_review_can_be_disabled(self) -> None:
+        """Projects can explicitly opt back into legacy fail-open behavior."""
+        config = LoopConfig(
+            story=["dev_story"],
+            fail_on_unresolved_negative_code_review=False,
+        )
+        assert config.fail_on_unresolved_negative_code_review is False
+
 
 # =============================================================================
 # Test Exports

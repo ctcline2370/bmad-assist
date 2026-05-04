@@ -1001,5 +1001,6 @@ def accelerated_time():
     with (
         patch("bmad_assist.providers.claude.time.perf_counter", side_effect=mock_perf_counter),
         patch("bmad_assist.providers.claude.time.sleep"),
+        patch("bmad_assist.providers.codex.time.perf_counter", side_effect=mock_perf_counter),
     ):
         yield

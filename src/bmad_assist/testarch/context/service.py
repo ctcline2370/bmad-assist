@@ -167,28 +167,61 @@ class TEAContextService:
             ),
         )
 
-    def _get_base_path(self) -> Path:
-        """Get base path for TEA artifacts.
+    def _get_base_paths(self) -> list[Path]:
+        """Get base paths for TEA artifacts.
 
         Returns:
-            Path to implementation_artifacts (output_folder).
-            Resolvers handle subdirectory navigation themselves.
+            Ordered paths to implementation_artifacts and output_folder.
+            Resolvers handle artifact-specific subdirectory navigation.
 
         """
         # Try paths singleton first
         try:
             from bmad_assist.core.paths import get_paths
 
-            path = get_paths().implementation_artifacts
-            logger.debug("TEA base path (from paths singleton): %s", path)
-            return path
+            paths = get_paths()
+            candidates = [
+                paths.implementation_artifacts,
+                paths.output_folder,
+                self._context.output_folder,
+                *self._artifact_root_fallbacks(
+                    paths.implementation_artifacts,
+                    self._context.output_folder,
+                ),
+            ]
+            logger.debug("TEA base paths (from paths singleton): %s", candidates)
+            return self._dedupe_paths(candidates)
         except RuntimeError:
             # Paths not initialized - use context output_folder as fallback
-            logger.debug(
-                "TEA base path (fallback to output_folder): %s",
+            candidates = [
                 self._context.output_folder,
+                *self._artifact_root_fallbacks(self._context.output_folder),
+            ]
+            logger.debug(
+                "TEA base paths (fallback to output_folder): %s",
+                candidates,
             )
-            return self._context.output_folder
+            return self._dedupe_paths(candidates)
+
+    def _artifact_root_fallbacks(self, *paths: Path) -> list[Path]:
+        """Return sibling artifact roots for implementation-artifact bases."""
+        fallbacks: list[Path] = []
+        for path in paths:
+            if path.name == "implementation-artifacts":
+                fallbacks.append(path.parent)
+        return fallbacks
+
+    def _dedupe_paths(self, paths: list[Path]) -> list[Path]:
+        """Return paths with duplicates removed while preserving order."""
+        result: list[Path] = []
+        seen: set[Path] = set()
+        for path in paths:
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            result.append(path)
+        return result
 
     def _get_epic_id(self) -> EpicId:
         """Get current epic ID from resolved variables."""
@@ -260,7 +293,7 @@ class TEAContextService:
         # Get context variables (F2: handles int|str epic IDs)
         epic_id = self._get_epic_id()
         story_id = self._get_story_id()
-        base_path = self._get_base_path()
+        base_paths = self._get_base_paths()
 
         # Track total tokens used
         total_tokens = 0
@@ -284,12 +317,12 @@ class TEAContextService:
                 if self._workflow_name == "dev_story":
                     max_files = min(max_files, DEV_STORY_ATDD_MAX_FILES)
                 resolver = ATDDResolver(
-                    base_path,
+                    base_paths,
                     artifact_budget,
                     max_files=max_files,
                 )
             else:
-                resolver = resolver_cls(base_path, artifact_budget)
+                resolver = resolver_cls(base_paths, artifact_budget)
 
             try:
                 artifacts = resolver.resolve(epic_id, story_id)

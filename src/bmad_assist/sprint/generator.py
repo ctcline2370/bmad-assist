@@ -24,7 +24,12 @@ import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from bmad_assist.bmad.parser import EpicDocument, EpicStory, parse_epic_file
+from bmad_assist.bmad.parser import (
+    EpicDocument,
+    EpicStory,
+    is_non_epic_section_id,
+    parse_epic_file,
+)
 from bmad_assist.bmad.sharding import load_sharded_epics, resolve_doc_path
 from bmad_assist.core.exceptions import ParserError
 from bmad_assist.core.types import EpicId
@@ -323,6 +328,14 @@ def _parse_multi_epic_file(path: Path) -> list[EpicDocument]:
         # We need to extract epic_num and title from the header match
         raw_num = match.group(1)
         title = match.group(2).strip()
+
+        if is_non_epic_section_id(raw_num):
+            logger.debug(
+                "Skipping non-epic section heading in %s: Epic %s",
+                path,
+                raw_num,
+            )
+            continue
 
         # Try to convert epic_num to int
         epic_num: int | str

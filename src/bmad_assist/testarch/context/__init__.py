@@ -23,7 +23,7 @@ Configuration:
           code_review:
             include: [test-design]
           code_review_synthesis:
-            include: [test-review]
+            include: [atdd]
           retrospective:
             include: [trace]
 """
@@ -32,6 +32,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from bmad_assist.core.exceptions import ConfigError
 from bmad_assist.testarch.context.config import (
     TEAContextConfig,
     TEAContextWorkflowConfig,
@@ -55,6 +56,16 @@ def __getattr__(name: str) -> object:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def _get_testarch_config() -> object | None:
+    """Return loaded testarch config when the project config has been initialized."""
+    try:
+        from bmad_assist.core.config.loaders import get_config
+
+        return getattr(get_config(), "testarch", None)
+    except ConfigError:
+        return None
+
+
 def is_tea_context_enabled(context: CompilerContext) -> bool:
     """Check if TEA context is configured and enabled (F1 Fix: DRY helper).
 
@@ -65,9 +76,7 @@ def is_tea_context_enabled(context: CompilerContext) -> bool:
         True if TEA context is configured and enabled, False otherwise.
 
     """
-    testarch_config = getattr(context, "config", None)
-    if testarch_config:
-        testarch_config = getattr(testarch_config, "testarch", None)
+    testarch_config = _get_testarch_config()
 
     return (
         testarch_config is not None
@@ -106,10 +115,7 @@ def collect_tea_context(
     if not is_tea_context_enabled(context):
         return {}
 
-    # Get testarch config for service
-    testarch_config = getattr(context, "config", None)
-    if testarch_config:
-        testarch_config = getattr(testarch_config, "testarch", None)
+    testarch_config = _get_testarch_config()
 
     # Import service here to avoid circular import at module level
     from bmad_assist.testarch.context.service import TEAContextService

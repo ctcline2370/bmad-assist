@@ -299,7 +299,7 @@ class CursorAgentProvider(BaseProvider):
                         except OSError:
                             pass
 
-                stdin_thread = threading.Thread(target=_write_stdin)
+                stdin_thread = threading.Thread(target=_write_stdin, daemon=True)
                 stdin_thread.start()
 
                 if should_print_progress():

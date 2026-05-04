@@ -241,7 +241,7 @@ class QaRemediateHandler(BaseHandler):
                 prompt = self._build_remediate_prompt(
                     new_issues, fixed_files, epic_id, safety_cap,
                 )
-                result = self.invoke_provider(prompt)
+                result = self.invoke_provider(prompt, state=state)
 
                 # 4. Track modified files
                 new_fixed = extract_modified_files(result.stdout)
