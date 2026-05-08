@@ -88,6 +88,11 @@ class ToolGuardConfig(BaseModel):
         max_total_calls: Hard cap on total tool calls per invocation.
         max_interactions_per_file: Max combined read+write+edit per file path.
         max_calls_per_minute: Sliding-window rate cap (calls per 60s).
+        per_tenant_max_tokens: Per-run token budget for each tool guard tenant.
+        tenant_credit_window: Accounting window for tenant token credits.
+        tenant_circuit_breaker_threshold: Fraction of tenant budget that triggers warnings.
+        diagnostics_enabled: Whether to emit tool guard diagnostics.
+        diagnostics_enabled_env: Environment variable override for diagnostics.
 
     """
 
@@ -110,6 +115,34 @@ class ToolGuardConfig(BaseModel):
         ge=1,
         description="Sliding-window rate cap (calls per 60s)",
         json_schema_extra={"security": "safe", "ui_widget": "number"},
+    )
+    per_tenant_max_tokens: int = Field(
+        default=20_000,
+        ge=1,
+        description="Per-run token budget for each tool guard tenant",
+        json_schema_extra={"security": "safe", "ui_widget": "number"},
+    )
+    tenant_credit_window: str = Field(
+        default="per_run",
+        description="Accounting window for tenant token credits",
+        json_schema_extra={"security": "safe", "ui_widget": "text"},
+    )
+    tenant_circuit_breaker_threshold: float = Field(
+        default=0.8,
+        ge=0.0,
+        le=1.0,
+        description="Fraction of tenant budget that triggers circuit-breaker diagnostics",
+        json_schema_extra={"security": "safe", "ui_widget": "number"},
+    )
+    diagnostics_enabled: bool = Field(
+        default=False,
+        description="Emit tool guard diagnostic details",
+        json_schema_extra={"security": "safe", "ui_widget": "toggle"},
+    )
+    diagnostics_enabled_env: str = Field(
+        default="BMAD_ASSIST_DIAGNOSTICS_ENABLED",
+        description="Environment variable that enables tool guard diagnostics",
+        json_schema_extra={"security": "safe", "ui_widget": "text"},
     )
 
 

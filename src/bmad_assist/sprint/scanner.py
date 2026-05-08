@@ -1,17 +1,20 @@
 """Artifact scanner and index for evidence-based status inference.
 
 This module provides functionality to scan project artifact directories and
-build an index of story files, code reviews, validations, and retrospectives.
+build an index of story files, code reviews, validations, test reviews, and
+retrospectives.
 The index enables evidence-based status inference in the reconciliation engine.
 
 Artifact locations (scanned in order, new location takes precedence):
-1. Legacy: docs/sprint-artifacts/{stories,code-reviews,story-validations,retrospectives}
+1. Legacy: docs/sprint-artifacts/{stories,code-reviews,story-validations,test-reviews,retrospectives}
 2. New: _bmad-output/implementation-artifacts/{stories,code-reviews,...}
+3. Handler output: _bmad-output/test-reviews
 
 Public API:
     - StoryArtifact: Dataclass for story file metadata
     - CodeReviewArtifact: Dataclass for code review file metadata
     - ValidationArtifact: Dataclass for validation report metadata
+    - TestReviewArtifact: Dataclass for test-review report metadata
     - RetrospectiveArtifact: Dataclass for retrospective file metadata
     - ArtifactIndex: Container with indexed artifacts and query methods
 """
@@ -32,6 +35,7 @@ __all__ = [
     "StoryArtifact",
     "CodeReviewArtifact",
     "ValidationArtifact",
+    "TestReviewArtifact",
     "RetrospectiveArtifact",
     "ArtifactIndex",
 ]
@@ -91,6 +95,23 @@ LEGACY_VALIDATION_PATTERN = re.compile(
 # Examples: epic-15-retro-20260106.md, epic-testarch-retro-20260105.md
 RETRO_PATTERN = re.compile(
     r"^epic-(?P<epic_id>[a-z0-9-]+)-retro(?:spective)?(?:-(?P<timestamp>[\dT_]*))?\.md$",
+    re.IGNORECASE,
+)
+
+# Test review: test-review-{epic}-{story}[-timestamp].md
+# Examples: test-review-20-4.md, test-review-20-4-20260107T130000Z.md
+TEST_REVIEW_PATTERN = re.compile(
+    r"^test-review-(?P<epic>[a-z0-9-]+?)-(?P<story>\d+)"
+    r"(?:-(?P<timestamp>\d[\dT_Z-]*))?\.md$",
+    re.IGNORECASE,
+)
+
+# Backward-compatible test review form emitted by earlier handlers:
+# test-review-{epic}-{epic}.{story}[-timestamp].md
+# Also accepts test-review-{epic}.{story}.md when reports were named by dotted story id only.
+DOTTED_TEST_REVIEW_PATTERN = re.compile(
+    r"^test-review-(?:(?P<epic>[a-z0-9-]+)-)?(?P<story>[a-z0-9-]+\.\d+)"
+    r"(?:-(?P<timestamp>\d[\dT_Z-]*))?\.md$",
     re.IGNORECASE,
 )
 
@@ -207,6 +228,24 @@ class RetrospectiveArtifact:
     timestamp: str | None
 
 
+@dataclass(frozen=True)
+class TestReviewArtifact:
+    """Represents a discovered test-review report.
+
+    Attributes:
+        path: Absolute path to the test-review file.
+        story_key: Short story key extracted from filename (e.g., "20-1").
+        timestamp: Timestamp from filename, if present.
+        quality_score: Extracted quality score from report content, if present.
+
+    """
+
+    path: Path
+    story_key: str
+    timestamp: str | None
+    quality_score: int | None
+
+
 # ============================================================================
 # Helper Functions
 # ============================================================================
@@ -247,6 +286,37 @@ def _normalize_story_key(story_key: str) -> str:
     return story_key.lower()
 
 
+def _compose_story_key(epic: str | None, story: str) -> str:
+    """Compose a normalized short story key from epic and story fragments."""
+    story_key = story.replace(".", "-").lower()
+    if not epic:
+        return story_key
+
+    epic_key = epic.lower()
+    if story_key.startswith(f"{epic_key}-"):
+        return story_key
+    return f"{epic_key}-{story_key}"
+
+
+def _parse_test_review_filename(filename: str) -> tuple[str, str | None] | None:
+    """Parse test-review filenames into a normalized story key and timestamp."""
+    match = TEST_REVIEW_PATTERN.match(filename)
+    if match:
+        return (
+            _compose_story_key(match.group("epic"), match.group("story")),
+            match.group("timestamp"),
+        )
+
+    match = DOTTED_TEST_REVIEW_PATTERN.match(filename)
+    if match:
+        return (
+            _compose_story_key(match.group("epic"), match.group("story")),
+            match.group("timestamp"),
+        )
+
+    return None
+
+
 def _extract_story_status(path: Path) -> str | None:
     """Extract Status: field value from story markdown file.
 
@@ -282,6 +352,23 @@ def _extract_story_status(path: Path) -> str | None:
         return None
     except (OSError, UnicodeDecodeError) as e:
         logger.warning("Failed to read story file %s: %s", path, e)
+        return None
+
+
+def _extract_test_review_quality_score(path: Path) -> int | None:
+    """Extract quality score from a test-review artifact."""
+    try:
+        content = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        logger.warning("Failed to read test-review file %s: %s", path, e)
+        return None
+
+    try:
+        from bmad_assist.testarch.core import extract_quality_score
+
+        return extract_quality_score(content)
+    except Exception as e:
+        logger.debug("Failed to parse test-review quality score from %s: %s", path, e)
         return None
 
 
@@ -327,15 +414,18 @@ def _get_artifact_locations(project_root: Path) -> dict[str, list[Path]]:
         paths = get_paths()
         legacy_base = paths.legacy_sprint_artifacts
         new_base = paths.implementation_artifacts
+        output_base = paths.output_folder
     except RuntimeError:
         # Paths not initialized (e.g., in tests) - use project_root defaults
         legacy_base = project_root / "docs" / "sprint-artifacts"
         new_base = project_root / "_bmad-output" / "implementation-artifacts"
+        output_base = project_root / "_bmad-output"
 
     locations: dict[str, list[Path]] = {
         "stories": [],
         "code_reviews": [],
         "validations": [],
+        "test_reviews": [],
         "retrospectives": [],
     }
 
@@ -347,6 +437,8 @@ def _get_artifact_locations(project_root: Path) -> dict[str, list[Path]]:
             locations["code_reviews"].append(legacy_base / "code-reviews")
         if (legacy_base / "story-validations").exists():
             locations["validations"].append(legacy_base / "story-validations")
+        if (legacy_base / "test-reviews").exists():
+            locations["test_reviews"].append(legacy_base / "test-reviews")
         if (legacy_base / "retrospectives").exists():
             locations["retrospectives"].append(legacy_base / "retrospectives")
 
@@ -361,8 +453,14 @@ def _get_artifact_locations(project_root: Path) -> dict[str, list[Path]]:
             locations["code_reviews"].append(new_base / "code-reviews")
         if (new_base / "story-validations").exists():
             locations["validations"].append(new_base / "story-validations")
+        if (new_base / "test-reviews").exists():
+            locations["test_reviews"].append(new_base / "test-reviews")
         if (new_base / "retrospectives").exists():
             locations["retrospectives"].append(new_base / "retrospectives")
+
+    output_test_reviews = output_base / "test-reviews"
+    if output_test_reviews.exists() and output_test_reviews not in locations["test_reviews"]:
+        locations["test_reviews"].append(output_test_reviews)
 
     return locations
 
@@ -612,6 +710,46 @@ def _scan_retrospectives(paths: list[Path]) -> dict[str, RetrospectiveArtifact]:
     return results
 
 
+def _scan_test_reviews(paths: list[Path]) -> dict[str, list[TestReviewArtifact]]:
+    """Scan directories for test-review report files.
+
+    Parses story key from test-review filename patterns and extracts quality
+    score evidence from report content when available.
+
+    Args:
+        paths: List of directories to scan for test-review files.
+
+    Returns:
+        Dict mapping short story key to list of TestReviewArtifact.
+
+    """
+    results: dict[str, list[TestReviewArtifact]] = {}
+
+    for directory in paths:
+        if not directory.exists() or not directory.is_dir():
+            continue
+
+        for file_path in directory.iterdir():
+            if not file_path.is_file() or file_path.suffix.lower() != ".md":
+                continue
+
+            filename = file_path.name
+            parsed = _parse_test_review_filename(filename)
+            if parsed:
+                story_key, timestamp = parsed
+                artifact = TestReviewArtifact(
+                    path=file_path,
+                    story_key=story_key,
+                    timestamp=timestamp,
+                    quality_score=_extract_test_review_quality_score(file_path),
+                )
+                results.setdefault(story_key, []).append(artifact)
+            else:
+                logger.debug("Skipping unrecognized test-review file: %s", filename)
+
+    return results
+
+
 # ============================================================================
 # ArtifactIndex
 # ============================================================================
@@ -629,6 +767,7 @@ class ArtifactIndex:
         story_files: Dict mapping full story key to StoryArtifact.
         code_reviews: Dict mapping short story key to list of CodeReviewArtifact.
         validations: Dict mapping short story key to list of ValidationArtifact.
+        test_reviews: Dict mapping short story key to list of TestReviewArtifact.
         retrospectives: Dict mapping epic_id (as string) to RetrospectiveArtifact.
         scan_time: Timestamp when the scan was performed.
 
@@ -644,6 +783,7 @@ class ArtifactIndex:
     story_files: dict[str, StoryArtifact] = field(default_factory=dict)
     code_reviews: dict[str, list[CodeReviewArtifact]] = field(default_factory=dict)
     validations: dict[str, list[ValidationArtifact]] = field(default_factory=dict)
+    test_reviews: dict[str, list[TestReviewArtifact]] = field(default_factory=dict)
     retrospectives: dict[str, RetrospectiveArtifact] = field(default_factory=dict)
     scan_time: datetime = field(default_factory=datetime.now)
 
@@ -671,14 +811,16 @@ class ArtifactIndex:
         story_files = _scan_stories(locations["stories"])
         code_reviews = _scan_code_reviews(locations["code_reviews"])
         validations = _scan_validations(locations["validations"])
+        test_reviews = _scan_test_reviews(locations["test_reviews"])
         retrospectives = _scan_retrospectives(locations["retrospectives"])
 
         logger.info(
             "Artifact scan complete: %d stories, %d code_review keys, "
-            "%d validation keys, %d retrospectives",
+            "%d validation keys, %d test_review keys, %d retrospectives",
             len(story_files),
             len(code_reviews),
             len(validations),
+            len(test_reviews),
             len(retrospectives),
         )
 
@@ -686,6 +828,7 @@ class ArtifactIndex:
             story_files=story_files,
             code_reviews=code_reviews,
             validations=validations,
+            test_reviews=test_reviews,
             retrospectives=retrospectives,
             scan_time=datetime.now(),
         )
@@ -868,6 +1011,36 @@ class ArtifactIndex:
         short_key = _normalize_story_key(story_key)
         return self.validations.get(short_key, [])
 
+    def has_test_review(self, story_key: str) -> bool:
+        """Check if any test-review report exists.
+
+        Accepts both full keys (with slug) and short keys (epic-story).
+
+        Args:
+            story_key: Full or short story key.
+
+        Returns:
+            True if test-review report exists.
+
+        """
+        short_key = _normalize_story_key(story_key)
+        return bool(self.test_reviews.get(short_key))
+
+    def get_test_reviews(self, story_key: str) -> list[TestReviewArtifact]:
+        """Get all test-review artifacts for the given key.
+
+        Accepts both full keys (with slug) and short keys (epic-story).
+
+        Args:
+            story_key: Full or short story key.
+
+        Returns:
+            List of TestReviewArtifact (empty if none).
+
+        """
+        short_key = _normalize_story_key(story_key)
+        return self.test_reviews.get(short_key, [])
+
     def has_retrospective(self, epic_id: EpicId) -> bool:
         """Check if a retrospective exists for the given epic.
 
@@ -909,5 +1082,6 @@ class ArtifactIndex:
             f"ArtifactIndex(stories={len(self.story_files)}, "
             f"code_reviews={len(self.code_reviews)}, "
             f"validations={len(self.validations)}, "
+            f"test_reviews={len(self.test_reviews)}, "
             f"retrospectives={len(self.retrospectives)})"
         )

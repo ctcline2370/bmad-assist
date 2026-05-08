@@ -41,6 +41,13 @@ _WORKFLOW_RELATIVE_PATH = "_bmad/bmm/workflows/4-implementation/retrospective"
 _STORY_FILE_PATTERN = re.compile(r"^(\d+)-(\d+)-.+\.md$")
 
 RETROSPECTIVE_CONTEXT_HARD_CAP_TOKENS = 45000
+_RETROSPECTIVE_COMPACTED_SECTION_TARGET_TOKENS = 2500
+_RETROSPECTIVE_COMPACTED_SECTION_MIN_TOKENS = 400
+_RETROSPECTIVE_COMPACTION_NOTICE = (
+    "\n\n<!-- Retrospective context compacted: source content exceeded the "
+    "operational token budget. Read the referenced source file directly if "
+    "more detail is required. -->"
+)
 
 
 class RetrospectiveCompiler:
@@ -604,7 +611,339 @@ class RetrospectiveCompiler:
             if candidate_tokens <= token_cap:
                 return candidate_files, candidate_tokens, dropped_sections, dropped_story_files
 
+        if candidate_tokens > token_cap:
+            for compact_token_budget in self._required_context_compaction_budgets(token_cap):
+                compacted_epic_files, compacted_epic = self._compact_epic_files(
+                    epic_files,
+                    resolved,
+                    compact_token_budget,
+                )
+                compacted_sprint_status_files, compacted_sprint_status = (
+                    self._compact_sprint_status_files(
+                        sprint_status_files,
+                        resolved,
+                        compact_token_budget,
+                    )
+                )
+                compacted_tea_files, compacted_tea = self._compact_context_file_map(
+                    tea_files,
+                    compact_token_budget,
+                )
+
+                candidate_files = self._merge_context_sections(
+                    {} if "project-context" in dropped_sections else project_context_files,
+                    {} if "architecture" in dropped_sections else architecture_files,
+                    {} if "prd" in dropped_sections else prd_files,
+                    compacted_epic_files,
+                    compacted_sprint_status_files,
+                    dict(remaining_story_items),
+                    compacted_tea_files,
+                    {} if "previous-retrospective" in dropped_sections else previous_retro_files,
+                )
+                candidate_tokens = self._estimate_prompt_tokens(
+                    context,
+                    resolved,
+                    candidate_files,
+                    mission=mission,
+                    filtered_instructions=filtered_instructions,
+                )
+
+                compacted_sections = self._get_compacted_section_names(
+                    compacted_epic,
+                    compacted_sprint_status,
+                    compacted_tea,
+                )
+                if compacted_sections:
+                    for section_name in compacted_sections:
+                        if section_name not in dropped_sections:
+                            dropped_sections.append(section_name)
+
+                if candidate_tokens <= token_cap:
+                    return candidate_files, candidate_tokens, dropped_sections, dropped_story_files
+
+            placeholder_epic_files = self._replace_context_with_placeholders(
+                epic_files,
+                "epic",
+            )
+            placeholder_sprint_status_files = self._replace_context_with_placeholders(
+                sprint_status_files,
+                "sprint-status",
+            )
+            placeholder_tea_files = self._replace_context_with_placeholders(
+                tea_files,
+                "tea",
+            )
+            candidate_files = self._merge_context_sections(
+                {} if "project-context" in dropped_sections else project_context_files,
+                {} if "architecture" in dropped_sections else architecture_files,
+                {} if "prd" in dropped_sections else prd_files,
+                placeholder_epic_files,
+                placeholder_sprint_status_files,
+                dict(remaining_story_items),
+                placeholder_tea_files,
+                {} if "previous-retrospective" in dropped_sections else previous_retro_files,
+            )
+            candidate_tokens = self._estimate_prompt_tokens(
+                context,
+                resolved,
+                candidate_files,
+                mission=mission,
+                filtered_instructions=filtered_instructions,
+            )
+            for section_name in [
+                "deferred-epic",
+                "deferred-sprint-status",
+                "deferred-tea",
+            ]:
+                if section_name not in dropped_sections:
+                    dropped_sections.append(section_name)
+
         return candidate_files, candidate_tokens, dropped_sections, dropped_story_files
+
+    def _required_context_compaction_budgets(self, token_cap: int) -> list[int]:
+        """Return progressively smaller budgets for required retrospective context."""
+        initial_budget = min(
+            _RETROSPECTIVE_COMPACTED_SECTION_TARGET_TOKENS,
+            max(_RETROSPECTIVE_COMPACTED_SECTION_MIN_TOKENS, token_cap // 8),
+        )
+        tighter_budget = max(_RETROSPECTIVE_COMPACTED_SECTION_MIN_TOKENS, token_cap // 16)
+        tightest_budget = max(_RETROSPECTIVE_COMPACTED_SECTION_MIN_TOKENS, token_cap // 32)
+
+        budgets: list[int] = []
+        for budget in [initial_budget, tighter_budget, tightest_budget]:
+            if budget not in budgets:
+                budgets.append(budget)
+
+        return budgets
+
+    @staticmethod
+    def _get_compacted_section_names(
+        compacted_epic: bool,
+        compacted_sprint_status: bool,
+        compacted_tea: bool,
+    ) -> list[str]:
+        """Return compaction labels for observability and compiler errors."""
+        section_names: list[str] = []
+        if compacted_epic:
+            section_names.append("compacted-epic")
+        if compacted_sprint_status:
+            section_names.append("compacted-sprint-status")
+        if compacted_tea:
+            section_names.append("compacted-tea")
+
+        return section_names
+
+    def _compact_epic_files(
+        self,
+        epic_files: dict[str, str],
+        resolved: dict[str, Any],
+        token_budget: int,
+    ) -> tuple[dict[str, str], bool]:
+        """Compact epic context while preserving the current epic section when possible."""
+        epic_num = resolved.get("epic_num")
+        compacted_files: dict[str, str] = {}
+        changed = False
+
+        for path, content in epic_files.items():
+            candidate = self._extract_current_epic_section(content, epic_num)
+            if candidate != content:
+                changed = True
+
+            compacted = self._compact_content(candidate, token_budget)
+            if compacted != content:
+                changed = True
+            compacted_files[path] = compacted
+
+        return compacted_files, changed
+
+    def _compact_sprint_status_files(
+        self,
+        sprint_status_files: dict[str, str],
+        resolved: dict[str, Any],
+        token_budget: int,
+    ) -> tuple[dict[str, str], bool]:
+        """Compact sprint status to current epic and retrospective gate excerpts."""
+        epic_num = resolved.get("epic_num")
+        compacted_files: dict[str, str] = {}
+        changed = False
+
+        for path, content in sprint_status_files.items():
+            candidate = self._extract_current_epic_sprint_status(content, epic_num)
+            if candidate != content:
+                changed = True
+
+            compacted = self._compact_content(candidate, token_budget)
+            if compacted != content:
+                changed = True
+            compacted_files[path] = compacted
+
+        return compacted_files, changed
+
+    def _compact_context_file_map(
+        self,
+        files: dict[str, str],
+        token_budget: int,
+    ) -> tuple[dict[str, str], bool]:
+        """Compact a context file map with markdown-aware truncation."""
+        compacted_files: dict[str, str] = {}
+        changed = False
+
+        for path, content in files.items():
+            compacted = self._compact_content(content, token_budget)
+            if compacted != content:
+                changed = True
+            compacted_files[path] = compacted
+
+        return compacted_files, changed
+
+    def _compact_content(self, content: str, token_budget: int) -> str:
+        """Trim oversized retrospective context at a readable markdown boundary."""
+        if estimate_tokens(content) <= token_budget:
+            return content
+
+        target_chars = max(1, token_budget * 4)
+        if len(content) <= target_chars:
+            return content
+
+        search_start = int(target_chars * 0.8)
+        search_end = min(target_chars, len(content))
+        search_region = content[search_start:search_end]
+        best_cut = target_chars
+
+        header_matches = list(re.finditer(r"\n#{1,4}\s+[^\n]+\n", search_region))
+        if header_matches:
+            best_cut = search_start + header_matches[-1].start()
+        else:
+            blank_line_matches = list(re.finditer(r"\n\s*\n", search_region))
+            if blank_line_matches:
+                best_cut = search_start + blank_line_matches[-1].end()
+            else:
+                for index in range(min(target_chars, len(content) - 1), search_start, -1):
+                    if content[index] in " \n\t.,;:!?":
+                        best_cut = index + 1
+                        break
+
+        return content[:best_cut].rstrip() + _RETROSPECTIVE_COMPACTION_NOTICE
+
+    def _extract_current_epic_section(self, content: str, epic_num: Any) -> str:
+        """Extract the current epic section from a whole epics document."""
+        if epic_num is None:
+            return content
+
+        epic_text = str(epic_num).strip()
+        if not epic_text:
+            return content
+
+        heading_pattern = re.compile(
+            rf"^(?P<marker>#+)\s+Epic\s+0*{re.escape(epic_text)}(?:\b|[\s:.-]).*$",
+            re.IGNORECASE | re.MULTILINE,
+        )
+        match = heading_pattern.search(content)
+        if match is None:
+            return content
+
+        heading_level = len(match.group("marker"))
+        next_epic_pattern = re.compile(
+            rf"^#{{1,{heading_level}}}\s+Epic\s+\d+(?:\b|[\s:.-]).*$",
+            re.IGNORECASE | re.MULTILINE,
+        )
+        next_match = next_epic_pattern.search(content, match.end())
+        end = next_match.start() if next_match else len(content)
+        return content[match.start() : end].strip()
+
+    def _extract_current_epic_sprint_status(self, content: str, epic_num: Any) -> str:
+        """Extract current-epic sprint status and retrospective gate excerpts."""
+        if epic_num is None:
+            return content
+
+        epic_text = str(epic_num).strip()
+        if not epic_text:
+            return content
+
+        epic_key = f"epic-{epic_text}"
+        story_prefix = f"{epic_text}-"
+        metadata_lines: list[str] = []
+        current_epic_lines: list[str] = []
+        gate_lines: list[str] = []
+
+        for line in content.splitlines():
+            stripped = line.strip()
+            lower_stripped = stripped.lower()
+            if stripped.startswith("# Generated") or stripped.startswith("# Sprint Status"):
+                metadata_lines.append(line)
+                continue
+
+            if stripped in {"metadata:", "development_status:"}:
+                current_epic_lines.append(line)
+                continue
+
+            if stripped == f"# Epic {epic_text}":
+                current_epic_lines.append(line)
+                continue
+
+            if (
+                stripped.startswith(f"{epic_key}:")
+                or stripped.startswith(f"{epic_key}-retrospective:")
+                or stripped.startswith(story_prefix)
+            ):
+                current_epic_lines.append(line)
+                continue
+
+            if "retrospective" in lower_stripped and len(gate_lines) < 30:
+                gate_lines.append(line)
+
+        if not current_epic_lines:
+            return content
+
+        parts = [
+            "# Sprint status compacted for retrospective context",
+            "",
+        ]
+        if metadata_lines:
+            parts.extend(metadata_lines)
+            parts.append("")
+
+        parts.extend(
+            [
+                "## Current Epic Development Status",
+                "```yaml",
+                *current_epic_lines,
+                "```",
+            ]
+        )
+
+        if gate_lines:
+            parts.extend(
+                [
+                    "",
+                    "## Retrospective Gate Excerpts",
+                    "```yaml",
+                    *gate_lines,
+                    "```",
+                ]
+            )
+
+        parts.append(_RETROSPECTIVE_COMPACTION_NOTICE.strip())
+        return "\n".join(parts)
+
+    @staticmethod
+    def _replace_context_with_placeholders(
+        files: dict[str, str],
+        section_name: str,
+    ) -> dict[str, str]:
+        """Replace oversized required context with source-path placeholders."""
+        placeholders: dict[str, str] = {}
+        for path in files:
+            placeholders[path] = (
+                f"# {section_name} context deferred due token cap\n\n"
+                "Full content was omitted from the preloaded retrospective prompt "
+                "to keep the autonomous run within the operational token cap.\n\n"
+                f"Path: `{path}`\n\n"
+                "Required action: read this file directly before finalizing the "
+                "retrospective evidence for this section.\n"
+            )
+
+        return placeholders
 
     def _find_epic_file(self, context: CompilerContext, epic_num: Any) -> Path | None:
         """Find epic file by number.

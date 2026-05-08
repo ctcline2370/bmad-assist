@@ -30,7 +30,7 @@ Configuration:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from bmad_assist.core.exceptions import ConfigError
 from bmad_assist.testarch.context.config import (
@@ -40,6 +40,7 @@ from bmad_assist.testarch.context.config import (
 
 if TYPE_CHECKING:
     from bmad_assist.compiler.types import CompilerContext
+    from bmad_assist.testarch.config import TestarchConfig
 
 # Lazy import TEAContextService to break circular dependency:
 # testarch/config.py -> testarch/context/__init__.py -> service.py -> compiler/__init__.py
@@ -56,12 +57,12 @@ def __getattr__(name: str) -> object:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def _get_testarch_config() -> object | None:
+def _get_testarch_config() -> TestarchConfig | None:
     """Return loaded testarch config when the project config has been initialized."""
     try:
         from bmad_assist.core.config.loaders import get_config
 
-        return getattr(get_config(), "testarch", None)
+        return cast("TestarchConfig | None", getattr(get_config(), "testarch", None))
     except ConfigError:
         return None
 

@@ -134,7 +134,15 @@ class TestCodexProviderInvoke:
         command = call_args[0][0]
 
         # Prompt is passed via stdin, not as a command argument
-        assert command == ["codex", "exec", "--json", "--full-auto", "-m", "o3-mini"]
+        assert command == [
+            "codex",
+            "exec",
+            "--json",
+            "--sandbox",
+            "workspace-write",
+            "-m",
+            "o3-mini",
+        ]
 
     def test_invoke_uses_read_only_sandbox_for_allowed_tools(
         self, provider: CodexProvider, mock_popen_success: MagicMock
@@ -167,6 +175,41 @@ class TestCodexProviderInvoke:
             "o3-mini",
         ]
 
+    def test_invoke_sets_repo_local_codex_home_when_present(
+        self,
+        provider: CodexProvider,
+        mock_popen_success: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Repo-local .codex is used as CODEX_HOME when no env override exists."""
+        repo_codex_home = tmp_path / ".codex"
+        repo_codex_home.mkdir()
+
+        with patch.dict("bmad_assist.providers.codex.os.environ", {}, clear=True):
+            provider.invoke("Review code", cwd=tmp_path)
+
+        env = mock_popen_success.call_args.kwargs["env"]
+        assert env["CODEX_HOME"] == str(repo_codex_home)
+
+    def test_invoke_preserves_existing_codex_home(
+        self,
+        provider: CodexProvider,
+        mock_popen_success: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """An explicit CODEX_HOME environment value wins over repo-local .codex."""
+        (tmp_path / ".codex").mkdir()
+
+        with patch.dict(
+            "bmad_assist.providers.codex.os.environ",
+            {"CODEX_HOME": "/custom/codex-home"},
+            clear=True,
+        ):
+            provider.invoke("Review code", cwd=tmp_path)
+
+        env = mock_popen_success.call_args.kwargs["env"]
+        assert env["CODEX_HOME"] == "/custom/codex-home"
+
     def test_invoke_writes_prompt_to_stdin(
         self, provider: CodexProvider, mock_popen_success: MagicMock
     ) -> None:
@@ -189,7 +232,8 @@ class TestCodexProviderInvoke:
             "codex",
             "exec",
             "--json",
-            "--full-auto",
+            "--sandbox",
+            "workspace-write",
             "-m",
             "gpt-5.1-codex-max",
         ]
@@ -271,7 +315,15 @@ class TestCodexProviderInvoke:
 
         assert isinstance(result.command, tuple)
         # Prompt is passed via stdin and must never reappear in command metadata.
-        assert result.command == ("codex", "exec", "--json", "--full-auto", "-m", "o3")
+        assert result.command == (
+            "codex",
+            "exec",
+            "--json",
+            "--sandbox",
+            "workspace-write",
+            "-m",
+            "o3",
+        )
 
 
 class TestCodexProviderErrors:
@@ -324,7 +376,8 @@ class TestCodexProviderErrors:
                 "codex",
                 "exec",
                 "--json",
-                "--full-auto",
+                "--sandbox",
+                "workspace-write",
                 "-m",
                 "gpt-5.1-codex-max",
             )
@@ -417,6 +470,33 @@ class TestCodexProviderErrors:
             killpg_mock.assert_called_once_with(4321, signal.SIGKILL)
             unregister_mock.assert_called_once_with(4321)
 
+    def test_timeout_uses_wall_clock_when_perf_counter_stalls(
+        self, provider: CodexProvider
+    ) -> None:
+        """Wall-clock timeout still fires if the monotonic counter stalls."""
+        with (
+            patch("bmad_assist.providers.codex.Popen") as mock_popen,
+            patch("bmad_assist.providers.codex.os.getpgid", return_value=4321),
+            patch("bmad_assist.providers.codex.os.killpg") as killpg_mock,
+            patch("bmad_assist.providers.codex.time.perf_counter", return_value=0.0),
+            patch(
+                "bmad_assist.providers.codex.time.time",
+                side_effect=[100.0, 100.0, 106.0],
+            ),
+        ):
+            mock_popen.return_value = create_codex_mock_process(
+                stdout_content="",
+                stderr_content="",
+                never_finish=True,
+            )
+
+            with pytest.raises(ProviderTimeoutError) as exc_info:
+                provider.invoke("Hello", timeout=5)
+
+            assert exc_info.value.partial_result is not None
+            assert exc_info.value.partial_result.duration_ms == 6000
+            killpg_mock.assert_called_once_with(4321, signal.SIGKILL)
+
     def test_cancel_token_kills_registered_process_group(self, provider: CodexProvider) -> None:
         """Cancellation returns a non-zero result and kills the whole process group."""
         cancel_token = threading.Event()
@@ -503,7 +583,8 @@ class TestCodexProviderErrors:
                 "codex",
                 "exec",
                 "--json",
-                "--full-auto",
+                "--sandbox",
+                "workspace-write",
                 "-m",
                 "o3-mini",
             )

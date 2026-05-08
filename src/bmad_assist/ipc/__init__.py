@@ -58,7 +58,9 @@ from bmad_assist.ipc.protocol import (
     MessageTooLargeError,
     compute_project_hash,
     deserialize,
+    get_socket_candidate_paths,
     get_socket_dir,
+    get_socket_dirs,
     get_socket_path,
     make_error_response,
     make_event,
@@ -136,6 +138,8 @@ __all__ = [
     "make_event",
     # protocol.py - Socket path utilities
     "get_socket_dir",
+    "get_socket_dirs",
+    "get_socket_candidate_paths",
     "compute_project_hash",
     "get_socket_path",
     "validate_socket_path_length",

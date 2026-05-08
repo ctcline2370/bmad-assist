@@ -100,6 +100,8 @@ class TestResultsEvidence:
 
     """
 
+    __test__ = False
+
     total: int
     passed: int
     failed: int

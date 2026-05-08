@@ -3,13 +3,13 @@
 Commands for sprint-status management and validation.
 """
 
-import sys
 import re
+import sys
 from dataclasses import dataclass
-from datetime import UTC, datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import typer
 
@@ -22,7 +22,7 @@ from bmad_assist.cli_utils import (
     _warning,
     console,
 )
-from bmad_assist.core.config import load_config_with_project
+from bmad_assist.core.config import load_config_with_project, load_loop_config
 from bmad_assist.core.exceptions import BmadAssistError, ConfigError, StateError
 
 if TYPE_CHECKING:
@@ -341,7 +341,7 @@ def _build_sprint_status_summary(
         sprint_status.metadata.last_updated or sprint_status.metadata.generated
     )
     if status_time is not None:
-        age_days = (datetime.now(timezone.utc) - status_time).days
+        age_days = (datetime.now(UTC) - status_time).days
         if age_days > 7:
             risks.append("sprint-status.yaml may be stale; last update is over 7 days old.")
 
@@ -513,11 +513,11 @@ def sprint_status(
         sys.stdout.write("\n")
         raise typer.Exit(code=EXIT_SUCCESS)
 
-    story_counts = summary["story_counts"]
-    epic_counts = summary["epic_counts"]
-    retrospective_counts = summary["retrospective_counts"]
-    next_action = summary["next"]
-    risks = summary["risks"]
+    story_counts = cast(dict[str, int], summary["story_counts"])
+    epic_counts = cast(dict[str, int], summary["epic_counts"])
+    retrospective_counts = cast(dict[str, int], summary["retrospective_counts"])
+    next_action = cast(dict[str, str | None], summary["next"])
+    risks = cast(list[str], summary["risks"])
 
     console.print()
     console.print("[bold]Sprint Status[/bold]")
@@ -813,6 +813,8 @@ def sprint_validate(
 
     # Scan artifacts
     index = ArtifactIndex.scan(project_root)
+    loop_config = load_loop_config(project_root)
+    require_test_review_for_done = "test_review" in loop_config.story
 
     # Compare each entry with inferred status
     discrepancies: list[Discrepancy] = []
@@ -842,6 +844,8 @@ def sprint_validate(
                 project_root,
                 lifecycle_epic_list,
                 lifecycle_epic_stories_loader,
+                require_completion_artifacts_for_done=True,
+                require_test_review_for_done=require_test_review_for_done,
             )
         except StateError as exc:
             discrepancies.append(
@@ -861,7 +865,11 @@ def sprint_validate(
             continue
 
         # Get inferred status
-        result = infer_story_status_detailed(key, index)
+        result = infer_story_status_detailed(
+            key,
+            index,
+            require_test_review_for_done=require_test_review_for_done,
+        )
         inferred = result.status
         confidence = result.confidence
 

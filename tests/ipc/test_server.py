@@ -8,43 +8,41 @@ IPCServerThread thread bridge, and real Unix socket integration.
 from __future__ import annotations
 
 import asyncio
-import json
+import contextlib
 import os
 import struct
-import time
+import tempfile
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from bmad_assist.ipc import protocol as proto
 from bmad_assist.ipc.protocol import (
-    IDLE_TIMEOUT,
-    MAX_CONNECTIONS,
-    MAX_MESSAGE_SIZE,
     MAX_PARSE_ERRORS,
     PROTOCOL_VERSION,
-    SUPPORTED_METHODS,
     ErrorCode,
+    IPCError,
     deserialize,
     make_event,
     read_message,
-    serialize,
     write_message,
 )
-from bmad_assist.ipc.server import (
-    IPCServerThread,
-    SocketServer,
-    _BACKPRESSURE_THRESHOLD,
-    _BROADCAST_WRITE_TIMEOUT,
-)
-from bmad_assist.ipc.types import (
-    EventPriority,
-    GetCapabilitiesResult,
-    GetStateResult,
-    PingResult,
-    RunnerState,
-)
+from bmad_assist.ipc.server import IPCServerThread, SocketServer
+from bmad_assist.ipc.types import RunnerState
+
+
+@pytest.fixture
+def short_socket_dir(monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Socket directory with enough path budget for real AF_UNIX binding."""
+    with tempfile.TemporaryDirectory(prefix="baf", dir="/tmp") as root:
+        socket_dir = Path(root) / "sockets"
+        socket_dir.mkdir(mode=0o700)
+        monkeypatch.setattr(
+            "bmad_assist.ipc.server.get_socket_dir", lambda: socket_dir
+        )
+        yield socket_dir
 
 
 # ============================================================================
@@ -275,7 +273,7 @@ class TestMethodRouting:
 
     @pytest.mark.asyncio
     async def test_ping_response(self, tmp_path: Path) -> None:
-        """ping method returns PingResult with pong=True."""
+        """Ping method returns PingResult with pong=True."""
         server = SocketServer(
             socket_path=tmp_path / "test.sock",
             project_root=tmp_path,
@@ -772,7 +770,7 @@ class TestIntegrationParseErrors:
                     await w.drain()
                     # Read error response
                     try:
-                        raw = await asyncio.wait_for(read_message(r), timeout=2.0)
+                        await asyncio.wait_for(read_message(r), timeout=2.0)
                     except (asyncio.IncompleteReadError, ConnectionError):
                         break
 
@@ -782,10 +780,8 @@ class TestIntegrationParseErrors:
                     await asyncio.wait_for(read_message(r), timeout=1.0)
             finally:
                 w.close()
-                try:
+                with contextlib.suppress(Exception):
                     await w.wait_closed()
-                except Exception:
-                    pass
         finally:
             await server.stop()
 
@@ -807,11 +803,11 @@ class TestIPCServerThread:
         assert thread.is_running is False
         assert thread.client_count == 0
 
-    def test_start_and_stop(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_start_and_stop(
+        self, tmp_path: Path, short_socket_dir: Path
+    ) -> None:
         """Thread starts server and stops cleanly."""
-        sock_dir = tmp_path / "sockets"
-        sock_dir.mkdir(mode=0o700)
-        monkeypatch.setattr("bmad_assist.ipc.server.get_socket_dir", lambda: sock_dir)
+        sock_dir = short_socket_dir
 
         sock_path = sock_dir / "thread-test.sock"
         thread = IPCServerThread(
@@ -829,11 +825,9 @@ class TestIPCServerThread:
         assert thread.is_running is False
         assert not sock_path.exists()
 
-    def test_update_state(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_update_state(self, tmp_path: Path, short_socket_dir: Path) -> None:
         """update_state updates server runner state from main thread."""
-        sock_dir = tmp_path / "sockets"
-        sock_dir.mkdir(mode=0o700)
-        monkeypatch.setattr("bmad_assist.ipc.server.get_socket_dir", lambda: sock_dir)
+        sock_dir = short_socket_dir
 
         sock_path = sock_dir / "state-test.sock"
         thread = IPCServerThread(
@@ -851,11 +845,11 @@ class TestIPCServerThread:
         finally:
             thread.stop(timeout=5.0)
 
-    def test_broadcast_threadsafe(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_broadcast_threadsafe(
+        self, tmp_path: Path, short_socket_dir: Path
+    ) -> None:
         """broadcast_threadsafe does not raise even with no clients."""
-        sock_dir = tmp_path / "sockets"
-        sock_dir.mkdir(mode=0o700)
-        monkeypatch.setattr("bmad_assist.ipc.server.get_socket_dir", lambda: sock_dir)
+        sock_dir = short_socket_dir
 
         sock_path = sock_dir / "broadcast-test.sock"
         thread = IPCServerThread(
@@ -879,11 +873,11 @@ class TestIPCServerThread:
         # Should not raise
         thread.broadcast_threadsafe({"test": True})
 
-    def test_make_event_returns_valid_event(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_make_event_returns_valid_event(
+        self, tmp_path: Path, short_socket_dir: Path
+    ) -> None:
         """make_event returns proper JSON-RPC event with sequence number."""
-        sock_dir = tmp_path / "sockets"
-        sock_dir.mkdir(mode=0o700)
-        monkeypatch.setattr("bmad_assist.ipc.server.get_socket_dir", lambda: sock_dir)
+        sock_dir = short_socket_dir
 
         sock_path = sock_dir / "event-test.sock"
         thread = IPCServerThread(
@@ -902,11 +896,11 @@ class TestIPCServerThread:
         finally:
             thread.stop(timeout=5.0)
 
-    def test_start_twice_no_error(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_start_twice_no_error(
+        self, tmp_path: Path, short_socket_dir: Path
+    ) -> None:
         """Starting an already-running thread is a no-op."""
-        sock_dir = tmp_path / "sockets"
-        sock_dir.mkdir(mode=0o700)
-        monkeypatch.setattr("bmad_assist.ipc.server.get_socket_dir", lambda: sock_dir)
+        sock_dir = short_socket_dir
 
         sock_path = sock_dir / "twice-test.sock"
         thread = IPCServerThread(
@@ -925,11 +919,11 @@ class TestIPCServerThread:
 class TestIPCServerThreadIntegration:
     """Integration test: IPCServerThread with real client connection."""
 
-    def test_client_ping_via_thread(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_client_ping_via_thread(
+        self, tmp_path: Path, short_socket_dir: Path
+    ) -> None:
         """Client connects to thread-managed server and sends ping."""
-        sock_dir = tmp_path / "sockets"
-        sock_dir.mkdir(mode=0o700)
-        monkeypatch.setattr("bmad_assist.ipc.server.get_socket_dir", lambda: sock_dir)
+        sock_dir = short_socket_dir
 
         sock_path = sock_dir / "thread-int.sock"
         thread = IPCServerThread(
@@ -954,11 +948,11 @@ class TestIPCServerThreadIntegration:
         finally:
             thread.stop(timeout=5.0)
 
-    def test_broadcast_received_by_client(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_broadcast_received_by_client(
+        self, tmp_path: Path, short_socket_dir: Path
+    ) -> None:
         """broadcast_threadsafe delivers event to connected client."""
-        sock_dir = tmp_path / "sockets"
-        sock_dir.mkdir(mode=0o700)
-        monkeypatch.setattr("bmad_assist.ipc.server.get_socket_dir", lambda: sock_dir)
+        sock_dir = short_socket_dir
 
         sock_path = sock_dir / "bcast-int.sock"
         thread = IPCServerThread(
@@ -1097,20 +1091,22 @@ class TestSocketPathLengthIntegration:
 
     @pytest.mark.asyncio
     async def test_start_rejects_long_socket_path(self, tmp_path):
-        """SocketServer.start() raises IPCError for socket path > 107 bytes."""
-        from bmad_assist.ipc.protocol import IPCError
+        """SocketServer.start() raises IPCError beyond the runtime socket limit."""
+        limit = proto._SUN_PATH_LIMIT_BYTES
 
-        # Build a socket path that exceeds 107 bytes when resolved
+        # Build a socket path that exceeds the runtime limit when resolved
         long_dir = tmp_path / ("x" * 80)
         long_dir.mkdir(parents=True, exist_ok=True)
         long_sock = long_dir / ("y" * 30 + ".sock")
         resolved_len = len(str(long_sock.resolve()).encode("utf-8"))
-        assert resolved_len > 107, f"Test setup error: path only {resolved_len} bytes"
+        assert resolved_len > limit, (
+            f"Test setup error: path only {resolved_len} bytes"
+        )
 
         server = SocketServer(
             socket_path=long_sock,
             project_root=tmp_path,
         )
 
-        with pytest.raises(IPCError, match="107-byte sun_path limit"):
+        with pytest.raises(IPCError, match=fr"{limit}-byte sun_path limit"):
             await server.start()

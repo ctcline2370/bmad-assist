@@ -1,9 +1,16 @@
 """Pytest configuration and fixtures for bmad-assist tests."""
 
+import contextlib
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+
+# Keep pytest tmp_path roots short enough for Unix domain socket integration tests.
+# Pytest still creates a unique per-process base directory under /tmp, so parallel
+# test processes do not share a fixed basetemp.
+tempfile.tempdir = "/tmp"
 
 
 @pytest.fixture(autouse=True)
@@ -48,11 +55,8 @@ def reset_and_load_minimal_config(request):
                 }
             }
         }
-        try:
+        with contextlib.suppress(Exception):
             load_config(minimal_config)
-        except Exception:
-            # Config already loaded or other issue - that's ok
-            pass
 
     yield
 

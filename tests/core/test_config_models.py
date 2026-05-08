@@ -21,6 +21,7 @@ from bmad_assist.core.config import (
     MultiProviderConfig,
     PowerPromptConfig,
     ProviderConfig,
+    ToolGuardConfig,
 )
 
 # === AC1: Config Model Structure ===
@@ -69,6 +70,50 @@ class TestConfigModelStructure:
         assert "power_prompts" in Config.model_fields
         assert "state_path" in Config.model_fields
         assert "bmad_paths" in Config.model_fields
+
+
+class TestToolGuardConfig:
+    """Tests for tool guard hardening configuration."""
+
+    def test_tool_guard_accepts_tenant_budget_and_diagnostics_fields(self) -> None:
+        """Project configs can set tenant limits and diagnostics toggles."""
+        config = Config.model_validate(
+            {
+                "providers": {
+                    "master": {
+                        "provider": "codex",
+                        "model": "gpt-5",
+                    }
+                },
+                "tool_guard": {
+                    "max_total_calls": 350,
+                    "max_interactions_per_file": 25,
+                    "max_calls_per_minute": 120,
+                    "per_tenant_max_tokens": 20_000,
+                    "tenant_credit_window": "per_run",
+                    "tenant_circuit_breaker_threshold": 0.8,
+                    "diagnostics_enabled": True,
+                    "diagnostics_enabled_env": "BMAD_ASSIST_DIAGNOSTICS_ENABLED",
+                },
+            }
+        )
+
+        assert config.tool_guard.max_total_calls == 350
+        assert config.tool_guard.per_tenant_max_tokens == 20_000
+        assert config.tool_guard.tenant_credit_window == "per_run"
+        assert config.tool_guard.tenant_circuit_breaker_threshold == 0.8
+        assert config.tool_guard.diagnostics_enabled is True
+        assert config.tool_guard.diagnostics_enabled_env == "BMAD_ASSIST_DIAGNOSTICS_ENABLED"
+
+    def test_tool_guard_new_fields_have_safe_defaults(self) -> None:
+        """Tenant-aware guard fields have production-safe defaults."""
+        guard = ToolGuardConfig()
+
+        assert guard.per_tenant_max_tokens == 20_000
+        assert guard.tenant_credit_window == "per_run"
+        assert guard.tenant_circuit_breaker_threshold == 0.8
+        assert guard.diagnostics_enabled is False
+        assert guard.diagnostics_enabled_env == "BMAD_ASSIST_DIAGNOSTICS_ENABLED"
 
 
 # === AC2: Provider Configuration Model ===

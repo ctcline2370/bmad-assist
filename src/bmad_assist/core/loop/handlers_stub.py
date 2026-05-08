@@ -287,7 +287,7 @@ def tea_nfr_assess_handler(state: State) -> PhaseResult:
     """Handle the TEA_NFR_ASSESS phase.
 
     Assesses non-functional requirements during epic_teardown scope.
-    Runs testarch-nfr workflow if mode allows and no existing assessment.
+    Runs testarch-nfr-assess workflow if mode allows and no existing assessment.
 
     Args:
         state: Current loop state at epic completion.

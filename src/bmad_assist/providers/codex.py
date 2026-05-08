@@ -9,9 +9,9 @@ on POSIX systems. Large compiled BMAD prompts (>128KB) exceed the Linux
 per-argument limit and cannot be passed as positional arguments.
 
 ⚠️ SECURITY WARNING: When CodexProvider is used as a Multi-LLM validator,
-the orchestrator MUST ensure read-only behavior. The --full-auto flag
-grants file modification permissions, but Multi-LLM validators MUST NOT
-modify project files per docs/architecture.md.
+the orchestrator MUST ensure read-only behavior. The provider defaults to
+Codex CLI's workspace-write sandbox for implementation phases and switches
+to read-only when callers pass allowed tools without an explicit sandbox mode.
 
 JSON Streaming:
     Uses --json flag to capture JSONL event stream for debugging.
@@ -233,7 +233,8 @@ class CodexProvider(BaseProvider):
         - Consistent debugging across all providers
 
         Command Format:
-            codex exec "<prompt>" --json --full-auto -m <model>     (normal mode)
+            codex exec "<prompt>" --json --sandbox workspace-write -m <model>
+                (normal mode)
             codex exec "<prompt>" --json --sandbox read-only -m <model>  (validator mode)
             codex exec "<prompt>" --json --sandbox workspace-write -m <model>
                 (explicit writable sandbox)
@@ -260,9 +261,9 @@ class CodexProvider(BaseProvider):
             allowed_tools: List of allowed tools. When set, defaults to
                 --sandbox read-only unless sandbox_mode is explicitly provided.
             sandbox_mode: Explicit Codex sandbox mode. When set, overrides the
-                implicit read-only sandbox used for allowed_tools and suppresses
-                --full-auto so callers can opt into workspace-write when edits
-                are required inside a guarded tool set.
+                implicit read-only sandbox used for allowed_tools so callers
+                can opt into workspace-write when edits are required inside a
+                guarded tool set.
             no_cache: Disable caching (ignored - Codex CLI doesn't support).
             color_index: Color index for terminal output differentiation.
             reasoning_effort: Reasoning effort level (minimal/low/medium/high/xhigh).
@@ -304,6 +305,8 @@ class CodexProvider(BaseProvider):
                 "Codex CLI: using --sandbox read-only for tool restriction (requested: %s)",
                 allowed_tools,
             )
+        elif effective_sandbox is None:
+            effective_sandbox = "workspace-write"
         elif effective_sandbox is not None:
             logger.debug(
                 "Codex CLI: using explicit sandbox mode %s (requested tools: %s)",
@@ -317,7 +320,7 @@ class CodexProvider(BaseProvider):
             effective_timeout,
             len(prompt),
             validated_settings,
-            effective_sandbox or "none",
+            effective_sandbox,
         )
 
         # Validate reasoning_effort if provided
@@ -335,10 +338,7 @@ class CodexProvider(BaseProvider):
         # (Linux MAX_ARG_STRLEN is 128KB per argument, compiled prompts exceed this)
         command: list[str] = ["codex", "exec", "--json"]
 
-        if effective_sandbox is not None:
-            command.extend(["--sandbox", effective_sandbox])
-        else:
-            command.append("--full-auto")
+        command.extend(["--sandbox", effective_sandbox])
 
         command.extend(["-m", effective_model])
 
@@ -366,7 +366,13 @@ class CodexProvider(BaseProvider):
         thread_id: str | None = None
 
         start_time = time.perf_counter()
+        wall_start_time = time.time()
         child_pgid: int | None = None
+        child_env = os.environ.copy()
+        if cwd is not None and "CODEX_HOME" not in child_env:
+            repo_codex_home = Path(cwd) / ".codex"
+            if repo_codex_home.is_dir():
+                child_env["CODEX_HOME"] = str(repo_codex_home)
 
         try:
             process = Popen(
@@ -378,6 +384,7 @@ class CodexProvider(BaseProvider):
                 encoding="utf-8",
                 errors="replace",
                 cwd=cwd,  # Use target project directory, not bmad-assist cwd
+                env=child_env,
                 start_new_session=True,  # Own process group for safe termination
             )
             try:
@@ -521,16 +528,19 @@ class CodexProvider(BaseProvider):
 
             # Wait for process with timeout and cooperative cancellation.
             deadline = start_time + effective_timeout
+            wall_deadline = wall_start_time + effective_timeout
             returncode: int | None = None
             cancelled = False
             idle_progress_interval = _idle_progress_interval(effective_timeout)
             last_activity_at = start_time
+            last_wall_activity_at = wall_start_time
             next_idle_log_at = start_time + idle_progress_interval
             last_stdout_line_count = 0
             last_stderr_chunk_count = 0
 
             while True:
                 now = time.perf_counter()
+                wall_now = time.time()
                 stdout_line_count = len(raw_stdout_lines)
                 stderr_chunk_count = len(stderr_chunks)
                 if (
@@ -538,12 +548,13 @@ class CodexProvider(BaseProvider):
                     or stderr_chunk_count != last_stderr_chunk_count
                 ):
                     last_activity_at = now
+                    last_wall_activity_at = wall_now
                     next_idle_log_at = now + idle_progress_interval
                     last_stdout_line_count = stdout_line_count
                     last_stderr_chunk_count = stderr_chunk_count
                 elif now >= next_idle_log_at:
-                    elapsed_seconds = int(now - start_time)
-                    idle_seconds = int(now - last_activity_at)
+                    elapsed_seconds = int(max(now - start_time, wall_now - wall_start_time))
+                    idle_seconds = int(max(now - last_activity_at, wall_now - last_wall_activity_at))
                     logger.warning(
                         "Codex CLI still running with no new output: "
                         "provider=%s, model=%s, elapsed_seconds=%d, "
@@ -587,7 +598,7 @@ class CodexProvider(BaseProvider):
                     returncode = -15
                     break
 
-                if now >= deadline:
+                if now >= deadline or wall_now >= wall_deadline:
                     if child_pgid is not None:
                         with contextlib.suppress(
                             ProcessLookupError,
@@ -611,7 +622,7 @@ class CodexProvider(BaseProvider):
                     stdin_thread.join(timeout=1)
                     stdout_thread.join(timeout=1)
                     stderr_thread.join(timeout=1)
-                    duration_ms = int((now - start_time) * 1000)
+                    duration_ms = int(max(now - start_time, wall_now - wall_start_time) * 1000)
 
                     partial_result = ProviderResult(
                         stdout="".join(response_text_parts),
@@ -657,7 +668,13 @@ class CodexProvider(BaseProvider):
                 stdin_thread.join(timeout=1)
                 stdout_thread.join(timeout=1)
                 stderr_thread.join(timeout=1)
-                duration_ms = int((time.perf_counter() - start_time) * 1000)
+                duration_ms = int(
+                    max(
+                        time.perf_counter() - start_time,
+                        time.time() - wall_start_time,
+                    )
+                    * 1000
+                )
                 return ProviderResult(
                     stdout="".join(response_text_parts),
                     stderr="Cancelled by orchestration",
@@ -681,7 +698,13 @@ class CodexProvider(BaseProvider):
                 unregister_child_pgid(child_pgid)
             debug_json_logger.close()
 
-        duration_ms = int((time.perf_counter() - start_time) * 1000)
+        duration_ms = int(
+            max(
+                time.perf_counter() - start_time,
+                time.time() - wall_start_time,
+            )
+            * 1000
+        )
         stderr_content = "".join(stderr_chunks)
 
         if returncode != 0:

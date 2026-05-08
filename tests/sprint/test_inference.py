@@ -18,7 +18,6 @@ from bmad_assist.sprint.inference import (
 )
 from bmad_assist.sprint.scanner import ArtifactIndex
 
-
 # ============================================================================
 # Fixtures
 # ============================================================================
@@ -52,6 +51,8 @@ def temp_project_full(tmp_path: Path) -> Path:
     (stories_dir / "20-5-no-status.md").write_text("# Story 20.5\n\nNo status field here.")
     # Story with empty status value
     (stories_dir / "20-6-empty-status.md").write_text("# Story 20.6\n\nStatus:\n\nEmpty status.")
+    # Story with synthesis but no test-review artifact
+    (stories_dir / "20-7-missing-test-review.md").write_text("# Story 20.7\n\nNo status field.")
     # Story for epic with retrospective (should be done)
     (stories_dir / "12-1-completed.md").write_text("# Story 12.1\n\nStatus: done\n\nCompleted.")
     (stories_dir / "12-2-completed.md").write_text("# Story 12.2\n\nStatus: done\n\nCompleted.")
@@ -73,6 +74,8 @@ def temp_project_full(tmp_path: Path) -> Path:
     reviews_dir.mkdir()
     # Master review/synthesis for 20-4 (should override invalid status → done)
     (reviews_dir / "synthesis-20-4-20260107T120000.md").write_text("# Synthesis 20-4")
+    # Master review/synthesis without matching test review
+    (reviews_dir / "synthesis-20-7-20260107T120000.md").write_text("# Synthesis 20-7")
     # Validator review only for 20-5 (no master) → review status
     (reviews_dir / "code-review-20-5-validator_a-20260107T120000.md").write_text("# Validator A")
     (reviews_dir / "code-review-20-5-validator_b-20260107T120001.md").write_text("# Validator B")
@@ -83,6 +86,13 @@ def temp_project_full(tmp_path: Path) -> Path:
     # Validation for 20-6 (should override empty status → ready-for-dev)
     # Pattern: validation-{epic}-{story}-{role_id}-{timestamp}.md (role_id is single letter)
     (validations_dir / "validation-20-6-a-20260107T100000.md").write_text("# Validation")
+
+    # Test reviews for validated-done inference tests
+    test_reviews_dir = new_base / "test-reviews"
+    test_reviews_dir.mkdir()
+    (test_reviews_dir / "test-review-20-4-20260107T130000Z.md").write_text(
+        "# Test Review\n\nQuality Score: 91/100\n"
+    )
 
     # Retrospectives
     retros_dir = new_base / "retrospectives"
@@ -331,6 +341,42 @@ class TestInferStoryStatus:
         assert status == "done"
         assert confidence == InferenceConfidence.STRONG
 
+    def test_master_review_and_test_review_required_for_done(self, index: ArtifactIndex) -> None:
+        """Test that validated-done requires both synthesis and test-review evidence."""
+        status, confidence = infer_story_status(
+            "20-4",
+            index,
+            require_test_review_for_done=True,
+        )
+        assert status == "done"
+        assert confidence == InferenceConfidence.STRONG
+
+    def test_master_review_without_test_review_stays_review_when_required(
+        self,
+        index: ArtifactIndex,
+    ) -> None:
+        """Test that synthesis alone does not become done when test review is required."""
+        status, confidence = infer_story_status(
+            "20-7-missing-test-review",
+            index,
+            require_test_review_for_done=True,
+        )
+        assert status == "review"
+        assert confidence == InferenceConfidence.STRONG
+
+    def test_explicit_done_without_completion_evidence_is_not_validated_done(
+        self,
+        index: ArtifactIndex,
+    ) -> None:
+        """Test that Status: done alone is not enough when validated-done is required."""
+        status, confidence = infer_story_status(
+            "20-1-entry-classification",
+            index,
+            require_test_review_for_done=True,
+        )
+        assert status == "in-progress"
+        assert confidence == InferenceConfidence.WEAK
+
     def test_priority3_validator_reviews(self, index: ArtifactIndex) -> None:
         """Test Priority 3: Validator reviews exist → review."""
         # Story 20-5 has no status, no master review, but has validator reviews
@@ -398,6 +444,21 @@ class TestInferStoryStatusDetailed:
         assert result.confidence == InferenceConfidence.STRONG
         assert len(result.evidence_sources) >= 1
         assert any("synthesis" in str(p) for p in result.evidence_sources)
+
+    def test_validated_done_evidence_sources_include_test_review(
+        self,
+        index: ArtifactIndex,
+    ) -> None:
+        """Test validated-done evidence includes synthesis and test review."""
+        result = infer_story_status_detailed(
+            "20-4-invalid",
+            index,
+            require_test_review_for_done=True,
+        )
+        assert result.status == "done"
+        assert result.confidence == InferenceConfidence.STRONG
+        assert any("synthesis" in str(p) for p in result.evidence_sources)
+        assert any("test-review" in str(p) for p in result.evidence_sources)
 
     def test_validator_review_evidence_sources(self, index: ArtifactIndex) -> None:
         """Test evidence sources for validator review inference."""

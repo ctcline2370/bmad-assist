@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import typer
 
@@ -31,6 +31,23 @@ from bmad_assist.cli_utils import (
 )
 
 ipc_app = typer.Typer(help="IPC socket management utilities")
+
+
+def _socket_files() -> list[Path]:
+    """Return socket files from every active bmad-assist socket directory."""
+    from bmad_assist.ipc.protocol import get_socket_dirs
+
+    sock_files: list[Path] = []
+    for socket_dir in get_socket_dirs():
+        sock_files.extend(sorted(socket_dir.glob("*.sock")))
+    return sorted(sock_files)
+
+
+def _existing_project_socket_paths(project: Path) -> list[Path]:
+    """Return existing socket paths for a project in connection priority order."""
+    from bmad_assist.ipc.protocol import get_socket_candidate_paths
+
+    return [path for path in get_socket_candidate_paths(project) if path.exists()]
 
 
 @ipc_app.command(name="cleanup")
@@ -55,10 +72,9 @@ def cleanup_command(
         cleanup_orphaned_sockets,
         find_orphaned_sockets,
     )
-    from bmad_assist.ipc.protocol import SOCKET_DIR
+    from bmad_assist.ipc.protocol import get_socket_dirs
 
-    socket_dir = SOCKET_DIR.expanduser()
-    if not socket_dir.exists():
+    if not get_socket_dirs():
         _info("No socket directory found (nothing to clean)")
         raise typer.Exit(code=EXIT_SUCCESS)
 
@@ -124,20 +140,14 @@ def list_command(
     import asyncio
 
     from bmad_assist.ipc.cleanup import is_socket_stale, read_socket_pid
-    from bmad_assist.ipc.protocol import SOCKET_DIR
 
-    socket_dir = SOCKET_DIR.expanduser()
-    if not socket_dir.exists():
-        _info("No socket directory found")
-        raise typer.Exit(code=EXIT_SUCCESS)
-
-    sock_files = sorted(socket_dir.glob("*.sock"))
+    sock_files = _socket_files()
     if not sock_files:
         _info("No socket files found")
         raise typer.Exit(code=EXIT_SUCCESS)
 
     # If probing, discover instances to get their state
-    probed_states: dict[str, str] = {}  # socket_name -> runner state
+    probed_states: dict[Path, str] = {}
     if probe:
         from bmad_assist.ipc.discovery import discover_instances_async
 
@@ -145,7 +155,7 @@ def list_command(
             instances = asyncio.run(discover_instances_async(probe_timeout=2.0))
             for inst in instances:
                 state_val = inst.state.get("state", "?") if inst.state else "?"
-                probed_states[inst.socket_path.name] = state_val
+                probed_states[inst.socket_path] = state_val
         except (OSError, RuntimeError):
             pass  # Probe failure — continue without state info
 
@@ -170,8 +180,8 @@ def list_command(
         if probe:
             if stale:
                 state_str = "–"
-            elif sock_path.name in probed_states:
-                state_str = probed_states[sock_path.name]
+            elif sock_path in probed_states:
+                state_str = probed_states[sock_path]
             else:
                 state_str = "?"
         else:
@@ -279,15 +289,8 @@ def _status_single_project(project: Path) -> None:
     """Show detailed status for a single project's runner."""
     import asyncio
 
-    from bmad_assist.ipc.protocol import SOCKET_DIR, compute_project_hash
-
-    # Avoid calling get_socket_path() which creates the directory as a
-    # side effect via get_socket_dir(). Status is a read-only command.
-    socket_dir = SOCKET_DIR.expanduser()
-    project_hash = compute_project_hash(project)
-    sock_path = socket_dir / f"{project_hash}.sock"
-
-    if not sock_path.exists():
+    existing_paths = _existing_project_socket_paths(project)
+    if not existing_paths:
         _warning(f"No socket found for project: {project}")
         _info("Is a bmad-assist runner active for this project?")
         return
@@ -295,9 +298,14 @@ def _status_single_project(project: Path) -> None:
     # Probe the socket for state
     from bmad_assist.ipc.discovery import probe_instance
 
-    state = asyncio.run(probe_instance(sock_path, timeout=5.0))
+    state: dict[str, Any] | None = None
+    for candidate in existing_paths:
+        state = asyncio.run(probe_instance(candidate, timeout=5.0))
+        if state is not None:
+            break
     if state is None:
-        _warning(f"Socket exists but runner is not responding: {sock_path.name}")
+        socket_names = ", ".join(path.name for path in existing_paths)
+        _warning(f"Socket exists but runner is not responding: {socket_names}")
         return
 
     # Display detailed state
@@ -340,21 +348,15 @@ def _status_all_instances() -> None:
     """
     from bmad_assist.ipc.cleanup import is_socket_stale, read_socket_pid
     from bmad_assist.ipc.discovery import discover_instances
-    from bmad_assist.ipc.protocol import SOCKET_DIR
 
-    socket_dir = SOCKET_DIR.expanduser()
-    if not socket_dir.exists():
-        _info("No running bmad-assist instances found")
-        return
-
-    sock_files = sorted(socket_dir.glob("*.sock"))
+    sock_files = _socket_files()
     if not sock_files:
         _info("No running bmad-assist instances found")
         return
 
     # Discover active instances and index by socket name for lookup
     active_map = {
-        inst.socket_path.name: inst for inst in discover_instances()
+        inst.socket_path: inst for inst in discover_instances()
     }
 
     table = Table(title="Running Instances")
@@ -368,7 +370,7 @@ def _status_all_instances() -> None:
 
     for sock_path in sock_files:
         lock_path = Path(f"{sock_path}.lock")
-        inst = active_map.get(sock_path.name)
+        inst = active_map.get(sock_path)
         pid = inst.pid if inst else read_socket_pid(lock_path)
         project_hash = sock_path.stem
 
@@ -434,25 +436,25 @@ def _connect_to_project(project: Path, timeout: float = 5.0) -> SyncSocketClient
 
     """
     from bmad_assist.ipc.client import IPCConnectionError, SyncSocketClient
-    from bmad_assist.ipc.protocol import SOCKET_DIR, compute_project_hash
 
-    socket_dir = SOCKET_DIR.expanduser()
-    project_hash = compute_project_hash(project)
-    sock_path = socket_dir / f"{project_hash}.sock"
-
-    if not sock_path.exists():
+    sock_paths = _existing_project_socket_paths(project)
+    if not sock_paths:
         _warning(f"No socket found for project: {project}")
         _info("Is a bmad-assist runner active for this project?")
         raise typer.Exit(code=1)
 
-    client = SyncSocketClient(socket_path=sock_path)
-    try:
-        client.connect(timeout=timeout)
-    except IPCConnectionError as e:
-        _error(f"Cannot connect to runner: {e}")
-        raise typer.Exit(code=1) from None
+    last_error: IPCConnectionError | None = None
+    for sock_path in sock_paths:
+        client = SyncSocketClient(socket_path=sock_path)
+        try:
+            client.connect(timeout=timeout)
+            return client
+        except IPCConnectionError as e:
+            last_error = e
+            client.disconnect()
 
-    return client
+    _error(f"Cannot connect to runner: {last_error}")
+    raise typer.Exit(code=1)
 
 
 @ipc_app.command(name="pause")

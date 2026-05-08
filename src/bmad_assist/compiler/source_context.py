@@ -858,10 +858,17 @@ class SourceContextService:
         # because File List entries often share the same base score while stale
         # docs and artifact references are still present in the surrounding
         # planning context.
-        if self.workflow_name in SEMANTIC_PRIORITY_WORKFLOWS:
-            sort_key = lambda f: (-f.relevance_rank, -f.score, f.path)
-        else:
-            sort_key = lambda f: (-f.score, -f.relevance_rank, f.path)
+        def semantic_sort_key(file: ScoredFile) -> tuple[int, int, str]:
+            return (-file.relevance_rank, -file.score, file.path)
+
+        def score_sort_key(file: ScoredFile) -> tuple[int, int, str]:
+            return (-file.score, -file.relevance_rank, file.path)
+
+        sort_key = (
+            semantic_sort_key
+            if self.workflow_name in SEMANTIC_PRIORITY_WORKFLOWS
+            else score_sort_key
+        )
 
         sorted_files = sorted(scored_files, key=sort_key)
 

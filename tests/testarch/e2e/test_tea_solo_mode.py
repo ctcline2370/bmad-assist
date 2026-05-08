@@ -220,7 +220,7 @@ instructions: "{{installed_path}}/instructions.xml"
 
         mock_compiled = MagicMock()
         mock_compiled.context = "<compiled>nfr</compiled>"
-        mock_compiled.workflow_name = "testarch-nfr"
+        mock_compiled.workflow_name = "testarch-nfr-assess"
 
         mock_provider = MagicMock()
         from bmad_assist.providers.base import ProviderResult

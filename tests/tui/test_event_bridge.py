@@ -353,10 +353,19 @@ class TestGoodbyeEvents:
         event = make_goodbye_event(seq=1, reason="normal")
 
         with patch("asyncio.get_running_loop") as mock_loop:
-            mock_loop.return_value = MagicMock()
+            mock_running_loop = MagicMock()
+
+            def _capture_task(coro: object) -> MagicMock:
+                if hasattr(coro, "close"):
+                    coro.close()  # type: ignore[attr-defined]
+                return MagicMock()
+
+            mock_running_loop.create_task.side_effect = _capture_task
+            mock_loop.return_value = mock_running_loop
             bridge.on_event(event)
 
-            mock_loop.return_value.create_task.assert_called_once()
+            mock_client.disconnect.assert_called_once_with()
+            mock_running_loop.create_task.assert_called_once()
 
     def test_goodbye_stop_command_no_disconnect(
         self, bridge: EventBridge, mock_client: MagicMock

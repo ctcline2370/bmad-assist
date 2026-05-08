@@ -5,8 +5,10 @@ response/event builders, Pydantic message models, and the public API surface.
 """
 
 import asyncio
+import contextlib
 import json
 import struct
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,18 +17,21 @@ from pydantic import ValidationError
 
 from bmad_assist.ipc import protocol as proto
 from bmad_assist.ipc.protocol import (
+    MAX_MESSAGE_SIZE,
     ErrorCode,
     IPCError,
-    MAX_MESSAGE_SIZE,
     MessageTooLargeError,
     compute_project_hash,
     deserialize,
+    get_socket_candidate_paths,
     get_socket_dir,
+    get_socket_dirs,
     get_socket_path,
     make_error_response,
     make_event,
     read_message,
     serialize,
+    validate_socket_path_length,
     write_message,
 )
 from bmad_assist.ipc.types import (
@@ -39,7 +44,6 @@ from bmad_assist.ipc.types import (
     RunnerState,
     get_event_priority,
 )
-
 
 # ============================================================================
 # Helper: mock transport for async write tests
@@ -252,7 +256,7 @@ class TestMakeEvent:
         assert "timestamp" in params
 
     def test_event_sequence_numbers(self):
-        """seq field is present and matches the provided value."""
+        """Seq field is present and matches the provided value."""
         for i in range(5):
             event = make_event("log", {"message": "test"}, seq=i)
             assert event["params"]["seq"] == i
@@ -298,16 +302,77 @@ class TestSocketPathDeterministic:
 
     def test_socket_path_format(self, tmp_path, monkeypatch):
         """get_socket_path returns socket_dir / '<hash>.sock'."""
+        with tempfile.TemporaryDirectory(prefix="baf", dir="/tmp") as short_tmp:
+            sock_dir = Path(short_tmp) / "sockets"
+            monkeypatch.setattr(proto, "SOCKET_DIR", sock_dir)
+
+            project = tmp_path / "my-project"
+            project.mkdir()
+            path = get_socket_path(project)
+
+            expected_hash = compute_project_hash(project)
+            assert path == sock_dir / f"{expected_hash}.sock"
+            assert path.suffix == ".sock"
+
+    def test_socket_path_falls_back_when_primary_path_is_too_long(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """get_socket_path uses a short fallback when the configured path is too long."""
+        long_sock_dir = tmp_path / ("x" * 80) / "sockets"
+        monkeypatch.setattr(proto, "SOCKET_DIR", long_sock_dir)
+
+        with tempfile.TemporaryDirectory(prefix="baf", dir="/tmp") as short_tmp:
+            fallback_dir = Path(short_tmp)
+            monkeypatch.setattr(proto, "_fallback_socket_dir_path", lambda: fallback_dir)
+
+            project = tmp_path / "my-project"
+            project.mkdir()
+            path = get_socket_path(project)
+
+            expected_hash = compute_project_hash(project)
+            assert path == fallback_dir / f"{expected_hash}.sock"
+            validate_socket_path_length(path)
+
+    def test_socket_candidate_paths_are_read_only(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Candidate lookup includes primary and fallback paths without creating dirs."""
         sock_dir = tmp_path / "sockets"
+        fallback_dir = tmp_path / "fallback"
         monkeypatch.setattr(proto, "SOCKET_DIR", sock_dir)
+        monkeypatch.setattr(proto, "_fallback_socket_dir_path", lambda: fallback_dir)
 
         project = tmp_path / "my-project"
         project.mkdir()
-        path = get_socket_path(project)
-
         expected_hash = compute_project_hash(project)
-        assert path == sock_dir / f"{expected_hash}.sock"
-        assert path.suffix == ".sock"
+
+        paths = get_socket_candidate_paths(project)
+
+        assert paths == [
+            sock_dir / f"{expected_hash}.sock",
+            fallback_dir / f"{expected_hash}.sock",
+        ]
+        assert not sock_dir.exists()
+        assert not fallback_dir.exists()
+
+    def test_get_socket_dirs_returns_existing_primary_and_fallback(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Socket directory discovery includes both configured and fallback dirs."""
+        sock_dir = tmp_path / "sockets"
+        fallback_dir = tmp_path / "fallback"
+        sock_dir.mkdir()
+        fallback_dir.mkdir()
+        monkeypatch.setattr(proto, "SOCKET_DIR", sock_dir)
+        monkeypatch.setattr(proto, "_fallback_socket_dir_path", lambda: fallback_dir)
+
+        assert get_socket_dirs() == [sock_dir, fallback_dir]
 
 
 class TestSocketDirCreation:
@@ -642,7 +707,7 @@ class TestExceptions:
 
 
 class TestValidateSocketPathLength:
-    """Tests for validate_socket_path_length() — 107-byte sun_path limit."""
+    """Tests for validate_socket_path_length() at the runtime sun_path limit."""
 
     def test_short_path_passes(self, tmp_path):
         """Short path (~70 bytes, typical WSL2 home) passes silently."""
@@ -659,73 +724,85 @@ class TestValidateSocketPathLength:
         """Long path (~120 bytes) raises IPCError."""
         from bmad_assist.ipc.protocol import validate_socket_path_length
 
-        # Build a path that exceeds 107 bytes when resolved
+        limit = proto._SUN_PATH_LIMIT_BYTES
+
+        # Build a path that exceeds the runtime socket limit when resolved
         long_dir = tmp_path / ("x" * 80)
         long_dir.mkdir(parents=True, exist_ok=True)
         long_sock = long_dir / ("y" * 30 + ".sock")
         long_sock.touch()
         resolved_len = len(str(long_sock.resolve()).encode("utf-8"))
-        assert resolved_len > 107, f"Test setup error: path only {resolved_len} bytes"
+        assert resolved_len > limit, (
+            f"Test setup error: path only {resolved_len} bytes"
+        )
 
-        with pytest.raises(IPCError, match="107-byte sun_path limit"):
+        with pytest.raises(IPCError, match=fr"{limit}-byte sun_path limit"):
             validate_socket_path_length(long_sock)
 
-    def test_exactly_107_bytes_passes(self, tmp_path):
-        """Path of exactly 107 UTF-8 bytes passes (boundary case)."""
+    def test_exactly_limit_bytes_passes(self, tmp_path):
+        """Path of exactly the runtime limit in UTF-8 bytes passes."""
         from bmad_assist.ipc.protocol import validate_socket_path_length
 
-        # We need to create a real file whose resolved path is exactly 107 bytes
+        limit = proto._SUN_PATH_LIMIT_BYTES
+
+        # We need to create a real file whose resolved path is exactly limit bytes
         resolved_base = str(tmp_path.resolve())
         base_len = len(resolved_base.encode("utf-8"))
-        # We need: base_len + 1 (/) + filename_len = 107
-        needed = 107 - base_len - 1
+        # We need: base_len + 1 (/) + filename_len = limit
+        needed = limit - base_len - 1
         if needed <= 0:
             pytest.skip("tmp_path too long for this boundary test")
 
         boundary_file = tmp_path / ("b" * needed)
         boundary_file.touch()
         resolved_len = len(str(boundary_file.resolve()).encode("utf-8"))
-        assert resolved_len == 107, f"Expected 107, got {resolved_len}"
+        assert resolved_len == limit, f"Expected {limit}, got {resolved_len}"
 
         validate_socket_path_length(boundary_file)  # Should not raise
 
-    def test_108_bytes_raises(self, tmp_path):
-        """Path of 108 UTF-8 bytes raises IPCError (boundary case)."""
+    def test_limit_plus_one_bytes_raises(self, tmp_path):
+        """Path one byte past the runtime limit raises IPCError."""
         from bmad_assist.ipc.protocol import validate_socket_path_length
+
+        limit = proto._SUN_PATH_LIMIT_BYTES
 
         resolved_base = str(tmp_path.resolve())
         base_len = len(resolved_base.encode("utf-8"))
-        needed = 108 - base_len - 1
+        needed = limit + 1 - base_len - 1
         if needed <= 0:
             pytest.skip("tmp_path too long for this boundary test")
 
         boundary_file = tmp_path / ("c" * needed)
         boundary_file.touch()
         resolved_len = len(str(boundary_file.resolve()).encode("utf-8"))
-        assert resolved_len == 108, f"Expected 108, got {resolved_len}"
+        assert resolved_len == limit + 1, (
+            f"Expected {limit + 1}, got {resolved_len}"
+        )
 
-        with pytest.raises(IPCError, match="107-byte sun_path limit"):
+        with pytest.raises(IPCError, match=fr"{limit}-byte sun_path limit"):
             validate_socket_path_length(boundary_file)
 
     def test_non_ascii_multibyte_path(self, tmp_path):
-        """Non-ASCII path where char count ≤ 107 but byte count > 107 raises IPCError."""
+        """Non-ASCII path under char limit but over byte limit raises IPCError."""
         from bmad_assist.ipc.protocol import validate_socket_path_length
 
         # 'é' is 2 bytes in UTF-8. Build a path that is short in chars but long in bytes.
         resolved_base = str(tmp_path.resolve())
         base_len = len(resolved_base.encode("utf-8"))
 
-        # We need byte length > 107. Each 'é' is 2 bytes, 1 char.
-        # So we need (107 - base_len - 1) / 2 + some extra 'é' chars
-        # to push byte count over 107 while char count stays ≤ 107
-        char_budget = 107 - base_len - 1  # chars we can use
+        limit = proto._SUN_PATH_LIMIT_BYTES
+
+        # We need byte length > limit. Each 'é' is 2 bytes, 1 char.
+        # So we need (limit - base_len - 1) / 2 + some extra 'é' chars
+        # to push byte count over limit while char count stays ≤ limit
+        char_budget = limit - base_len - 1  # chars we can use
         if char_budget <= 0:
             pytest.skip("tmp_path too long for this multibyte test")
 
         # Use all 'é' chars — each is 2 bytes
         # char_count = char_budget, byte_count = base_len + 1 + char_budget * 2
-        # We need byte_count > 107 → base_len + 1 + char_budget * 2 > 107
-        # → char_budget * 2 > 107 - base_len - 1 = char_budget → char_budget > 0 (always true)
+        # We need byte_count > limit → base_len + 1 + char_budget * 2 > limit
+        # → char_budget * 2 > limit - base_len - 1 = char_budget.
         try:
             accent_dir = tmp_path / ("é" * char_budget)
             accent_dir.mkdir(parents=True, exist_ok=True)
@@ -736,13 +813,15 @@ class TestValidateSocketPathLength:
         byte_len = len(resolved_path.encode("utf-8"))
         char_len = len(resolved_path)
 
-        assert char_len <= 107 or byte_len > 107, (
+        assert char_len <= limit or byte_len > limit, (
             f"Test setup: chars={char_len}, bytes={byte_len}"
         )
-        if byte_len <= 107:
-            pytest.skip(f"Could not create path with byte_len > 107 (got {byte_len})")
+        if byte_len <= limit:
+            pytest.skip(
+                f"Could not create path with byte_len > {limit} (got {byte_len})"
+            )
 
-        with pytest.raises(IPCError, match="107-byte sun_path limit"):
+        with pytest.raises(IPCError, match=fr"{limit}-byte sun_path limit"):
             validate_socket_path_length(accent_dir)
 
     def test_typical_wsl2_path_safe(self, tmp_path: Path) -> None:
@@ -761,7 +840,8 @@ class TestValidateSocketPathLength:
 
         resolved_len = len(str(sock_file.resolve()).encode("utf-8"))
         # Sanity: confirm test setup created a safe-length path
-        if resolved_len >= 107:
+        limit = proto._SUN_PATH_LIMIT_BYTES
+        if resolved_len >= limit:
             pytest.skip(
                 f"tmp_path too long for this test ({resolved_len} bytes); "
                 "cannot simulate typical WSL2 path"
@@ -805,12 +885,14 @@ class TestDrvFSWarning:
 
         monkeypatch.setattr(proto_mod, "SOCKET_DIR", FakeSocketDir())
 
-        with patch.object(Path, "mkdir"):
-            with patch("bmad_assist.ipc.protocol.logger") as mock_logger:
-                get_socket_dir()
-                mock_logger.warning.assert_called_once()
-                call_args = str(mock_logger.warning.call_args)
-                assert "Windows filesystem" in call_args or "DrvFS" in call_args
+        with (
+            patch.object(Path, "mkdir"),
+            patch("bmad_assist.ipc.protocol.logger") as mock_logger,
+        ):
+            get_socket_dir()
+            mock_logger.warning.assert_called_once()
+            call_args = str(mock_logger.warning.call_args)
+            assert "Windows filesystem" in call_args or "DrvFS" in call_args
 
     def test_drvfs_warning_not_repeated(self, monkeypatch):
         """DrvFS warning is logged only once (suppressed on subsequent calls)."""
@@ -826,23 +908,21 @@ class TestDrvFSWarning:
 
         monkeypatch.setattr(proto_mod, "SOCKET_DIR", FakeSocketDir())
 
-        with patch.object(Path, "mkdir"):
-            with patch("bmad_assist.ipc.protocol.logger") as mock_logger:
-                try:
-                    get_socket_dir()
-                except Exception:
-                    pass
-                first_count = mock_logger.warning.call_count
+        with (
+            patch.object(Path, "mkdir"),
+            patch("bmad_assist.ipc.protocol.logger") as mock_logger,
+        ):
+            with contextlib.suppress(Exception):
+                get_socket_dir()
+            first_count = mock_logger.warning.call_count
 
-                try:
-                    get_socket_dir()
-                except Exception:
-                    pass
-                second_count = mock_logger.warning.call_count
+            with contextlib.suppress(Exception):
+                get_socket_dir()
+            second_count = mock_logger.warning.call_count
 
-                # Warning should only be logged once
-                assert first_count == 1
-                assert second_count == 1
+            # Warning should only be logged once
+            assert first_count == 1
+            assert second_count == 1
 
     def test_no_warning_on_native_linux(self, tmp_path, monkeypatch):
         """On native Linux (not WSL), no DrvFS warning even with /mnt/ path."""

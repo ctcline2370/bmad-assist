@@ -23,6 +23,24 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _format_test_review_story_id(state: State) -> str:
+    """Return the stable hyphenated story id used in test-review filenames."""
+    if state.current_story:
+        story_id = str(state.current_story).replace(".", "-")
+        if state.current_epic is None:
+            return story_id
+
+        epic_id = str(state.current_epic)
+        if story_id.lower().startswith(f"{epic_id.lower()}-"):
+            return story_id
+        return f"{epic_id}-{story_id}"
+
+    if state.current_epic is not None:
+        return str(state.current_epic)
+
+    return "unknown"
+
+
 class TestReviewHandler(TestarchBaseHandler):
     """Handler for test review workflow.
 
@@ -42,6 +60,8 @@ class TestReviewHandler(TestarchBaseHandler):
     - on: Always run test review
 
     """
+
+    __test__ = False
 
     def __init__(self, config: Config, project_path: Path) -> None:
         """Initialize handler with config and project path.
@@ -106,7 +126,7 @@ class TestReviewHandler(TestarchBaseHandler):
             - file: Path to saved review report
 
         """
-        story_id = f"{state.current_epic}-{state.current_story}"
+        story_id = _format_test_review_story_id(state)
 
         try:
             paths = get_paths()
@@ -139,7 +159,7 @@ class TestReviewHandler(TestarchBaseHandler):
             PhaseResult with success/failure and outputs.
 
         """
-        story_id = f"{state.current_epic}-{state.current_story}"
+        story_id = _format_test_review_story_id(state)
         logger.info("Test review handler starting for story %s", story_id)
 
         # Engagement model check (before all other checks)

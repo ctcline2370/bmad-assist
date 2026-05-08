@@ -37,7 +37,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from bmad_assist.benchmarking import (
     CollectorContext,
@@ -48,6 +48,7 @@ from bmad_assist.compiler import compile_workflow
 from bmad_assist.compiler.types import CompilerContext
 from bmad_assist.core.config import Config, get_phase_retries, get_phase_timeout
 from bmad_assist.core.config.loaders import parse_parallel_delay
+from bmad_assist.core.config.models.loop import LoopConfig
 from bmad_assist.core.config.models.providers import (
     MultiProviderConfig,
     get_phase_provider_config,
@@ -291,7 +292,10 @@ def _calculate_code_review_sweep_timeout(
     if task_count <= 0:
         return 0.0
 
-    attempt_count = 1 if timeout_retries in (None, 0) else timeout_retries + 1
+    if timeout_retries is None or timeout_retries == 0:
+        attempt_count = 1
+    else:
+        attempt_count = timeout_retries + 1
     reviewer_timeout = max_start_delay + (timeout * attempt_count)
     task_timeout = max(reviewer_timeout, float(security_timeout or 0))
     return task_timeout + _CODE_REVIEW_SWEEP_GRACE_SECONDS
@@ -355,12 +359,12 @@ async def _collect_code_review_task_results(
             else:
                 results[slot] = result
 
-    for idx, result in enumerate(results):
-        if result is None:
+    for idx, current_result in enumerate(results):
+        if current_result is None:
             name = task_names[idx] if idx < len(task_names) else "<unknown>"
             results[idx] = TimeoutError(f"Code review task {name} did not produce a result")
 
-    return list(results)
+    return cast(list[_CodeReviewGatherResult | BaseException], results)
 
 
 def _extract_code_review_report(raw_output: str) -> str:
@@ -1018,14 +1022,19 @@ async def run_code_review_phase(
     )
 
     # Split results: regular reviewers vs DV batch vs security
-    reviewer_results: list[_ReviewerResult | BaseException] = results[: len(tasks)]
+    reviewer_results = cast(list[_ReviewerResult | BaseException], results[: len(tasks)])
     next_idx = len(tasks)
     dv_batch_result: dict[Path, DeepVerifyValidationResult] | BaseException | None = None
     if dv_batch_task is not None:
-        dv_batch_result = results[next_idx]
+        dv_batch_result = cast(
+            dict[Path, DeepVerifyValidationResult] | BaseException,
+            results[next_idx],
+        )
         next_idx += 1
     security_result: SecurityReport | BaseException | None = (
-        results[next_idx] if security_task is not None else None
+        cast(SecurityReport | BaseException, results[next_idx])
+        if security_task is not None
+        else None
     )
 
     # Step 4: Collect successful results (regular reviewers)
@@ -1313,7 +1322,7 @@ async def run_code_review_phase(
     # Use configurable thresholds from loop config (defaults to ADR-5: 6.0/4.0)
     reject_thresh = 6.0
     major_rework_thresh = 4.0
-    if config.loop is not None:
+    if isinstance(config.loop, LoopConfig):
         reject_thresh = config.loop.evidence_reject_threshold
         major_rework_thresh = config.loop.evidence_major_rework_threshold
     evidence_aggregate = _calculate_evidence_aggregate(

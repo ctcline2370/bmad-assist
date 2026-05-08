@@ -178,7 +178,7 @@ class SocketServer:
         Raises:
             StateError: If a live process already owns the socket.
             IPCError: If socket directory creation fails or socket path
-                exceeds the 107-byte sun_path limit.
+                exceeds the runtime sun_path limit.
 
         """
         if self._is_running:
@@ -191,7 +191,7 @@ class SocketServer:
         # Check for stale socket
         self._check_stale_socket()
 
-        # Story 29.7: Validate socket path length (107-byte sun_path limit)
+        # Story 29.7: Validate socket path length before bind() raises OSError.
         validate_socket_path_length(self._socket_path)
 
         # Start the async Unix server

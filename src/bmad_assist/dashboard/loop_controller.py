@@ -205,11 +205,10 @@ class LoopController:
             # Create cancel context
             self._cancel_ctx = CancellationContext()
 
-            # Run in executor
-            loop = asyncio.get_event_loop()
-            self._future = loop.run_in_executor(
-                self._executor,
-                lambda: self._run_loop_wrapper(epic_list, epic_stories_loader),
+            # Keep the future executor-owned so stop() can await it from any
+            # request loop without cross-loop asyncio.Future ownership errors.
+            self._future = self._executor.submit(
+                lambda: self._run_loop_wrapper(epic_list, epic_stories_loader)
             )
 
             with self._lock:

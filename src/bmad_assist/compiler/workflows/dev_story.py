@@ -45,7 +45,7 @@ from bmad_assist.testarch.context import collect_tea_context, is_tea_context_ena
 
 logger = logging.getLogger(__name__)
 
-DEV_STORY_CONTEXT_HARD_CAP_TOKENS = 45000
+DEV_STORY_CONTEXT_HARD_CAP_TOKENS = DEFAULT_HARD_LIMIT_TOKENS
 DEV_STORY_REQUIRED_SECTION_HEADINGS = {
     "story",
     "acceptance criteria",
@@ -611,6 +611,7 @@ class DevStoryCompiler:
                 mission=mission,
                 filtered_instructions=filtered_instructions,
                 protected_source_files=protected_source_files,
+                prune_epic=True,
             )
         if pruned_tokens > token_cap:
             dropped_source_summary = ", ".join(dropped_source_files) or "none"
@@ -829,6 +830,7 @@ class DevStoryCompiler:
         filtered_instructions: str | None = None,
         prune_source: bool = True,
         protected_source_files: set[str] | None = None,
+        prune_epic: bool = False,
     ) -> tuple[dict[str, str], int, list[str], list[str]]:
         """Prune low-value duplicate context before provider invocation."""
         optional_sections: list[tuple[str, dict[str, str]]] = [
@@ -916,12 +918,14 @@ class DevStoryCompiler:
             if candidate_tokens <= token_cap:
                 return candidate_files, candidate_tokens, dropped_sections, dropped_source_files
 
+        candidate_source_files = dict(remaining_source_items)
         if candidate_tokens > token_cap and protected_source_files:
             placeholder_source_files = self._replace_protected_source_with_placeholders(
-                dict(remaining_source_items),
+                candidate_source_files,
                 protected_source_files,
             )
-            if placeholder_source_files != dict(remaining_source_items):
+            if placeholder_source_files != candidate_source_files:
+                candidate_source_files = placeholder_source_files
                 candidate_files = self._merge_context_sections(
                     strategic_files,
                     {} if "antipatterns" in dropped_sections else antipattern_files,
@@ -929,7 +933,7 @@ class DevStoryCompiler:
                     {} if "tea-test-design" in dropped_sections else tea_test_design_files,
                     {} if "tea-other" in dropped_sections else tea_other_files,
                     tea_atdd_files,
-                    placeholder_source_files,
+                    candidate_source_files,
                     story_files,
                 )
                 candidate_tokens = self._estimate_prompt_tokens(
@@ -947,6 +951,28 @@ class DevStoryCompiler:
                     "placeholder(s) after full source context exceeded cap",
                     placeholder_count,
                 )
+
+        if candidate_tokens > token_cap and prune_epic and epic_files:
+            dropped_sections.append("epic-context")
+            candidate_files = self._merge_context_sections(
+                strategic_files,
+                {} if "antipatterns" in dropped_sections else antipattern_files,
+                {},
+                {} if "tea-test-design" in dropped_sections else tea_test_design_files,
+                {} if "tea-other" in dropped_sections else tea_other_files,
+                tea_atdd_files,
+                candidate_source_files,
+                story_files,
+            )
+            candidate_tokens = self._estimate_prompt_tokens(
+                context,
+                resolved,
+                candidate_files,
+                mission=mission,
+                filtered_instructions=filtered_instructions,
+            )
+            if candidate_tokens <= token_cap:
+                return candidate_files, candidate_tokens, dropped_sections, dropped_source_files
 
         return candidate_files, candidate_tokens, dropped_sections, dropped_source_files
 

@@ -3,10 +3,11 @@
 This module provides the status inference engine that determines story and epic
 status from artifact evidence using a prioritized hierarchy. The inference
 algorithm examines project artifacts (story files, code reviews, validations,
-retrospectives) to determine the most accurate status for each entry.
+test reviews, retrospectives) to determine the most accurate status for each
+entry.
 
 Evidence Hierarchy (highest to lowest priority):
-1. Story file Status: field → EXPLICIT (authoritative)
+1. Story file Status: field → EXPLICIT (authoritative unless validated-done is required)
 2. Master code review or synthesis exists → STRONG (story = done)
 3. Any code review exists (validator reviews) → MEDIUM (story = review)
 4. Validation report exists → MEDIUM (story = ready-for-dev)
@@ -215,6 +216,8 @@ def _get_story_keys_for_epic(epic_id: EpicId, index: ArtifactIndex) -> list[str]
 def infer_story_status(
     story_key: str,
     index: ArtifactIndex,
+    *,
+    require_test_review_for_done: bool = False,
 ) -> tuple[ValidStatus, InferenceConfidence]:
     """Infer story status from artifact evidence.
 
@@ -227,6 +230,9 @@ def infer_story_status(
     Args:
         story_key: Story key (full or short format supported).
         index: ArtifactIndex with scanned artifacts.
+        require_test_review_for_done: When true, story "done" inference
+            requires both code-review synthesis/master evidence and a
+            test-review artifact.
 
     Returns:
         Tuple of (inferred_status, confidence_level).
@@ -240,13 +246,19 @@ def infer_story_status(
         InferenceConfidence.STRONG
 
     """
-    result = infer_story_status_detailed(story_key, index)
+    result = infer_story_status_detailed(
+        story_key,
+        index,
+        require_test_review_for_done=require_test_review_for_done,
+    )
     return result.status, result.confidence
 
 
 def infer_story_status_detailed(
     story_key: str,
     index: ArtifactIndex,
+    *,
+    require_test_review_for_done: bool = False,
 ) -> InferenceResult:
     """Infer story status with full evidence audit trail.
 
@@ -256,6 +268,9 @@ def infer_story_status_detailed(
     Args:
         story_key: Story key (full or short format supported).
         index: ArtifactIndex with scanned artifacts.
+        require_test_review_for_done: When true, story "done" inference
+            requires both code-review synthesis/master evidence and a
+            test-review artifact.
 
     Returns:
         InferenceResult with status, confidence, and evidence sources.
@@ -277,19 +292,27 @@ def infer_story_status_detailed(
     if raw_status is not None:
         normalized = _normalize_status(raw_status)
         if normalized is not None:
+            if normalized == "done" and require_test_review_for_done:
+                logger.warning(
+                    "Story %s: Status: done ignored until durable completion evidence exists",
+                    story_key,
+                )
+            else:
+                if story_artifact:
+                    evidence.append(story_artifact.path)
+                logger.debug(
+                    "Story %s: EXPLICIT status '%s' from story file",
+                    story_key,
+                    normalized,
+                )
+                return InferenceResult(
+                    key=story_key,
+                    status=normalized,
+                    confidence=InferenceConfidence.EXPLICIT,
+                    evidence_sources=tuple(evidence),
+                )
             if story_artifact:
                 evidence.append(story_artifact.path)
-            logger.debug(
-                "Story %s: EXPLICIT status '%s' from story file",
-                story_key,
-                normalized,
-            )
-            return InferenceResult(
-                key=story_key,
-                status=normalized,
-                confidence=InferenceConfidence.EXPLICIT,
-                evidence_sources=tuple(evidence),
-            )
         else:
             logger.warning(
                 "Story %s: Invalid status '%s' in story file, falling through",
@@ -304,6 +327,25 @@ def infer_story_status_detailed(
         for review in reviews:
             if review.is_master or review.is_synthesis:
                 evidence.append(review.path)
+
+        if require_test_review_for_done:
+            test_reviews = index.get_test_reviews(story_key)
+            if test_reviews:
+                for test_review in test_reviews:
+                    evidence.append(test_review.path)
+            else:
+                logger.debug(
+                    "Story %s: STRONG confidence 'review' - master review exists "
+                    "but test review is missing",
+                    story_key,
+                )
+                return InferenceResult(
+                    key=story_key,
+                    status="review",
+                    confidence=InferenceConfidence.STRONG,
+                    evidence_sources=tuple(evidence),
+                )
+
         logger.debug(
             "Story %s: STRONG confidence 'done' - master review exists",
             story_key,
@@ -384,6 +426,8 @@ def infer_epic_status(
     epic_id: EpicId,
     index: ArtifactIndex,
     story_statuses: dict[str, ValidStatus] | None = None,
+    *,
+    require_test_review_for_done: bool = False,
 ) -> tuple[ValidStatus, InferenceConfidence]:
     """Infer epic status from story statuses and retrospective.
 
@@ -395,6 +439,8 @@ def infer_epic_status(
         index: ArtifactIndex with scanned artifacts.
         story_statuses: Optional pre-computed story statuses.
             If None, infers statuses for all stories in epic.
+        require_test_review_for_done: Passed through to story status inference
+            when story_statuses is not supplied.
 
     Returns:
         Tuple of (inferred_status, confidence_level).
@@ -428,7 +474,14 @@ def infer_epic_status(
     if story_statuses is None:
         # Discover story keys for this epic using pattern matching
         story_keys = _get_story_keys_for_epic(epic_id, index)
-        story_statuses = {key: infer_story_status(key, index)[0] for key in story_keys}
+        story_statuses = {
+            key: infer_story_status(
+                key,
+                index,
+                require_test_review_for_done=require_test_review_for_done,
+            )[0]
+            for key in story_keys
+        }
 
     # Priority 2: Empty story list → backlog
     if not story_statuses:
@@ -497,6 +550,8 @@ def infer_epic_status(
 def infer_all_statuses(
     index: ArtifactIndex,
     story_keys: list[str] | None = None,
+    *,
+    require_test_review_for_done: bool = False,
 ) -> dict[str, InferenceResult]:
     """Infer statuses for all stories in the index.
 
@@ -507,6 +562,7 @@ def infer_all_statuses(
         index: ArtifactIndex with scanned artifacts.
         story_keys: Optional list of story keys to infer.
             If None, infers all stories in index.
+        require_test_review_for_done: Passed through to story status inference.
 
     Returns:
         Dict mapping story_key to InferenceResult.
@@ -525,7 +581,11 @@ def infer_all_statuses(
 
     results: dict[str, InferenceResult] = {}
     for key in story_keys:
-        result = infer_story_status_detailed(key, index)
+        result = infer_story_status_detailed(
+            key,
+            index,
+            require_test_review_for_done=require_test_review_for_done,
+        )
         results[key] = result
 
     logger.debug(

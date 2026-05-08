@@ -50,6 +50,7 @@ from bmad_assist.compiler import compile_workflow
 from bmad_assist.compiler.types import CompilerContext
 from bmad_assist.core.config import Config, get_phase_retries, get_phase_timeout
 from bmad_assist.core.config.loaders import parse_parallel_delay
+from bmad_assist.core.config.models.loop import LoopConfig
 from bmad_assist.core.config.models.providers import (
     MultiProviderConfig,
     get_phase_provider_config,
@@ -302,7 +303,10 @@ def _calculate_validation_sweep_timeout(
     if task_count <= 0:
         return 0.0
 
-    attempt_count = 1 if timeout_retries in (None, 0) else timeout_retries + 1
+    if timeout_retries is None or timeout_retries == 0:
+        attempt_count = 1
+    else:
+        attempt_count = timeout_retries + 1
     return max_start_delay + (timeout * attempt_count) + _VALIDATION_SWEEP_GRACE_SECONDS
 
 
@@ -1093,7 +1097,7 @@ async def run_validation_phase(
     # Use configurable thresholds from loop config (defaults to ADR-5: 6.0/4.0)
     reject_thresh = 6.0
     major_rework_thresh = 4.0
-    if config.loop is not None:
+    if isinstance(config.loop, LoopConfig):
         reject_thresh = config.loop.evidence_reject_threshold
         major_rework_thresh = config.loop.evidence_major_rework_threshold
     evidence_aggregate = _calculate_evidence_aggregate(

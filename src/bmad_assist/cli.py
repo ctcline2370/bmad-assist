@@ -32,6 +32,7 @@ from bmad_assist.core.config import (
     PROJECT_CONFIG_NAME,
     Config,
     load_config_with_project,
+    load_loop_config,
 )
 from bmad_assist.core.config_generator import run_config_wizard
 from bmad_assist.core.exceptions import ConfigError, StateError
@@ -603,8 +604,6 @@ def run(
                 _error(f"Invalid phase '{phase_override}'. Valid values: {', '.join(valid_phases)}")
                 raise typer.Exit(code=EXIT_CONFIG_ERROR) from None
 
-            from bmad_assist.core.config import load_loop_config
-
             _lc = load_loop_config(project_path)
             _epic_phases = set(_lc.epic_setup) | set(_lc.epic_teardown)
             _is_epic_level_phase = phase_override in _epic_phases
@@ -655,11 +654,16 @@ def run(
         if debug_vars:
             state_path = get_state_path(loaded_config, project_root=project_path)
             state = load_state(state_path)
+            require_test_review_for_done = (
+                Phase.TEST_REVIEW.value in load_loop_config(project_path).story
+            )
             validation = validate_resume_state(
                 state,
                 project_path,
                 lifecycle_epic_list,
                 lifecycle_epic_stories_loader,
+                require_completion_artifacts_for_done=True,
+                require_test_review_for_done=require_test_review_for_done,
             )
             if validation.advanced:
                 save_state(validation.state, state_path)

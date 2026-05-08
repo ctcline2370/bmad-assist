@@ -12,6 +12,21 @@ T = TypeVar("T")
 logger = logging.getLogger(__name__)
 
 
+def _cancel_pending_tasks(loop: asyncio.AbstractEventLoop) -> None:
+    """Cancel and drain pending tasks before closing a manually managed loop."""
+    pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+    if not pending:
+        return
+
+    for task in pending:
+        task.cancel()
+
+    results = loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+    for result in results:
+        if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
+            logger.debug("Pending task raised during loop cleanup: %s", result)
+
+
 def _run_coro_in_new_loop(coro: Coroutine[Any, Any, T]) -> T:
     """Run a coroutine in a fresh event loop on the current thread.
 
@@ -24,6 +39,8 @@ def _run_coro_in_new_loop(coro: Coroutine[Any, Any, T]) -> T:
         asyncio.set_event_loop(loop)
         return loop.run_until_complete(coro)
     finally:
+        with contextlib.suppress(Exception):
+            _cancel_pending_tasks(loop)
         asyncio.set_event_loop(None)
         loop.close()
 
@@ -94,6 +111,9 @@ def run_async_with_timeout(coro: Coroutine[Any, Any, T], executor_timeout: float
         asyncio.set_event_loop(loop)
         return loop.run_until_complete(coro)
     finally:
+        with contextlib.suppress(Exception):
+            _cancel_pending_tasks(loop)
+
         with contextlib.suppress(Exception):
             # Cleanup async generators
             loop.run_until_complete(loop.shutdown_asyncgens())

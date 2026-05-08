@@ -587,7 +587,7 @@ def nfr_assess_command(
         raise typer.Exit(code=EXIT_ERROR)
 
     if dry_run:
-        _handle_dry_run("testarch-nfr", project_path, output_dir)
+        _handle_dry_run("testarch-nfr-assess", project_path, output_dir)
         raise typer.Exit(code=EXIT_SUCCESS)
 
     runner = _get_runner(project_path, output_dir, evidence_output, provider)

@@ -266,6 +266,75 @@ class TestRetrospectiveCompiler:
         assert "sprint-status" in files
         assert "tea-context" in files
 
+    def test_prune_context_files_compacts_required_sections_after_stories_exhausted(
+        self,
+        tmp_project: Path,
+    ) -> None:
+        """Required sections are compacted when story pruning still exceeds the cap."""
+        from bmad_assist.compiler.workflows.retrospective import RetrospectiveCompiler
+
+        compiler = RetrospectiveCompiler()
+        context = create_test_context(tmp_project)
+        resolved = {"epic_num": 7}
+        token_cap = 20000
+
+        large_epic = "# Epic 7\n\n" + ("Epic scope.\n" * 4000)
+        large_sprint_status = "\n".join(
+            [
+                "metadata:",
+                "  project: sample",
+                "development_status:",
+                "  epic-7: in-progress",
+                "  7-1-alpha: done",
+                "  7-2-beta: done",
+                "  epic-7-retrospective: in-progress",
+                "  epic-8: backlog",
+                "  8-1-outside: backlog",
+            ]
+        )
+        large_tea = "# Trace\n\n" + ("Trace evidence.\n" * 4000)
+
+        with patch.object(
+            compiler,
+            "_estimate_prompt_tokens",
+            side_effect=[100000, 90000, 80000, 70000, 60000, 55000, 18000],
+        ):
+            files, tokens, dropped_sections, dropped_story_files = compiler._prune_context_files(
+                {"project-context": "project"},
+                {"architecture": "architecture"},
+                {"prd": "prd"},
+                {"epic": large_epic},
+                {"sprint-status": large_sprint_status},
+                {"7-1-alpha.md": "story-a"},
+                {"tea-context": large_tea},
+                {"previous-retrospective": "retro"},
+                token_cap,
+                context=context,
+                resolved=resolved,
+                mission="mission",
+                filtered_instructions="instructions",
+            )
+
+        assert tokens == 18000
+        assert dropped_sections == [
+            "previous-retrospective",
+            "project-context",
+            "architecture",
+            "prd",
+            "compacted-epic",
+            "compacted-sprint-status",
+            "compacted-tea",
+        ]
+        assert dropped_story_files == ["7-1-alpha.md"]
+        assert "7-1-alpha.md" not in files
+        assert "epic" in files
+        assert "sprint-status" in files
+        assert "tea-context" in files
+        assert "Retrospective context compacted" in files["epic"]
+        assert "Retrospective context compacted" in files["tea-context"]
+        assert "7-1-alpha: done" in files["sprint-status"]
+        assert "8-1-outside: backlog" not in files["sprint-status"]
+
     def test_compile_raises_when_prompt_still_exceeds_cap_after_pruning(
         self,
         tmp_project: Path,

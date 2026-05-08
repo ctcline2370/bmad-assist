@@ -23,7 +23,7 @@ Public API:
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -32,6 +32,7 @@ from bmad_assist.core.retrospective_artifacts import has_durable_retrospective_a
 from bmad_assist.core.state import Phase, State
 from bmad_assist.core.types import EpicId
 from bmad_assist.sprint.models import SprintStatus
+from bmad_assist.sprint.scanner import ArtifactIndex
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,30 @@ class ResumeValidationResult:
         return "Resume validation: " + ", ".join(parts)
 
 
+def _normalize_epic_teardown_phases(
+    epic_teardown_phases: Sequence[str | Phase] | None,
+) -> set[Phase]:
+    """Return the epic teardown phases that resume validation must not skip."""
+    phases = {Phase.RETROSPECTIVE}
+    if not epic_teardown_phases:
+        return phases
+
+    for phase in epic_teardown_phases:
+        if isinstance(phase, Phase):
+            phases.add(phase)
+            continue
+
+        try:
+            phases.add(Phase(phase))
+        except ValueError:
+            logger.warning(
+                "Ignoring unknown epic teardown phase in resume validation: %s",
+                phase,
+            )
+
+    return phases
+
+
 def _get_story_status_from_sprint(
     story_id: str,
     sprint_status: SprintStatus,
@@ -114,6 +139,65 @@ def _is_story_done_in_sprint(
     """
     status = _get_story_status_from_sprint(story_id, sprint_status)
     return status == "done"
+
+
+def _get_story_completion_gaps(
+    story_id: str,
+    sprint_status: SprintStatus,
+    project_path: Path | None,
+    *,
+    require_completion_artifacts_for_done: bool = False,
+    require_test_review_for_done: bool = False,
+    artifact_index: ArtifactIndex | None = None,
+) -> list[str]:
+    """Return concrete story-completion gaps that block validated done."""
+    gaps: list[str] = []
+    status = _get_story_status_from_sprint(story_id, sprint_status)
+    if status != "done":
+        status_text = status if status is not None else "missing"
+        gaps.append(f"sprint-status story entry is {status_text!r}")
+        return gaps
+
+    require_code_review_evidence = (
+        require_completion_artifacts_for_done or require_test_review_for_done
+    )
+    if not require_code_review_evidence:
+        return gaps
+
+    if artifact_index is None:
+        if project_path is None:
+            gaps.append("artifact index is unavailable")
+            return gaps
+        artifact_index = ArtifactIndex.scan(project_path)
+
+    story_key = story_id.replace(".", "-")
+    if not artifact_index.has_master_review(story_key):
+        gaps.append("durable code-review synthesis artifact is missing")
+
+    if require_test_review_for_done and not artifact_index.has_test_review(story_key):
+        gaps.append("durable test-review artifact is missing")
+
+    return gaps
+
+
+def _is_story_durably_done(
+    story_id: str,
+    sprint_status: SprintStatus,
+    project_path: Path | None = None,
+    *,
+    require_completion_artifacts_for_done: bool = False,
+    require_test_review_for_done: bool = False,
+    artifact_index: ArtifactIndex | None = None,
+) -> bool:
+    """Check if story completion is backed by required durable artifacts."""
+    return not _get_story_completion_gaps(
+        story_id,
+        sprint_status,
+        project_path,
+        require_completion_artifacts_for_done=require_completion_artifacts_for_done,
+        require_test_review_for_done=require_test_review_for_done,
+        artifact_index=artifact_index,
+    )
 
 
 def _is_epic_done_in_sprint(
@@ -205,11 +289,48 @@ def _ensure_prior_epics_durably_complete(
             )
 
 
+def _ensure_prior_stories_durably_complete(
+    current_story: str,
+    epic_stories: list[str],
+    sprint_status: SprintStatus,
+    project_path: Path,
+    *,
+    require_completion_artifacts_for_done: bool = False,
+    require_test_review_for_done: bool = False,
+    artifact_index: ArtifactIndex | None = None,
+) -> None:
+    """Fail closed if state advanced beyond a story whose completion is incomplete."""
+    try:
+        current_idx = epic_stories.index(current_story)
+    except ValueError:
+        return
+
+    for prior_story in epic_stories[:current_idx]:
+        gaps = _get_story_completion_gaps(
+            prior_story,
+            sprint_status,
+            project_path,
+            require_completion_artifacts_for_done=require_completion_artifacts_for_done,
+            require_test_review_for_done=require_test_review_for_done,
+            artifact_index=artifact_index,
+        )
+        if gaps:
+            gap_text = "; ".join(gaps)
+            raise StateError(
+                f"Story {prior_story} completion is incomplete ({gap_text}). "
+                f"Finish story {prior_story} before advancing to story {current_story}."
+            )
+
+
 def validate_resume_state(
     state: State,
     project_path: Path,
     epic_list: list[EpicId],
     epic_stories_loader: Callable[[EpicId], list[str]],
+    *,
+    require_completion_artifacts_for_done: bool = False,
+    require_test_review_for_done: bool = False,
+    epic_teardown_phases: Sequence[str | Phase] | None = None,
 ) -> ResumeValidationResult:
     """Validate and advance state based on sprint-status.
 
@@ -226,6 +347,12 @@ def validate_resume_state(
         project_path: Project root directory.
         epic_list: Ordered list of epic IDs.
         epic_stories_loader: Function to get stories for an epic.
+        require_completion_artifacts_for_done: Require durable code-review
+            synthesis or master-review artifacts before skipping done stories.
+        require_test_review_for_done: Require durable test-review artifacts
+            before skipping done stories. Implies code-review completion evidence.
+        epic_teardown_phases: Configured epic teardown phases that must execute
+            even when sprint-status already marks every story in the epic done.
 
     Returns:
         ResumeValidationResult with potentially advanced state.
@@ -239,6 +366,10 @@ def validate_resume_state(
 
     stories_skipped: list[str] = []
     epics_skipped: list[EpicId] = []
+    configured_teardown_phases = _normalize_epic_teardown_phases(epic_teardown_phases)
+    artifact_index: ArtifactIndex | None = None
+    if require_completion_artifacts_for_done or require_test_review_for_done:
+        artifact_index = ArtifactIndex.scan(project_path)
 
     # Find sprint-status location (uses paths singleton for external paths support)
     try:
@@ -320,11 +451,19 @@ def validate_resume_state(
             project_path,
         )
 
-        # CRITICAL: If we're in RETROSPECTIVE phase, don't skip anything.
-        # The loop needs to execute the retrospective - we shouldn't try to
-        # advance past it just because stories are done.
-        if current_state.current_phase == Phase.RETROSPECTIVE:
-            logger.debug("Current phase is RETROSPECTIVE - not skipping, let loop execute it")
+        # CRITICAL: If we're in a configured epic teardown phase, don't skip anything.
+        # The loop needs to execute teardown - we shouldn't try to advance past it
+        # just because all stories in the epic are done.
+        if current_state.current_phase in configured_teardown_phases:
+            logger.debug(
+                "Current phase is configured epic teardown phase %s - "
+                "not skipping, let loop execute it",
+                current_state.current_phase.name,
+            )
+            break
+
+        if current_state.current_phase == Phase.TEST_REVIEW:
+            logger.debug("Current phase is TEST_REVIEW - not skipping, let loop execute it")
             break
 
         # Check if current epic is durably done (sprint-status plus artifact)
@@ -395,40 +534,60 @@ def validate_resume_state(
         if current_state.current_story is None:
             logger.debug("No current story set, cannot validate")
             break
+        current_story = current_state.current_story
 
-        if _is_story_done_in_sprint(current_state.current_story, sprint_status):
+        try:
+            current_epic_stories = epic_stories_loader(current_epic)
+        except Exception as e:
+            raise StateError(f"Failed to load stories for epic {current_epic}: {e}") from e
+
+        _ensure_prior_stories_durably_complete(
+            current_story,
+            current_epic_stories,
+            sprint_status,
+            project_path,
+            require_completion_artifacts_for_done=require_completion_artifacts_for_done,
+            require_test_review_for_done=require_test_review_for_done,
+            artifact_index=artifact_index,
+        )
+
+        story_completion_gaps = _get_story_completion_gaps(
+            current_story,
+            sprint_status,
+            project_path,
+            require_completion_artifacts_for_done=require_completion_artifacts_for_done,
+            require_test_review_for_done=require_test_review_for_done,
+            artifact_index=artifact_index,
+        )
+        if not story_completion_gaps:
             # Story is done but epic is not - need to advance to next story
             logger.info(
                 "Sprint-status shows story %s is done, advancing",
-                current_state.current_story,
+                current_story,
             )
-            stories_skipped.append(current_state.current_story)
+            stories_skipped.append(current_story)
 
             # Add to completed_stories if not there
-            if current_state.current_story not in current_state.completed_stories:
+            if current_story not in current_state.completed_stories:
                 current_state = current_state.model_copy(
                     update={
                         "completed_stories": [
                             *current_state.completed_stories,
-                            current_state.current_story,
+                            current_story,
                         ],
                         "updated_at": now,
                     }
                 )
 
-            # Get stories for current epic
-            try:
-                epic_stories = epic_stories_loader(current_epic)
-            except Exception as e:
-                raise StateError(f"Failed to load stories for epic {current_epic}: {e}") from e
-
-            # Find next story - use empty string fallback if current_story is None
-            current_story = current_state.current_story or ""
             next_story = _find_next_incomplete_story(
                 current_story,
-                epic_stories,
+                current_epic_stories,
                 current_state.completed_stories,
                 sprint_status,
+                project_path=project_path,
+                require_completion_artifacts_for_done=require_completion_artifacts_for_done,
+                require_test_review_for_done=require_test_review_for_done,
+                artifact_index=artifact_index,
             )
 
             if next_story is None:
@@ -455,6 +614,13 @@ def validate_resume_state(
             logger.info("Advanced to story %s", next_story)
             # Continue loop to check if new story is also done
             continue
+
+        if _is_story_done_in_sprint(current_story, sprint_status):
+            gap_text = "; ".join(story_completion_gaps)
+            raise StateError(
+                f"Story {current_story} completion is incomplete ({gap_text}). "
+                f"Finish story {current_story} before advancing."
+            )
 
         # Current position is not done - we're at the right place
         break
@@ -519,6 +685,11 @@ def _find_next_incomplete_story(
     epic_stories: list[str],
     completed_stories: list[str],
     sprint_status: SprintStatus,
+    *,
+    project_path: Path | None = None,
+    require_completion_artifacts_for_done: bool = False,
+    require_test_review_for_done: bool = False,
+    artifact_index: ArtifactIndex | None = None,
 ) -> str | None:
     """Find the next story in the epic that is not complete.
 
@@ -531,6 +702,12 @@ def _find_next_incomplete_story(
         epic_stories: Ordered list of stories in the epic.
         completed_stories: List of stories marked complete in state.
         sprint_status: Parsed sprint-status.
+        project_path: Project root used to scan durable completion artifacts.
+        require_completion_artifacts_for_done: Require durable code-review
+            completion artifacts before skipping done stories.
+        require_test_review_for_done: Require durable test-review artifacts
+            before skipping done stories.
+        artifact_index: Optional pre-scanned artifact index.
 
     Returns:
         Next incomplete story ID, or None if all remaining stories are done.
@@ -547,9 +724,16 @@ def _find_next_incomplete_story(
         if story in completed_stories:
             logger.debug("Skipping story %s - in completed_stories", story)
             continue
-        # Skip if done in sprint-status
-        if _is_story_done_in_sprint(story, sprint_status):
-            logger.debug("Skipping story %s - done in sprint-status", story)
+        # Skip if done in sprint-status and backed by required durable evidence
+        if _is_story_durably_done(
+            story,
+            sprint_status,
+            project_path,
+            require_completion_artifacts_for_done=require_completion_artifacts_for_done,
+            require_test_review_for_done=require_test_review_for_done,
+            artifact_index=artifact_index,
+        ):
+            logger.debug("Skipping story %s - durably done", story)
             continue
         return story
 

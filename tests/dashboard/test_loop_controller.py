@@ -429,10 +429,14 @@ class TestLoopControllerConcurrentOperations:
                     assert controller._state == ControllerState.RUNNING
 
                     # Now stop
+                    stop_errors = []
+
                     def do_stop():
                         loop = asyncio.new_event_loop()
                         try:
                             loop.run_until_complete(controller.stop())
+                        except BaseException as exc:
+                            stop_errors.append(exc)
                         finally:
                             loop.close()
 
@@ -445,6 +449,8 @@ class TestLoopControllerConcurrentOperations:
                     # Wait for both to complete
                     start_thread.join(timeout=5.0)
                     stop_thread.join(timeout=5.0)
+
+            assert stop_errors == []
 
             # Controller should end up idle
             final_status = controller.get_status()

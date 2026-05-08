@@ -18,6 +18,7 @@ import os
 import re
 import signal
 import socket
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -908,8 +909,7 @@ class DashboardServer:
             debug=True,
             routes=routes,
             middleware=middleware,
-            on_startup=[self._on_startup],
-            on_shutdown=[self._on_shutdown],
+            lifespan=self._lifespan,
         )
 
         # Store server reference in app state
@@ -917,6 +917,16 @@ class DashboardServer:
 
         self._app = app
         return app
+
+    @contextlib.asynccontextmanager
+    async def _lifespan(self, app: Starlette) -> AsyncIterator[None]:
+        """Run dashboard startup and shutdown hooks."""
+        del app
+        await self._on_startup()
+        try:
+            yield
+        finally:
+            await self._on_shutdown()
 
     async def _on_startup(self) -> None:
         """Handle server startup."""

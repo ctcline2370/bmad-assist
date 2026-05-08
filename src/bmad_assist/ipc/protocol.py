@@ -10,7 +10,9 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import struct
+import sys
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
@@ -48,6 +50,8 @@ __all__ = [
     "make_event",
     # Socket path utilities
     "get_socket_dir",
+    "get_socket_dirs",
+    "get_socket_candidate_paths",
     "compute_project_hash",
     "get_socket_path",
     "validate_socket_path_length",
@@ -129,6 +133,11 @@ MAX_PARSE_ERRORS: int = 3
 EVENT_RATE_LIMIT: int = 100  # per second
 
 SOCKET_DIR: Path = Path("~/.bmad-assist/sockets/")
+# Linux exposes 108 bytes for sockaddr_un.sun_path with 107 usable bytes.
+# Darwin exposes 104 bytes with 103 usable bytes. Use the runtime-safe limit
+# so validation fails before bind() raises a low-level AF_UNIX error.
+_SUN_PATH_LIMIT_BYTES = 103 if sys.platform == "darwin" else 107
+_FALLBACK_SOCKET_DIR_NAME = "bmad-assist"
 
 # DrvFS warning deduplication flag (Story 29.7, AC #3)
 _drvfs_warned: bool = False
@@ -395,25 +404,52 @@ def make_event(
 def validate_socket_path_length(socket_path: Path) -> None:
     """Validate that a socket path does not exceed the sun_path limit.
 
-    Unix domain sockets have a 108-byte sun_path field (107 usable bytes).
-    This function checks the UTF-8 byte length of the resolved path and
-    raises IPCError if it exceeds 107 bytes. Prevents a cryptic OSError
-    on WSL2 (and native Linux) when home directory paths are long.
+    Unix domain socket path limits vary by platform: Linux exposes 107 usable
+    bytes and Darwin exposes 103 usable bytes. This function checks the UTF-8
+    byte length of the resolved path and raises IPCError if it exceeds the
+    runtime-safe limit. Prevents a cryptic OSError when home directory paths
+    are long.
 
     Args:
         socket_path: Path to validate.
 
     Raises:
-        IPCError: If the resolved path exceeds 107 bytes (UTF-8 encoded).
+        IPCError: If the resolved path exceeds the runtime-safe byte limit.
 
     """
     resolved = str(socket_path.resolve())
-    byte_len = len(resolved.encode("utf-8"))
-    if byte_len > 107:
+    byte_len = _socket_path_byte_len(socket_path)
+    if byte_len > _SUN_PATH_LIMIT_BYTES:
         raise IPCError(
-            f"Socket path exceeds 107-byte sun_path limit: {byte_len} bytes "
+            f"Socket path exceeds {_SUN_PATH_LIMIT_BYTES}-byte sun_path limit: {byte_len} bytes "
             f"(path: {resolved})"
         )
+
+
+def _socket_path_byte_len(socket_path: Path) -> int:
+    """Return the UTF-8 byte length of a socket path after symlink resolution."""
+    return len(str(socket_path.resolve()).encode("utf-8"))
+
+
+def _socket_path_fits(socket_path: Path) -> bool:
+    """Return whether a socket path fits within the Unix sun_path byte limit."""
+    return _socket_path_byte_len(socket_path) <= _SUN_PATH_LIMIT_BYTES
+
+
+def _fallback_socket_dir_path() -> Path:
+    """Return the short runtime socket directory used when home paths are too long."""
+    getuid = getattr(os, "getuid", None)
+    uid = str(getuid()) if callable(getuid) else "user"
+    return Path("/tmp") / f"{_FALLBACK_SOCKET_DIR_NAME}-{uid}"
+
+
+def _make_socket_dir(socket_dir: Path) -> Path:
+    """Create a socket directory with owner-only permissions."""
+    try:
+        socket_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError as exc:
+        raise IPCError(f"Cannot create socket directory {socket_dir}: {exc}") from exc
+    return socket_dir
 
 
 def get_socket_dir() -> Path:
@@ -445,11 +481,38 @@ def get_socket_dir() -> Path:
         )
         _drvfs_warned = True
 
-    try:
-        socket_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    except OSError as exc:
-        raise IPCError(f"Cannot create socket directory {socket_dir}: {exc}") from exc
-    return socket_dir
+    return _make_socket_dir(socket_dir)
+
+
+def get_socket_dirs() -> list[Path]:
+    """Return existing socket directories that may contain bmad-assist sockets.
+
+    The configured directory is listed first, followed by the short fallback
+    directory when it exists. This function is read-only and does not create
+    directories, so status/list/discovery commands do not leave filesystem
+    artifacts.
+
+    Returns:
+        Existing socket directories in deterministic order.
+
+    """
+    paths = [SOCKET_DIR.expanduser(), _fallback_socket_dir_path()]
+    socket_dirs: list[Path] = []
+    seen: set[Path] = set()
+    for path in paths:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path.absolute()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        try:
+            if path.exists():
+                socket_dirs.append(path)
+        except PermissionError:
+            logger.debug("Skipping socket directory without permission: %s", path)
+    return socket_dirs
 
 
 def compute_project_hash(project_root: Path) -> str:
@@ -470,11 +533,43 @@ def compute_project_hash(project_root: Path) -> str:
     return hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:32]
 
 
+def get_socket_candidate_paths(project_root: Path) -> list[Path]:
+    """Return possible socket paths for a project without creating directories.
+
+    The primary configured path is returned first and the short fallback path
+    second. Commands use this to find already-running instances without the
+    side effect of creating socket directories.
+
+    Args:
+        project_root: Path to the project root directory.
+
+    Returns:
+        Candidate socket paths in lookup order.
+
+    """
+    filename = f"{compute_project_hash(project_root)}.sock"
+    paths = [SOCKET_DIR.expanduser() / filename, _fallback_socket_dir_path() / filename]
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+    for path in paths:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            resolved = path.absolute()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        candidates.append(path)
+    return candidates
+
+
 def get_socket_path(project_root: Path) -> Path:
     """Get the Unix domain socket path for a project.
 
     Combines the socket directory with a hash-based filename derived
-    from the project root path.
+    from the project root path. If the configured directory would produce
+    a path that exceeds the Unix domain socket ``sun_path`` limit, falls
+    back to a short owner-scoped directory under ``/tmp``.
 
     Args:
         project_root: Path to the project root directory.
@@ -483,4 +578,20 @@ def get_socket_path(project_root: Path) -> Path:
         Path to the socket file (e.g., ``~/.bmad-assist/sockets/<hash>.sock``).
 
     """
-    return get_socket_dir() / f"{compute_project_hash(project_root)}.sock"
+    filename = f"{compute_project_hash(project_root)}.sock"
+    primary_dir = get_socket_dir()
+    primary_path = primary_dir / filename
+    if _socket_path_fits(primary_path):
+        return primary_path
+
+    fallback_dir = _make_socket_dir(_fallback_socket_dir_path())
+    fallback_path = fallback_dir / filename
+    validate_socket_path_length(fallback_path)
+    logger.warning(
+        "Configured IPC socket path is %d bytes and exceeds the %d-byte limit; "
+        "using fallback socket path %s",
+        _socket_path_byte_len(primary_path),
+        _SUN_PATH_LIMIT_BYTES,
+        fallback_path,
+    )
+    return fallback_path

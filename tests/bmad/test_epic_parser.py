@@ -370,6 +370,28 @@ total_epics: 2
         assert result.stories[2].number == "2.1"
         assert result.stories[3].number == "2.2"
 
+    def test_multi_epic_file_ignores_epic_list_without_blank_line(self, tmp_path: Path) -> None:
+        """Epic List followed immediately by Epic 1 still yields real stories."""
+        content = """# Feature Plan
+
+## Epic List
+### Epic 1: Project Foundation
+
+#### Story 1.1: Project Initialization
+**Estimate:** 2 SP
+
+### Epic 2: BMAD File Integration
+
+#### Story 2.1: Markdown Frontmatter Parser
+**Estimate:** 3 SP
+"""
+        path = tmp_path / "epics.md"
+        path.write_text(content)
+
+        result = parse_epic_file(path)
+
+        assert [story.number for story in result.stories] == ["1.1", "2.1"]
+
     def test_stories_ordered_by_appearance(self, tmp_path: Path) -> None:
         """Stories are ordered by appearance in file."""
         content = """---
@@ -418,6 +440,36 @@ Beta content.
         assert extracted.startswith("# Epic 2: BMAD File Integration")
         assert "## Story 2.1: Markdown Frontmatter Parser" in extracted
         assert "# Epic 1: Project Foundation" not in extracted
+
+    def test_extract_epic_markdown_skips_epic_list_section_heading(self) -> None:
+        """Document headings like Epic List do not hide the first real epic."""
+        content = """# Feature Plan
+
+## Epic Ownership and Collision Analysis
+
+This is planning guidance, not an epic.
+
+## Epic List
+### Epic 1: Foundation Governance
+
+#### Story 1.1: Foundation Readiness
+
+Alpha content.
+
+### Epic 2: Domain Substrate
+
+#### Story 2.1: Persistence Standards
+
+Beta content.
+"""
+
+        extracted = extract_epic_markdown(content, 1)
+
+        assert extracted is not None
+        assert extracted.startswith("### Epic 1: Foundation Governance")
+        assert "#### Story 1.1: Foundation Readiness" in extracted
+        assert "## Epic List" not in extracted
+        assert "### Epic 2: Domain Substrate" not in extracted
 
     def test_extract_markdown_sections_preserves_source_order(self) -> None:
         """Selected sections preserve original document order."""

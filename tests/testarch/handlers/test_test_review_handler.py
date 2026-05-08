@@ -15,9 +15,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from bmad_assist.core.loop.types import PhaseResult
 from bmad_assist.core.state import Phase, State
-
 
 # =============================================================================
 # Fixtures
@@ -31,7 +29,7 @@ def mock_config() -> MagicMock:
     config.testarch = MagicMock()
     config.testarch.engagement_model = "auto"  # Allow workflows to run
     config.testarch.test_review_on_code_complete = "auto"
-    
+
     config.providers = MagicMock()
     config.providers.master = MagicMock()
     config.providers.master.provider = "claude"
@@ -92,6 +90,14 @@ class TestTestReviewHandlerCreation:
     def test_handler_phase_name(self, handler: "TestReviewHandler") -> None:
         """TestReviewHandler.phase_name returns 'test_review'."""
         assert handler.phase_name == "test_review"
+
+    def test_story_id_uses_hyphenated_story_without_epic_duplication(
+        self, state_story_1_1: State
+    ) -> None:
+        """Test review filenames use the canonical short story key."""
+        from bmad_assist.testarch.handlers.test_review import _format_test_review_story_id
+
+        assert _format_test_review_story_id(state_story_1_1) == "1-1"
 
 
 # =============================================================================
@@ -449,6 +455,8 @@ class TestWorkflowInvocation:
         review_file = result.outputs.get("review_file")
         assert review_file is not None
         assert "test-review" in review_file
+        assert "test-review-1-1-" in Path(review_file).name
+        assert "test-review-1-1.1-" not in Path(review_file).name
         assert Path(review_file).exists()
 
 

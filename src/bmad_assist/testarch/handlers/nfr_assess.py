@@ -27,13 +27,13 @@ logger = logging.getLogger(__name__)
 class NFRAssessHandler(TestarchBaseHandler):
     """Handler for TEA_NFR_ASSESS phase.
 
-    Executes the testarch-nfr workflow to assess non-functional requirements
+    Executes the testarch-nfr-assess workflow to assess non-functional requirements
     during epic_teardown scope (after trace, before retrospective).
 
     The handler:
     1. Detects existing NFR assessment
     2. Skips if assessment already exists (returns skipped result)
-    3. Invokes testarch-nfr workflow if mode allows
+    3. Invokes testarch-nfr-assess workflow if mode allows
     4. Tracks execution in state (nfr_assess_ran_in_epic)
 
     """
@@ -119,7 +119,7 @@ class NFRAssessHandler(TestarchBaseHandler):
         }
 
     def _invoke_nfr_assess_workflow(self, state: State) -> PhaseResult:
-        """Invoke the testarch-nfr workflow using master provider.
+        """Invoke the testarch-nfr-assess workflow using master provider.
 
         Args:
             state: Current loop state.

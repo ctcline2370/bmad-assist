@@ -31,6 +31,7 @@ from bmad_assist.ipc.protocol import (
     SOCKET_DIR,
     IPCError,
     deserialize,
+    get_socket_dirs,
     read_message,
     write_message,
 )
@@ -44,6 +45,26 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+_DEFAULT_SOCKET_DIR = SOCKET_DIR
+
+
+def _discovery_socket_dirs() -> list[Path]:
+    """Return socket directories to scan, honoring test-local monkeypatches."""
+    local_dir = SOCKET_DIR.expanduser()
+    if SOCKET_DIR != _DEFAULT_SOCKET_DIR:
+        try:
+            return [local_dir] if local_dir.exists() else []
+        except PermissionError:
+            return []
+
+    socket_dirs = get_socket_dirs()
+    try:
+        local_exists = local_dir.exists()
+    except PermissionError:
+        local_exists = False
+    if local_exists and local_dir not in socket_dirs:
+        socket_dirs.insert(0, local_dir)
+    return socket_dirs
 
 
 @dataclass(frozen=True)
@@ -161,14 +182,9 @@ async def discover_instances_async(
         only stale sockets.
 
     """
-    socket_dir = SOCKET_DIR.expanduser()
-    try:
-        if not socket_dir.exists():
-            return []
-    except PermissionError:
-        return []
-
-    sock_files = sorted(socket_dir.glob("*.sock"))
+    sock_files: list[Path] = []
+    for socket_dir in _discovery_socket_dirs():
+        sock_files.extend(sorted(socket_dir.glob("*.sock")))
     if not sock_files:
         return []
 

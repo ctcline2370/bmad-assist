@@ -36,14 +36,14 @@ class ATDDResolver(BaseResolver):
 
     def __init__(
         self,
-        base_path: Path,
+        base_path: Path | list[Path] | tuple[Path, ...],
         max_tokens: int,
         max_files: int = DEFAULT_MAX_FILES,
     ) -> None:
         """Initialize ATDD resolver.
 
         Args:
-            base_path: Base directory for artifact search.
+            base_path: Base directory or ordered base directories for artifact search.
             max_tokens: Maximum tokens budget for this resolver.
             max_files: Maximum number of ATDD files to load.
 

@@ -11,11 +11,10 @@ Tests verify:
 - AC8: Verbose flag enables debug logging
 """
 
-import asyncio
 import errno
 import os
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from typer.testing import CliRunner
@@ -35,7 +34,11 @@ runner = CliRunner()
 def mock_asyncio_run():
     """Mock asyncio.run to prevent blocking during tests."""
     with patch("asyncio.run") as mock:
-        mock.return_value = None
+        def _close_coro(coro):
+            coro.close()
+            return None
+
+        mock.side_effect = _close_coro
         yield mock
 
 
@@ -111,7 +114,7 @@ class TestServeDefaultPort:
         """
         # GIVEN: Valid project directory
         # Using tmp_path directly (autouse fixture creates sprint-status.yaml)
-        
+
 
         # WHEN: User runs serve without --port
         result = runner.invoke(app, ["serve", "--project", str(tmp_path)])
@@ -130,7 +133,7 @@ class TestServeDefaultPort:
         """
         # GIVEN: Valid project directory
         # Using tmp_path directly (autouse fixture creates sprint-status.yaml)
-        
+
 
         # WHEN: User runs serve
         result = runner.invoke(app, ["serve", "--project", str(tmp_path)])
@@ -148,7 +151,7 @@ class TestServeDefaultPort:
         """
         # GIVEN: Valid project directory
         # Using tmp_path directly (autouse fixture creates sprint-status.yaml)
-        
+
 
         # WHEN: User runs serve
         result = runner.invoke(app, ["serve", "--project", str(tmp_path)])
@@ -165,7 +168,7 @@ class TestServeDefaultPort:
         """
         # GIVEN: Valid project directory
         # Using tmp_path directly (autouse fixture creates sprint-status.yaml)
-        
+
 
         # WHEN: User runs serve
         result = runner.invoke(app, ["serve", "--project", str(tmp_path)])
@@ -189,7 +192,7 @@ class TestServeCustomPort:
         """
         # GIVEN: Valid project directory
         # Using tmp_path directly (autouse fixture creates sprint-status.yaml)
-        
+
 
         # WHEN: User runs serve with custom port
         result = runner.invoke(app, ["serve", "--project", str(tmp_path), "--port", "3000"])
@@ -205,7 +208,7 @@ class TestServeCustomPort:
         """
         # GIVEN: Valid project directory
         # Using tmp_path directly (autouse fixture creates sprint-status.yaml)
-        
+
 
         # WHEN: User runs serve with -p short form
         # Note: -p is used for --project in other commands, check if serve uses different
@@ -231,7 +234,7 @@ class TestServeCustomHost:
         """
         # GIVEN: Valid project directory
         # Using tmp_path directly (autouse fixture creates sprint-status.yaml)
-        
+
 
         # WHEN: User runs serve with custom host
         result = runner.invoke(app, ["serve", "--project", str(tmp_path), "--host", "0.0.0.0"])
@@ -249,7 +252,7 @@ class TestServeCustomHost:
         """
         # GIVEN: Valid project directory
         # Using tmp_path directly (autouse fixture creates sprint-status.yaml)
-        
+
 
         # WHEN: User runs serve without --host
         result = runner.invoke(app, ["serve", "--project", str(tmp_path)])
@@ -273,7 +276,7 @@ class TestServeConfigLoading:
         """
         # GIVEN: Project without config
         # Using tmp_path directly (autouse fixture creates sprint-status.yaml)
-        
+
         # No bmad-assist.yaml created
 
         # WHEN: User runs serve
@@ -293,7 +296,7 @@ class TestServeConfigLoading:
         """
         # GIVEN: Valid project directory
         # Using tmp_path directly (autouse fixture creates sprint-status.yaml)
-        
+
 
         # WHEN: Config loading fails (note: serve should catch internally)
         result = runner.invoke(app, ["serve", "--project", str(tmp_path)])
@@ -335,7 +338,7 @@ class TestServeGracefulShutdown:
         """
         # GIVEN: Valid project directory
         # Using tmp_path directly (autouse fixture creates sprint-status.yaml)
-        
+
 
         # WHEN: Server shuts down
         result = runner.invoke(app, ["serve", "--project", str(tmp_path)])
@@ -360,11 +363,15 @@ class TestServePortInUse:
         """
         # GIVEN: Valid project directory
         # Using tmp_path directly (autouse fixture creates sprint-status.yaml)
-        
+
 
         # WHEN: Port is in use (OSError with EADDRINUSE)
         with patch("asyncio.run") as mock_run:
-            mock_run.side_effect = OSError(errno.EADDRINUSE, "Address already in use")
+            def _raise_port_in_use(coro):
+                coro.close()
+                raise OSError(errno.EADDRINUSE, "Address already in use")
+
+            mock_run.side_effect = _raise_port_in_use
             result = runner.invoke(app, ["serve", "--project", str(tmp_path), "--port", "9600"])
 
         # THEN: Error message mentions port in use
@@ -378,11 +385,15 @@ class TestServePortInUse:
         """
         # GIVEN: Valid project directory
         # Using tmp_path directly (autouse fixture creates sprint-status.yaml)
-        
+
 
         # WHEN: Port is in use
         with patch("asyncio.run") as mock_run:
-            mock_run.side_effect = OSError(errno.EADDRINUSE, "Address already in use")
+            def _raise_port_in_use(coro):
+                coro.close()
+                raise OSError(errno.EADDRINUSE, "Address already in use")
+
+            mock_run.side_effect = _raise_port_in_use
             result = runner.invoke(app, ["serve", "--project", str(tmp_path), "--port", "9600"])
 
         # THEN: Exit code is 1
@@ -431,7 +442,7 @@ class TestServeVerboseLogging:
         """
         # GIVEN: Valid project directory
         # Using tmp_path directly (autouse fixture creates sprint-status.yaml)
-        
+
 
         # WHEN: User runs serve with --verbose
         result = runner.invoke(app, ["serve", "--project", str(tmp_path), "--verbose"])
@@ -508,7 +519,7 @@ class TestServePortAutoDiscovery:
         """
         # GIVEN: Valid project directory
         # Using tmp_path directly (autouse fixture creates sprint-status.yaml)
-        
+
 
         # Mock find_available_port to return different port
         with patch(
@@ -529,7 +540,7 @@ class TestServePortAutoDiscovery:
         """
         # GIVEN: Valid project directory
         # Using tmp_path directly (autouse fixture creates sprint-status.yaml)
-        
+
 
         # Mock find_available_port to return different port
         with patch("bmad_assist.dashboard.server.find_available_port", return_value=9602):
@@ -550,7 +561,7 @@ class TestServePortAutoDiscovery:
         """
         # GIVEN: Valid project directory
         # Using tmp_path directly (autouse fixture creates sprint-status.yaml)
-        
+
 
         # Mock find_available_port to return different port
         with patch("bmad_assist.dashboard.server.find_available_port", return_value=9602):
@@ -567,11 +578,15 @@ class TestServePortAutoDiscovery:
         """
         # GIVEN: Valid project directory
         # Using tmp_path directly (autouse fixture creates sprint-status.yaml)
-        
+
 
         # Mock asyncio.run to raise port in use error
         with patch("asyncio.run") as mock_run:
-            mock_run.side_effect = OSError(errno.EADDRINUSE, "Address already in use")
+            def _raise_port_in_use(coro):
+                coro.close()
+                raise OSError(errno.EADDRINUSE, "Address already in use")
+
+            mock_run.side_effect = _raise_port_in_use
 
             # WHEN: User runs serve with --no-auto-port
             result = runner.invoke(app, ["serve", "--project", str(tmp_path), "--no-auto-port"])
@@ -586,7 +601,7 @@ class TestServePortAutoDiscovery:
         """
         # GIVEN: Valid project directory
         # Using tmp_path directly (autouse fixture creates sprint-status.yaml)
-        
+
 
         # Mock find_available_port
         with patch("bmad_assist.dashboard.server.find_available_port") as mock_find:
@@ -605,7 +620,7 @@ class TestServePortAutoDiscovery:
 
         # GIVEN: Valid project directory
         # Using tmp_path directly (autouse fixture creates sprint-status.yaml)
-        
+
 
         # Mock find_available_port to raise DashboardError
         with patch(
@@ -629,7 +644,7 @@ class TestServePortAutoDiscovery:
         """
         # GIVEN: Valid project directory
         # Using tmp_path directly (autouse fixture creates sprint-status.yaml)
-        
+
 
         # Mock find_available_port
         with patch(

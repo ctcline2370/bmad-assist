@@ -1017,16 +1017,16 @@ class BaseHandler(ABC):
             return PhaseResult.fail(str(e))
         except ProviderTimeoutError as e:
             artifact_path = self._save_timeout_artifact(state, e)
-            outputs: dict[str, Any] = {}
+            timeout_outputs: dict[str, Any] = {}
             artifact_suffix = ""
             if artifact_path is not None:
-                outputs["timeout_artifact"] = str(artifact_path)
+                timeout_outputs["timeout_artifact"] = str(artifact_path)
                 artifact_suffix = f" (partial output: {artifact_path})"
             logger.error("Handler provider timeout: %s", e)
             return PhaseResult(
                 success=False,
                 error=f"Provider timeout: {e}{artifact_suffix}",
-                outputs=outputs,
+                outputs=timeout_outputs,
             )
         except Exception as e:
             logger.error("Handler execution failed: %s", e, exc_info=True)

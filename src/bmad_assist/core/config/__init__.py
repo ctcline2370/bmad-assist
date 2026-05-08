@@ -83,6 +83,7 @@ from bmad_assist.core.config.models import (
     StrategicContextWorkflowConfig,
     StrategicDocType,
     TimeoutsConfig,
+    ToolGuardConfig,
     WarningsConfig,
     _create_story_defaults,
     _validate_story_defaults,
@@ -150,6 +151,7 @@ __all__ = [
     # Models - Features
     "CompilerConfig",
     "TimeoutsConfig",
+    "ToolGuardConfig",
     "BenchmarkingConfig",
     "PlaywrightServerConfig",
     "PlaywrightConfig",

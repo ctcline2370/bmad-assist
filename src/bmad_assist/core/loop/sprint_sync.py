@@ -13,7 +13,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from bmad_assist.core.exceptions import StateError
-from bmad_assist.core.state import State, save_state
+from bmad_assist.core.state import Phase, State, save_state
 from bmad_assist.core.types import EpicId
 
 logger = logging.getLogger(__name__)
@@ -28,6 +28,30 @@ __all__ = [
 
 # Type alias for state parameter
 LoopState = State
+
+
+def _requires_test_review_for_done() -> bool:
+    """Return true when the active story loop includes BMAD TEST_REVIEW."""
+    try:
+        from bmad_assist.core.config import get_loop_config
+
+        loop_config = get_loop_config()
+    except Exception:
+        return False
+
+    return Phase.TEST_REVIEW.value in loop_config.story
+
+
+def _get_epic_teardown_phases() -> tuple[str, ...]:
+    """Return configured epic teardown phases for resume validation."""
+    try:
+        from bmad_assist.core.config import get_loop_config
+
+        loop_config = get_loop_config()
+    except Exception:
+        return (Phase.RETROSPECTIVE.value,)
+
+    return tuple(loop_config.epic_teardown)
 
 
 def _validate_resume_against_sprint(
@@ -68,7 +92,15 @@ def _validate_resume_against_sprint(
         return state, False
 
     try:
-        result = validate_resume_state(state, project_path, epic_list, epic_stories_loader)
+        result = validate_resume_state(
+            state,
+            project_path,
+            epic_list,
+            epic_stories_loader,
+            require_completion_artifacts_for_done=True,
+            require_test_review_for_done=_requires_test_review_for_done(),
+            epic_teardown_phases=_get_epic_teardown_phases(),
+        )
 
         if result.project_complete:
             # All epics done - save state if changed and signal completion

@@ -12,7 +12,6 @@ from bmad_assist.core.async_utils import (
     run_async_with_timeout,
 )
 
-
 # --- Helpers ---
 
 
@@ -36,6 +35,21 @@ async def async_get_thread_id():
     return threading.current_thread().ident
 
 
+async def async_spawn_pending_task(cancelled):
+    """Coroutine that leaves a child task pending until loop cleanup."""
+
+    async def sleeper():
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+
+    asyncio.create_task(sleeper())
+    await asyncio.sleep(0)
+    return "done"
+
+
 # --- Tests for _run_coro_in_new_loop ---
 
 
@@ -56,6 +70,14 @@ class TestRunCoroInNewLoop:
         # Should raise RuntimeError because no loop is set
         with pytest.raises(RuntimeError):
             asyncio.get_event_loop()
+
+    def test_cancels_pending_tasks_before_loop_close(self):
+        cancelled = []
+
+        result = _run_coro_in_new_loop(async_spawn_pending_task(cancelled))
+
+        assert result == "done"
+        assert cancelled == [True]
 
 
 # --- Tests for run_async_in_thread ---
@@ -151,3 +173,11 @@ class TestRunAsyncWithTimeout:
     def test_propagates_exception(self):
         with pytest.raises(TypeError, match="type error"):
             run_async_with_timeout(async_raise(TypeError("type error")))
+
+    def test_cancels_pending_tasks_before_loop_close(self):
+        cancelled = []
+
+        result = run_async_with_timeout(async_spawn_pending_task(cancelled))
+
+        assert result == "done"
+        assert cancelled == [True]

@@ -24,6 +24,7 @@ from bmad_assist.ipc.protocol import (
     SOCKET_DIR,
     compute_project_hash,
     deserialize,
+    get_socket_dirs,
     read_message,
     write_message,
 )
@@ -42,6 +43,26 @@ __all__ = [
 ]
 
 logger = logging.getLogger(__name__)
+_DEFAULT_SOCKET_DIR = SOCKET_DIR
+
+
+def _cleanup_socket_dirs() -> list[Path]:
+    """Return socket directories to scan, honoring test-local monkeypatches."""
+    local_dir = SOCKET_DIR.expanduser()
+    if SOCKET_DIR != _DEFAULT_SOCKET_DIR:
+        try:
+            return [local_dir] if local_dir.exists() else []
+        except PermissionError:
+            return []
+
+    socket_dirs = get_socket_dirs()
+    try:
+        local_exists = local_dir.exists()
+    except PermissionError:
+        local_exists = False
+    if local_exists and local_dir not in socket_dirs:
+        socket_dirs.insert(0, local_dir)
+    return socket_dirs
 
 # =============================================================================
 # Module-level active socket tracking (AC #10)
@@ -268,26 +289,23 @@ def find_orphaned_sockets() -> list[tuple[Path, int | None, str]]:
         Reasons: "no_lock_file", "process_dead", "connect_failed".
 
     """
-    socket_dir = SOCKET_DIR.expanduser()
-    if not socket_dir.exists():
-        return []
-
     orphans: list[tuple[Path, int | None, str]] = []
-    for sock_file in sorted(socket_dir.glob("*.sock")):
-        lock_path = Path(f"{sock_file}.lock")
+    for socket_dir in _cleanup_socket_dirs():
+        for sock_file in sorted(socket_dir.glob("*.sock")):
+            lock_path = Path(f"{sock_file}.lock")
 
-        if not lock_path.exists():
-            orphans.append((sock_file, None, "no_lock_file"))
-            continue
+            if not lock_path.exists():
+                orphans.append((sock_file, None, "no_lock_file"))
+                continue
 
-        pid = read_socket_pid(lock_path)
+            pid = read_socket_pid(lock_path)
 
-        if pid is None or not _is_pid_alive(pid):
-            orphans.append((sock_file, pid, "process_dead"))
-            continue
+            if pid is None or not _is_pid_alive(pid):
+                orphans.append((sock_file, pid, "process_dead"))
+                continue
 
-        # PID alive — not orphaned for basic scan
-        # (connect_failed reason only used with force/probe mode)
+            # PID alive — not orphaned for basic scan
+            # (connect_failed reason only used with force/probe mode)
 
     return orphans
 
@@ -370,8 +388,7 @@ def cleanup_orphaned_sockets(force: bool = False) -> list[Path]:
 
     # If force=True, also probe live-PID sockets
     if force:
-        socket_dir = SOCKET_DIR.expanduser()
-        if socket_dir.exists():
+        for socket_dir in _cleanup_socket_dirs():
             for sock_file in sorted(socket_dir.glob("*.sock")):
                 # Skip already cleaned
                 if sock_file in cleaned:
@@ -414,19 +431,15 @@ def cleanup_stale_sockets_on_startup(project_root: Path) -> None:
 
     """
     project_hash = compute_project_hash(project_root)
-    socket_dir = SOCKET_DIR.expanduser()
+    for socket_dir in _cleanup_socket_dirs():
+        sock_path = socket_dir / f"{project_hash}.sock"
+        if not sock_path.exists():
+            continue
 
-    if not socket_dir.exists():
-        return
-
-    sock_path = socket_dir / f"{project_hash}.sock"
-    if not sock_path.exists():
-        return
-
-    if is_socket_stale(sock_path):
-        logger.warning(
-            "Removing stale socket for project %s on startup: %s",
-            project_root.name,
-            sock_path.name,
-        )
-        cleanup_socket(sock_path)
+        if is_socket_stale(sock_path):
+            logger.warning(
+                "Removing stale socket for project %s on startup: %s",
+                project_root.name,
+                sock_path.name,
+            )
+            cleanup_socket(sock_path)

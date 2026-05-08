@@ -121,7 +121,7 @@ class TestEvidenceInWorkflows:
         workflow_dir = tmp_path / "_bmad/bmm/workflows/testarch/nfr"
         workflow_dir.mkdir(parents=True)
         (workflow_dir / "workflow.yaml").write_text("""
-name: testarch-nfr
+name: testarch-nfr-assess
 description: "NFR assessment"
 instructions: "{installed_path}/instructions.xml"
 """)
@@ -163,7 +163,7 @@ end_of_record
 
         mock_compiled = MagicMock()
         mock_compiled.context = "<compiled>nfr</compiled>"
-        mock_compiled.workflow_name = "testarch-nfr"
+        mock_compiled.workflow_name = "testarch-nfr-assess"
 
         mock_provider = MagicMock()
         from bmad_assist.providers.base import ProviderResult

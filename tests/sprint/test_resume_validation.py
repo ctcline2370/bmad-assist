@@ -1,10 +1,8 @@
 """Tests for sprint resume validation module."""
 
-from datetime import datetime
 from pathlib import Path
 
 import pytest
-import yaml
 
 from bmad_assist.core.exceptions import StateError
 from bmad_assist.core.state import Phase, State
@@ -43,6 +41,30 @@ def _write_legacy_retro_artifact(tmp_path: Path, epic_id: int) -> Path:
     retro_path = implementation_artifacts / f"epic-{epic_id}-retro-20260101_000000.md"
     retro_path.write_text(f"# Epic {epic_id} retrospective\n")
     return retro_path
+
+
+def _write_story_completion_artifacts(
+    tmp_path: Path,
+    story_id: str,
+    *,
+    include_test_review: bool = False,
+) -> None:
+    """Write durable story completion artifacts for the given story."""
+    story_key = story_id.replace(".", "-")
+    implementation_artifacts = tmp_path / "_bmad-output" / "implementation-artifacts"
+
+    code_reviews_dir = implementation_artifacts / "code-reviews"
+    code_reviews_dir.mkdir(parents=True, exist_ok=True)
+    (code_reviews_dir / f"synthesis-{story_key}-20260101T000000Z.md").write_text(
+        f"# Synthesis {story_id}\n"
+    )
+
+    if include_test_review:
+        test_reviews_dir = implementation_artifacts / "test-reviews"
+        test_reviews_dir.mkdir(parents=True, exist_ok=True)
+        (test_reviews_dir / f"test-review-{story_key}-20260101T000000Z.md").write_text(
+            "# Test Review\n\nQuality Score: 90/100\n"
+        )
 
 
 @pytest.fixture
@@ -272,6 +294,31 @@ development_status:
         result = _find_next_incomplete_story("1.1", ["1.1", "1.2"], [], sprint_status)
         assert result is None
 
+    def test_done_story_without_required_artifacts_is_incomplete(self, tmp_path):
+        """Does not skip a sprint-status done story without durable completion artifacts."""
+        from bmad_assist.sprint.parser import parse_sprint_status
+
+        yaml_content = """
+generated: '2026-01-01'
+development_status:
+  1-1-first: done
+  1-2-second: done
+"""
+        path = tmp_path / "sprint-status.yaml"
+        path.write_text(yaml_content)
+        sprint_status = parse_sprint_status(path)
+        _write_story_completion_artifacts(tmp_path, "1.1", include_test_review=True)
+
+        result = _find_next_incomplete_story(
+            "1.1",
+            ["1.1", "1.2"],
+            [],
+            sprint_status,
+            project_path=tmp_path,
+            require_test_review_for_done=True,
+        )
+        assert result == "1.2"
+
 
 class TestFindNextIncompleteEpic:
     """Tests for _find_next_incomplete_epic helper."""
@@ -352,6 +399,84 @@ class TestValidateResumeState:
         assert result.state.current_phase == Phase.CREATE_STORY
         assert "2.1" in result.state.completed_stories
 
+    def test_done_story_without_synthesis_raises_when_completion_artifacts_required(
+        self,
+        tmp_path,
+        state_at_epic_2_story_1,
+        epic_stories_loader,
+        basic_sprint_status_yaml,
+    ):
+        """Fails closed when sprint-status says done but synthesis evidence is missing."""
+        _write_sprint_status(tmp_path, basic_sprint_status_yaml)
+        _write_retro_artifact(tmp_path, 1)
+
+        with pytest.raises(
+            StateError,
+            match="Story 2.1 completion is incomplete .*durable code-review synthesis artifact is missing",
+        ):
+            validate_resume_state(
+                state_at_epic_2_story_1,
+                tmp_path,
+                [1, 2, 3],
+                epic_stories_loader,
+                require_test_review_for_done=True,
+            )
+
+    def test_done_story_without_test_review_raises_when_test_review_required(
+        self,
+        tmp_path,
+        state_at_epic_2_story_1,
+        epic_stories_loader,
+        basic_sprint_status_yaml,
+    ):
+        """Fails closed when TEA completion is missing a durable test-review artifact."""
+        _write_sprint_status(tmp_path, basic_sprint_status_yaml)
+        _write_retro_artifact(tmp_path, 1)
+        _write_story_completion_artifacts(tmp_path, "2.1", include_test_review=False)
+
+        with pytest.raises(
+            StateError,
+            match="Story 2.1 completion is incomplete .*durable test-review artifact is missing",
+        ):
+            validate_resume_state(
+                state_at_epic_2_story_1,
+                tmp_path,
+                [1, 2, 3],
+                epic_stories_loader,
+                require_test_review_for_done=True,
+            )
+
+    def test_test_review_phase_is_not_skipped_when_sprint_status_says_done(
+        self,
+        tmp_path,
+        epic_stories_loader,
+        basic_sprint_status_yaml,
+    ):
+        """Keeps a resume state at TEST_REVIEW when test-review evidence is missing."""
+        _write_sprint_status(tmp_path, basic_sprint_status_yaml)
+        _write_retro_artifact(tmp_path, 1)
+        _write_story_completion_artifacts(tmp_path, "2.1", include_test_review=False)
+
+        state = State(
+            current_epic=2,
+            current_story="2.1",
+            current_phase=Phase.TEST_REVIEW,
+            completed_stories=[],
+            completed_epics=[1],
+        )
+
+        result = validate_resume_state(
+            state,
+            tmp_path,
+            [1, 2, 3],
+            epic_stories_loader,
+            require_test_review_for_done=True,
+        )
+
+        assert result.advanced is False
+        assert result.state == state
+        assert result.stories_skipped == []
+
     def test_skips_done_epic(self, tmp_path, epic_stories_loader):
         """Advances to next epic when current epic is done in sprint-status."""
         yaml_content = """
@@ -418,6 +543,132 @@ development_status:
             match="Epic 2 has all stories marked done in sprint-status, but epic teardown is incomplete",
         ):
             validate_resume_state(state, tmp_path, [1, 2, 3], epic_stories_loader)
+
+    def test_configured_trace_teardown_phase_is_not_skipped_when_all_stories_done(
+        self, tmp_path, epic_stories_loader
+    ):
+        """Allows configured TRACE teardown to execute before retrospective closes the epic."""
+        yaml_content = """
+generated: '2026-01-01'
+development_status:
+  epic-1: done
+  epic-1-retrospective: done
+  1-1-first: done
+  1-2-second: done
+  epic-2: in-progress
+  epic-2-retrospective: backlog
+  2-1-first: done
+  2-2-second: done
+  2-3-third: done
+  epic-3: backlog
+  3-1-first: backlog
+"""
+        _write_sprint_status(tmp_path, yaml_content)
+        _write_retro_artifact(tmp_path, 1)
+
+        state = State(
+            current_epic=2,
+            current_story="2.3",
+            current_phase=Phase.TRACE,
+            completed_stories=["2.1", "2.2", "2.3"],
+            completed_epics=[1],
+        )
+
+        result = validate_resume_state(
+            state,
+            tmp_path,
+            [1, 2, 3],
+            epic_stories_loader,
+            epic_teardown_phases=["trace", "tea_nfr_assess", "retrospective"],
+        )
+
+        assert result.advanced is False
+        assert result.state == state
+        assert result.stories_skipped == []
+
+    def test_configured_tea_nfr_teardown_phase_is_not_skipped_when_all_stories_done(
+        self, tmp_path, epic_stories_loader
+    ):
+        """Allows configured TEA NFR teardown to execute before retrospective closes the epic."""
+        yaml_content = """
+generated: '2026-01-01'
+development_status:
+  epic-1: done
+  epic-1-retrospective: done
+  1-1-first: done
+  1-2-second: done
+  epic-2: in-progress
+  epic-2-retrospective: backlog
+  2-1-first: done
+  2-2-second: done
+  2-3-third: done
+  epic-3: backlog
+  3-1-first: backlog
+"""
+        _write_sprint_status(tmp_path, yaml_content)
+        _write_retro_artifact(tmp_path, 1)
+
+        state = State(
+            current_epic=2,
+            current_story="2.3",
+            current_phase=Phase.TEA_NFR_ASSESS,
+            completed_stories=["2.1", "2.2", "2.3"],
+            completed_epics=[1],
+        )
+
+        result = validate_resume_state(
+            state,
+            tmp_path,
+            [1, 2, 3],
+            epic_stories_loader,
+            epic_teardown_phases=["trace", "tea_nfr_assess", "retrospective"],
+        )
+
+        assert result.advanced is False
+        assert result.state == state
+        assert result.stories_skipped == []
+
+    def test_unconfigured_trace_teardown_phase_still_fails_closed(
+        self, tmp_path, epic_stories_loader
+    ):
+        """Does not treat TRACE as resumable teardown unless the loop config includes it."""
+        yaml_content = """
+generated: '2026-01-01'
+development_status:
+  epic-1: done
+  epic-1-retrospective: done
+  1-1-first: done
+  1-2-second: done
+  epic-2: in-progress
+  epic-2-retrospective: backlog
+  2-1-first: done
+  2-2-second: done
+  2-3-third: done
+  epic-3: backlog
+  3-1-first: backlog
+"""
+        _write_sprint_status(tmp_path, yaml_content)
+        _write_retro_artifact(tmp_path, 1)
+
+        state = State(
+            current_epic=2,
+            current_story="2.3",
+            current_phase=Phase.TRACE,
+            completed_stories=["2.1", "2.2", "2.3"],
+            completed_epics=[1],
+        )
+
+        with pytest.raises(
+            StateError,
+            match="Epic 2 has all stories marked done in sprint-status, but epic teardown is incomplete",
+        ):
+            validate_resume_state(
+                state,
+                tmp_path,
+                [1, 2, 3],
+                epic_stories_loader,
+                epic_teardown_phases=["retrospective"],
+            )
 
     def test_project_complete_all_done(
         self, tmp_path, epic_stories_loader, all_done_sprint_status_yaml

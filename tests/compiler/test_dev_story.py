@@ -495,6 +495,44 @@ Future epic context.
         assert "# Epic 13: Remove Me" not in epic_content
         assert "# Epic 15: Remove Me Too" not in epic_content
 
+    def test_epic_context_ignores_epic_list_section_before_trimming(
+        self,
+        tmp_project: Path,
+    ) -> None:
+        """Consolidated epics.md files with Epic List still trim to the active epic."""
+        story_file = tmp_project / "docs" / "sprint-artifacts" / "14-1-test.md"
+        story_file.write_text("# Story 14.1\n\nStatus: ready-for-dev")
+
+        (tmp_project / "docs" / "epics.md").write_text("""# Feature Plan
+
+## Epic Ownership and Collision Analysis
+
+Planning guidance.
+
+## Epic List
+### Epic 14: Keep Me
+
+Target epic context.
+
+#### Story 14.1: Target Story
+
+### Epic 15: Remove Me
+
+Future epic context.
+""")
+
+        context = create_test_context(tmp_project)
+        compiler = DevStoryCompiler()
+        compiler.validate_context(context)
+
+        context_files = compiler._build_context_files(context, context.resolved_variables)
+        epic_content = next(v for k, v in context_files.items() if k.endswith("epics.md"))
+
+        assert epic_content.startswith("### Epic 14: Keep Me")
+        assert "Target epic context" in epic_content
+        assert "## Epic List" not in epic_content
+        assert "### Epic 15: Remove Me" not in epic_content
+
     def test_story_context_keeps_only_implementation_sections(self, tmp_project: Path) -> None:
         """Final story context excludes execution-noise sections while keeping dev notes."""
         story_file = tmp_project / "docs" / "sprint-artifacts" / "14-1-test.md"
@@ -886,6 +924,24 @@ class TestSourceContextConfigDefaults:
         ):
             assert compiler._get_context_token_cap() == 12000
 
+    def test_context_cap_clamps_configured_budget_to_output_hard_limit(self) -> None:
+        """dev_story context cap cannot exceed the final output hard limit."""
+        compiler = DevStoryCompiler()
+        mock_budget_config = MagicMock()
+        mock_budget_config.get_budget.return_value = 45000
+        mock_source_context = MagicMock()
+        mock_source_context.budgets = mock_budget_config
+        mock_compiler_config = MagicMock()
+        mock_compiler_config.source_context = mock_source_context
+        mock_config = MagicMock()
+        mock_config.compiler = mock_compiler_config
+
+        with patch(
+            "bmad_assist.core.config.loaders.get_config",
+            return_value=mock_config,
+        ):
+            assert compiler._get_context_token_cap() == 20000
+
     def test_prune_context_files_honors_token_cap(self, tmp_project: Path) -> None:
         """Pruning respects the caller-provided operational cap."""
         compiler = DevStoryCompiler()
@@ -1057,6 +1113,51 @@ class TestSourceContextConfigDefaults:
         assert "# critical" not in pruned_files["src/critical.py"]
         assert "read this file directly" in pruned_files["src/critical.py"]
 
+    def test_hard_cap_pruning_can_drop_epic_context_after_source_pruning(
+        self,
+        tmp_project: Path,
+    ) -> None:
+        """Hard-cap pruning can drop epic context when source pruning is exhausted."""
+        compiler = DevStoryCompiler()
+        context = create_test_context(tmp_project)
+
+        with patch.object(
+            compiler,
+            "_estimate_prompt_tokens",
+            side_effect=[600, 550, 500, 450, 390],
+        ):
+            (
+                pruned_files,
+                pruned_tokens,
+                dropped_sections,
+                dropped_source_files,
+            ) = compiler._prune_context_files(
+                {"docs/project-context.md": "# Context"},
+                {"docs/code-antipatterns.md": "# Antipatterns"},
+                {"docs/epics/epic-14.md": "# Epic"},
+                {"docs/test-design.md": "# Test Design"},
+                {"docs/tea-notes.md": "# TEA Notes"},
+                {"docs/atdd-checklist-14.1.md": "# ATDD"},
+                {},
+                {"docs/sprint-artifacts/14-1-test.md": "# Story"},
+                token_cap=400,
+                context=context,
+                resolved=context.resolved_variables,
+                prune_epic=True,
+            )
+
+        assert pruned_tokens == 390
+        assert dropped_sections == [
+            "antipatterns",
+            "tea-other",
+            "tea-test-design",
+            "epic-context",
+        ]
+        assert dropped_source_files == []
+        assert "docs/epics/epic-14.md" not in pruned_files
+        assert "docs/atdd-checklist-14.1.md" in pruned_files
+        assert "docs/sprint-artifacts/14-1-test.md" in pruned_files
+
     def test_build_context_prunes_optional_context_toward_soft_cap(self, tmp_project: Path) -> None:
         """dev_story keeps source evidence while reducing optional context below the soft cap."""
         story_file = tmp_project / "docs" / "sprint-artifacts" / "14-1-test.md"
@@ -1110,6 +1211,68 @@ class TestSourceContextConfigDefaults:
         assert "docs/tea-notes.md" not in files
         assert "docs/test-design.md" in files
         assert str(source_file) in files
+        assert str(story_file) in files
+
+    def test_build_context_prunes_epic_context_as_hard_cap_last_resort(
+        self,
+        tmp_project: Path,
+    ) -> None:
+        """dev_story can fit under the hard cap by dropping epic context last."""
+        story_file = tmp_project / "docs" / "sprint-artifacts" / "14-1-test.md"
+        story_file.write_text("# Story\n\nStatus: ready-for-dev\n")
+        epic_file = tmp_project / "docs" / "epics" / "epic-14.md"
+        epic_file.write_text("# Epic 14\n\nDetailed epic context.\n")
+
+        compiler = DevStoryCompiler()
+        context = create_test_context(tmp_project)
+        resolved = {
+            **context.resolved_variables,
+            "story_file": str(story_file),
+            "story_id": "14.1",
+        }
+
+        with patch.object(
+            compiler,
+            "_estimate_prompt_tokens",
+            side_effect=[
+                21000,
+                21000,
+                20500,
+                20300,
+                20150,
+                21000,
+                20500,
+                20300,
+                20150,
+                19900,
+            ],
+        ), patch.object(
+            compiler,
+            "_get_context_token_cap",
+            return_value=20000,
+        ), patch(
+            "bmad_assist.compiler.strategic_context.load_antipatterns",
+            return_value={"docs/code-antipatterns.md": "# Antipatterns"},
+        ), patch(
+            "bmad_assist.compiler.workflows.dev_story.is_tea_context_enabled",
+            return_value=True,
+        ), patch(
+            "bmad_assist.compiler.workflows.dev_story.collect_tea_context",
+            return_value={
+                "docs/test-design.md": "# Test Design",
+                "docs/tea-notes.md": "# TEA Notes",
+                "docs/atdd-checklist-14.1.md": "# ATDD",
+            },
+        ):
+            files = compiler._build_context_files(
+                context,
+                resolved,
+                mission="Implement the story",
+                filtered_instructions="<workflow />",
+            )
+
+        assert str(epic_file) not in files
+        assert "docs/atdd-checklist-14.1.md" in files
         assert str(story_file) in files
 
     def test_tea_context_enabled_skips_legacy_atdd_fallback(self, tmp_project: Path) -> None:

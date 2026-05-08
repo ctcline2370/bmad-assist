@@ -15,7 +15,8 @@ logger = logging.getLogger(__name__)
 # Phases that trigger auto-commit
 # CREATE_STORY: Creates story documentation (commit after creation)
 # DEV_STORY: Modifies code (commit after implementation)
-# CODE_REVIEW_SYNTHESIS: Final story completion (commit after review)
+# CODE_REVIEW_SYNTHESIS: Code review completion (commit after review)
+# TEST_REVIEW: Test quality review completion (commit after TEA review)
 # RETROSPECTIVE: Epic retrospective report (commit after retrospective)
 # Validation phases excluded - their reports are outputs, not code changes
 COMMIT_PHASES: frozenset[Phase] = frozenset(
@@ -23,6 +24,7 @@ COMMIT_PHASES: frozenset[Phase] = frozenset(
         Phase.CREATE_STORY,
         Phase.DEV_STORY,
         Phase.CODE_REVIEW_SYNTHESIS,
+        Phase.TEST_REVIEW,
         Phase.RETROSPECTIVE,
     }
 )
@@ -32,6 +34,7 @@ PHASE_COMMIT_TYPES: dict[Phase, str] = {
     Phase.CREATE_STORY: "docs",
     Phase.DEV_STORY: "feat",
     Phase.CODE_REVIEW_SYNTHESIS: "refactor",
+    Phase.TEST_REVIEW: "test",
     Phase.RETROSPECTIVE: "chore",
 }
 
@@ -246,6 +249,8 @@ def _generate_conventional_message(
             description = "implement story"
         elif phase == Phase.CODE_REVIEW_SYNTHESIS:
             description = "apply code review changes"
+        elif phase == Phase.TEST_REVIEW:
+            description = "complete test review"
         else:
             description = f"complete {phase.value.replace('_', ' ')}"
 

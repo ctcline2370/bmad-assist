@@ -15,7 +15,6 @@ import pytest
 from typer.testing import CliRunner
 
 from bmad_assist.cli import app
-from bmad_assist.cli_utils import EXIT_ERROR, EXIT_SUCCESS
 from bmad_assist.core.exceptions import DashboardError
 
 runner = CliRunner()
@@ -148,8 +147,9 @@ Implementation of first story.
         WHEN dashboard server starts
         THEN existing file is used (no auto-generation).
         """
-        from bmad_assist.dashboard.server import DashboardServer
         import yaml
+
+        from bmad_assist.dashboard.server import DashboardServer
 
         # GIVEN: Project with existing sprint-status
         project_dir = tmp_path / "project"
@@ -197,8 +197,9 @@ Implementation of first story.
         WHEN dashboard server starts
         THEN legacy file is used (no auto-generation).
         """
-        from bmad_assist.dashboard.server import DashboardServer
         import yaml
+
+        from bmad_assist.dashboard.server import DashboardServer
 
         # GIVEN: Project with legacy sprint-status only
         project_dir = tmp_path / "project"
@@ -256,7 +257,11 @@ class TestServeAutoGenerationIntegration:
 
         # Mock asyncio.run to prevent actual server start
         with patch("asyncio.run") as mock_run:
-            mock_run.return_value = None
+            def _close_coro(coro):
+                coro.close()
+                return None
+
+            mock_run.side_effect = _close_coro
 
             # WHEN: User runs serve
             result = runner.invoke(app, ["serve", "--project", str(project_dir)])

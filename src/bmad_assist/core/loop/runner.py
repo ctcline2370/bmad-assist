@@ -53,7 +53,7 @@ from bmad_assist.core.loop.epic_phases import (
     _execute_epic_setup,
     _execute_epic_teardown,
 )
-from bmad_assist.core.loop.epic_transitions import handle_epic_completion
+from bmad_assist.core.loop.epic_transitions import complete_epic, handle_epic_completion
 from bmad_assist.core.loop.guardian import get_next_phase, guardian_check_anomaly
 from bmad_assist.core.loop.helpers import (
     _count_epic_stories,
@@ -133,6 +133,116 @@ def _get_unresolved_code_review_action_items(outputs: dict[str, Any] | None) -> 
     if count < 0:
         return None
     return count
+
+
+def _should_stop_after_successful_phase() -> bool:
+    """Return true when a recovery run should exit after the next saved boundary."""
+    return os.environ.get("BMAD_ASSIST_STOP_AFTER_PHASE") == "1"
+
+
+def _log_stop_after_successful_phase(completed_phase: Phase | None) -> None:
+    """Log a consistent stop-after-phase boundary message."""
+    logger.info(
+        "Stopping after successful phase %s because BMAD_ASSIST_STOP_AFTER_PHASE=1",
+        completed_phase.name if completed_phase else "unknown",
+    )
+
+
+def _load_story_completion_order(
+    state: State,
+    epic_stories_loader: Callable[[EpicId], list[str]],
+    lifecycle_epic_stories_loader: Callable[[EpicId], list[str]],
+) -> list[str]:
+    """Load the durable story order used for story-completion decisions."""
+    if state.current_epic is None:
+        raise StateError("Logic error: current_epic is None at story completion")
+
+    try:
+        lifecycle_stories = lifecycle_epic_stories_loader(state.current_epic)
+    except Exception as e:
+        raise StateError(
+            f"Failed to load lifecycle stories for epic {state.current_epic}: {e}"
+        ) from e
+
+    if state.current_story is None or state.current_story in lifecycle_stories:
+        return lifecycle_stories
+
+    try:
+        active_stories = epic_stories_loader(state.current_epic)
+    except Exception as e:
+        raise StateError(
+            f"Failed to load active stories for epic {state.current_epic}: {e}"
+        ) from e
+
+    if state.current_story in active_stories:
+        logger.warning(
+            "Lifecycle story list for epic %s omitted current story %s; "
+            "falling back to active story order",
+            state.current_epic,
+            state.current_story,
+        )
+        return active_stories
+
+    raise StateError(
+        "Cannot determine story completion order: current story "
+        f"{state.current_story} is absent from lifecycle stories for epic "
+        f"{state.current_epic}. Active stories: {active_stories}; "
+        f"lifecycle stories: {lifecycle_stories}"
+    )
+
+
+def _stage_epic_teardown_boundary(state: State, loop_config: Any, state_path: Path) -> State:
+    """Persist the first teardown phase without executing it."""
+    if not loop_config.epic_teardown:
+        return state
+
+    first_teardown_phase = Phase(loop_config.epic_teardown[0])
+    now = datetime.now(UTC).replace(tzinfo=None)
+    staged_state = state.model_copy(
+        update={
+            "current_phase": first_teardown_phase,
+            "updated_at": now,
+        }
+    )
+    start_phase_timing(staged_state)
+    save_state(staged_state, state_path)
+    logger.info(
+        "Staged epic %s teardown at phase %s without executing it",
+        staged_state.current_epic,
+        first_teardown_phase.name,
+    )
+    return staged_state
+
+
+def _complete_epic_boundary_for_stop_after_phase(
+    state: State,
+    state_path: Path,
+    project_path: Path,
+) -> State:
+    """Persist completed-epic state without advancing to the next epic."""
+    completed_state = complete_epic(state)
+    save_state(completed_state, state_path)
+    _invoke_sprint_sync(completed_state, project_path)
+    return completed_state
+
+
+def _get_teardown_phases(loop_config: Any) -> list[Phase]:
+    """Return configured teardown phases as Phase values."""
+    return [Phase(phase_name) for phase_name in loop_config.epic_teardown]
+
+
+def _get_next_teardown_phase(current_phase: Phase, loop_config: Any) -> Phase | None:
+    """Return the next configured teardown phase after current_phase."""
+    teardown_phases = _get_teardown_phases(loop_config)
+    try:
+        current_index = teardown_phases.index(current_phase)
+    except ValueError:
+        return None
+
+    next_index = current_index + 1
+    if next_index >= len(teardown_phases):
+        return None
+    return teardown_phases[next_index]
 
 
 def _map_exit_reason_to_run_status(exit_reason: LoopExitReason) -> tuple[RunStatus, str]:
@@ -1382,94 +1492,122 @@ def _run_loop_body(
             # Determine what to do next based on current phase
             current_phase = state.current_phase
 
-            # AC3: CODE_REVIEW_SYNTHESIS success → handle story completion
+            # AC3: terminal story phase success → handle story completion
             # CRITICAL: This check MUST happen before get_next_phase() because story completion
             # determines whether we advance to RETROSPECTIVE (epic complete) or next story.
-            if current_phase == Phase.CODE_REVIEW_SYNTHESIS and result.success:
+            if current_phase in (Phase.CODE_REVIEW_SYNTHESIS, Phase.TEST_REVIEW) and result.success:
                 # Rework loop: If verdict requires rework and feature is enabled, loop back to DEV_STORY
-                verdict = result.outputs.get("verdict", "UNKNOWN") if result.outputs else "UNKNOWN"
-                unresolved_action_items = _get_unresolved_code_review_action_items(
-                    result.outputs
-                )
-                rework_verdicts = {"REJECT", "MAJOR_REWORK"}
-                if (
-                    verdict in rework_verdicts
-                    and unresolved_action_items == 0
-                ):
-                    logger.info(
-                        "Code review %s produced zero unresolved synthesis action items; "
-                        "completing story without rework",
-                        verdict,
+                if current_phase == Phase.CODE_REVIEW_SYNTHESIS:
+                    verdict = result.outputs.get("verdict", "UNKNOWN") if result.outputs else "UNKNOWN"
+                    unresolved_action_items = _get_unresolved_code_review_action_items(
+                        result.outputs
                     )
-                elif (
-                    verdict in rework_verdicts
-                    and loop_config.code_review_rework
-                    and state.code_review_rework_count < loop_config.max_rework_attempts
-                ):
-                    rework_attempt = state.code_review_rework_count + 1
-                    logger.info(
-                        "Code review %s (attempt %d/%d), looping back to DEV_STORY",
-                        verdict,
-                        rework_attempt,
-                        loop_config.max_rework_attempts,
-                    )
-                    now = datetime.now(UTC).replace(tzinfo=None)
-                    state = state.model_copy(
-                        update={
-                            "current_phase": Phase.DEV_STORY,
-                            "code_review_rework_count": rework_attempt,
-                            "updated_at": now,
-                        }
-                    )
-                    save_state(state, state_path)
-                    continue
-                elif verdict in rework_verdicts:
-                    if loop_config.fail_on_unresolved_negative_code_review:
-                        if loop_config.code_review_rework:
-                            message = (
-                                "Code review "
-                                f"{verdict} remains unresolved after max rework attempts "
-                                f"({loop_config.max_rework_attempts}); stopping run."
-                            )
-                        else:
-                            message = (
-                                "Code review "
-                                f"{verdict} remains unresolved and "
-                                "loop.code_review_rework is disabled; stopping run."
-                            )
-                        logger.error(message)
-                        raise StateError(message)
-
-                    if loop_config.code_review_rework:
-                        logger.warning(
-                            "Code review %s but max rework attempts (%d) reached, "
-                            "continuing because "
-                            "loop.fail_on_unresolved_negative_code_review=false",
+                    rework_verdicts = {"REJECT", "MAJOR_REWORK"}
+                    if (
+                        verdict in rework_verdicts
+                        and unresolved_action_items == 0
+                    ):
+                        logger.info(
+                            "Code review %s produced zero unresolved synthesis action items; "
+                            "completing story without rework",
                             verdict,
+                        )
+                    elif (
+                        verdict in rework_verdicts
+                        and loop_config.code_review_rework
+                        and state.code_review_rework_count < loop_config.max_rework_attempts
+                    ):
+                        rework_attempt = state.code_review_rework_count + 1
+                        logger.info(
+                            "Code review %s (attempt %d/%d), looping back to DEV_STORY",
+                            verdict,
+                            rework_attempt,
                             loop_config.max_rework_attempts,
                         )
-                    else:
-                        logger.warning(
-                            "Code review %s with loop.code_review_rework disabled, "
-                            "continuing because "
-                            "loop.fail_on_unresolved_negative_code_review=false",
-                            verdict,
+                        now = datetime.now(UTC).replace(tzinfo=None)
+                        state = state.model_copy(
+                            update={
+                                "current_phase": Phase.DEV_STORY,
+                                "code_review_rework_count": rework_attempt,
+                                "updated_at": now,
+                            }
+                        )
+                        save_state(state, state_path)
+                        if _should_stop_after_successful_phase():
+                            _log_stop_after_successful_phase(current_phase)
+                            return LoopExitReason.COMPLETED
+                        continue
+                    elif verdict in rework_verdicts:
+                        if loop_config.fail_on_unresolved_negative_code_review:
+                            if loop_config.code_review_rework:
+                                message = (
+                                    "Code review "
+                                    f"{verdict} remains unresolved after max rework attempts "
+                                    f"({loop_config.max_rework_attempts}); stopping run."
+                                )
+                            else:
+                                message = (
+                                    "Code review "
+                                    f"{verdict} remains unresolved and "
+                                    "loop.code_review_rework is disabled; stopping run."
+                                )
+                            logger.error(message)
+                            raise StateError(message)
+
+                        if loop_config.code_review_rework:
+                            logger.warning(
+                                "Code review %s but max rework attempts (%d) reached, "
+                                "continuing because "
+                                "loop.fail_on_unresolved_negative_code_review=false",
+                                verdict,
+                                loop_config.max_rework_attempts,
+                            )
+                        else:
+                            logger.warning(
+                                "Code review %s with loop.code_review_rework disabled, "
+                                "continuing because "
+                                "loop.fail_on_unresolved_negative_code_review=false",
+                                verdict,
+                            )
+
+                    # Archive multi-LLM artifacts (idempotent - safe if LLM already ran it)
+                    _run_archive_artifacts(project_path)
+
+                    next_story_phase = get_next_phase(current_phase)
+                    if next_story_phase is not None:
+                        now = datetime.now(UTC).replace(tzinfo=None)
+                        state = state.model_copy(
+                            update={
+                                "current_phase": next_story_phase,
+                                "updated_at": now,
+                            }
+                        )
+                        save_state(state, state_path)
+                        logger.info(
+                            "Advanced to phase %s after code review synthesis",
+                            next_story_phase.name,
                         )
 
-                # Archive multi-LLM artifacts (idempotent - safe if LLM already ran it)
-                _run_archive_artifacts(project_path)
+                        sequence_id += 1
+                        if state.current_epic is not None and state.current_story is not None:
+                            emit_workflow_status(
+                                run_id=run_id,
+                                sequence_id=sequence_id,
+                                epic_num=state.current_epic,
+                                story_id=str(state.current_story),
+                                phase=next_story_phase.name,
+                                phase_status="in-progress",
+                            )
+                        if _should_stop_after_successful_phase():
+                            _log_stop_after_successful_phase(current_phase)
+                            return LoopExitReason.COMPLETED
+                        continue
 
-                # Get stories for current epic
-                if state.current_epic is None:
-                    raise StateError("Logic error: current_epic is None at CODE_REVIEW_SYNTHESIS")
-
-                # Code Review Fix: Wrap epic_stories_loader in try-except
-                try:
-                    epic_stories = epic_stories_loader(state.current_epic)
-                except Exception as e:
-                    raise StateError(
-                        f"Failed to load stories for epic {state.current_epic}: {e}"
-                    ) from e
+                epic_stories = _load_story_completion_order(
+                    state,
+                    epic_stories_loader,
+                    lifecycle_epic_stories_loader,
+                )
 
                 # Story 15.4: Dispatch story_completed event with TOTAL story duration
                 story_duration = get_story_duration_ms(state)
@@ -1520,6 +1658,12 @@ def _run_loop_body(
                 new_state, is_epic_complete = handle_story_completion(state, epic_stories, state_path)
 
                 if is_epic_complete:
+                    if _should_stop_after_successful_phase():
+                        state = _stage_epic_teardown_boundary(new_state, loop_config, state_path)
+                        _invoke_sprint_sync(state, project_path)
+                        _log_stop_after_successful_phase(current_phase)
+                        return LoopExitReason.COMPLETED
+
                     # Run all epic teardown phases (retrospective, qa_plan_*, etc.)
                     logger.info("Epic %s stories complete, running teardown phases", state.current_epic)
                     state, teardown_success, teardown_result = _execute_epic_teardown(
@@ -1567,6 +1711,22 @@ def _run_loop_body(
                     # Calculate epic timing before handle_epic_completion modifies state
                     epic_duration_ms = get_epic_duration_ms(state)
                     epic_stories_count = _count_epic_stories(state)
+
+                    if _should_stop_after_successful_phase():
+                        _complete_epic_boundary_for_stop_after_phase(
+                            state,
+                            state_path,
+                            project_path,
+                        )
+                        _dispatch_event(
+                            "epic_completed",
+                            project_path,
+                            state,
+                            duration_ms=epic_duration_ms,
+                            stories_completed=epic_stories_count,
+                        )
+                        _log_stop_after_successful_phase(current_phase)
+                        return LoopExitReason.COMPLETED
 
                     # Advance to next epic (or complete project)
                     advanced_state, is_project_complete = handle_epic_completion(
@@ -1678,6 +1838,10 @@ def _run_loop_body(
                             phase_status="in-progress",
                         )
 
+                    if _should_stop_after_successful_phase():
+                        _log_stop_after_successful_phase(current_phase)
+                        return LoopExitReason.COMPLETED
+
                 continue
 
             # AC4: QA_PLAN_EXECUTE success → handle epic completion
@@ -1686,6 +1850,22 @@ def _run_loop_body(
                 # Calculate epic timing before handle_epic_completion modifies state
                 epic_duration_ms = get_epic_duration_ms(state)
                 epic_stories_count = _count_epic_stories(state)
+
+                if _should_stop_after_successful_phase():
+                    _complete_epic_boundary_for_stop_after_phase(
+                        state,
+                        state_path,
+                        project_path,
+                    )
+                    _dispatch_event(
+                        "epic_completed",
+                        project_path,
+                        state,
+                        duration_ms=epic_duration_ms,
+                        stories_completed=epic_stories_count,
+                    )
+                    _log_stop_after_successful_phase(current_phase)
+                    return LoopExitReason.COMPLETED
 
                 new_state, is_project_complete = handle_epic_completion(
                     state, epic_list, epic_stories_loader, state_path
@@ -1764,6 +1944,10 @@ def _run_loop_body(
                     }
                 )
                 logger.info("Phase override: jumping to %s", result.next_phase.name)
+                if _should_stop_after_successful_phase():
+                    save_state(state, state_path)
+                    _log_stop_after_successful_phase(current_phase)
+                    return LoopExitReason.COMPLETED
                 continue
 
             # AC7: Normal phase advancement via get_next_phase()
@@ -1783,14 +1967,45 @@ def _run_loop_body(
                 #
                 # Check if this is the last epic_teardown phase (in case get_next_phase
                 # returns None for a phase that's part of teardown but executed separately)
-                teardown_phases = (
-                    [Phase(p) for p in loop_config.epic_teardown] if loop_config.epic_teardown else []
-                )
+                teardown_phases = _get_teardown_phases(loop_config)
                 is_teardown_phase = current_phase in teardown_phases
 
                 if is_teardown_phase and result.success:
+                    next_teardown_phase = _get_next_teardown_phase(current_phase, loop_config)
+                    if next_teardown_phase is not None:
+                        state = state.model_copy(
+                            update={
+                                "current_phase": next_teardown_phase,
+                                "updated_at": datetime.now(UTC).replace(tzinfo=None),
+                            }
+                        )
+                        logger.info(
+                            "Advanced epic %s teardown to phase %s",
+                            state.current_epic,
+                            next_teardown_phase.name,
+                        )
+
+                        sequence_id += 1
+                        if state.current_epic is not None:
+                            emit_workflow_status(
+                                run_id=run_id,
+                                sequence_id=sequence_id,
+                                epic_num=state.current_epic,
+                                story_id=str(state.current_story)
+                                if state.current_story
+                                else "epic-teardown",
+                                phase=next_teardown_phase.name,
+                                phase_status="in-progress",
+                            )
+
+                        if _should_stop_after_successful_phase():
+                            save_state(state, state_path)
+                            _log_stop_after_successful_phase(current_phase)
+                            return LoopExitReason.COMPLETED
+                        continue
+
                     # This path handles edge case where a teardown phase is executed
-                    # through the main loop (e.g., resumed mid-teardown)
+                    # through the main loop and has no configured teardown successor.
                     logger.info(
                         "Teardown phase %s complete for epic %s",
                         current_phase.name,
@@ -1799,6 +2014,22 @@ def _run_loop_body(
                     # Calculate epic timing before handle_epic_completion modifies state
                     epic_duration_ms = get_epic_duration_ms(state)
                     epic_stories_count = _count_epic_stories(state)
+
+                    if _should_stop_after_successful_phase():
+                        _complete_epic_boundary_for_stop_after_phase(
+                            state,
+                            state_path,
+                            project_path,
+                        )
+                        _dispatch_event(
+                            "epic_completed",
+                            project_path,
+                            state,
+                            duration_ms=epic_duration_ms,
+                            stories_completed=epic_stories_count,
+                        )
+                        _log_stop_after_successful_phase(current_phase)
+                        return LoopExitReason.COMPLETED
 
                     new_state, is_project_complete = handle_epic_completion(
                         state, epic_list, epic_stories_loader, state_path
@@ -1889,6 +2120,11 @@ def _run_loop_body(
                     phase=next_phase.name,
                     phase_status="in-progress",
                 )
+
+            if _should_stop_after_successful_phase():
+                save_state(state, state_path)
+                _log_stop_after_successful_phase(current_phase)
+                return LoopExitReason.COMPLETED
 
     finally:
         # Story 29.9: Broadcast goodbye event before IPC cleanup

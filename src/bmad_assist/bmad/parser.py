@@ -64,14 +64,14 @@ CHECKBOX_UNCHECKED_PATTERN = re.compile(r"-\s*\[\s*\]")
 
 # Pattern for multiple epics in a file: # Epic N: Title OR ## Epic Name
 EPIC_HEADER_PATTERN = re.compile(
-    r"^#{1,3}\s+Epic\s+[\w-]+[:\s\t]*",
+    r"^#{1,3}[ \t]+Epic[ \t]+[\w-]+(?:[ \t]*:[ \t]*|[ \t]+)?",
     re.MULTILINE,
 )
 
 # Pattern to extract epic number/ID and title from header:
 # # Epic 16: Real-time Dashboard OR ## Epic Correction Sprint [IN PROGRESS]
 EPIC_TITLE_PATTERN = re.compile(
-    r"^#{1,3}\s+Epic\s+([\w-]+)[:\s\t]*(.*)$",
+    r"^#{1,3}[ \t]+Epic[ \t]+([\w-]+)(?:[ \t]*:[ \t]*|[ \t]+)?(.*)$",
     re.MULTILINE,
 )
 
@@ -85,6 +85,7 @@ NON_EPIC_SECTION_IDS = frozenset(
         "inventory",
         "list",
         "overview",
+        "ownership",
         "requirements",
         "roadmap",
         "scope",
@@ -115,6 +116,15 @@ def is_non_epic_section_id(raw_epic_id: object) -> bool:
     return raw_epic_id.strip().lower() in NON_EPIC_SECTION_IDS
 
 
+def _iter_real_epic_headers(content: str) -> list[re.Match[str]]:
+    """Return parsed epic headers, excluding document-section headings."""
+    return [
+        header
+        for header in EPIC_TITLE_PATTERN.finditer(content)
+        if not is_non_epic_section_id(header.group(1))
+    ]
+
+
 def extract_epic_markdown(content: str, epic_id: EpicId) -> str | None:
     """Extract a single epic block from markdown content.
 
@@ -126,7 +136,7 @@ def extract_epic_markdown(content: str, epic_id: EpicId) -> str | None:
         The matching epic block, stripped of surrounding whitespace, or None if absent.
 
     """
-    headers = list(EPIC_TITLE_PATTERN.finditer(content))
+    headers = _iter_real_epic_headers(content)
     if not headers:
         return None
 
@@ -451,8 +461,7 @@ def _is_multi_epic_file(content: str) -> bool:
         True if multiple "# Epic N:" headers are found.
 
     """
-    matches = EPIC_HEADER_PATTERN.findall(content)
-    return len(matches) > 1
+    return len(_iter_real_epic_headers(content)) > 1
 
 
 def _find_stories_section(content: str) -> tuple[str, int] | None:
@@ -752,7 +761,7 @@ def parse_epic_file(path: str | Path) -> EpicDocument:
         # Fallback: parse from markdown header if frontmatter is empty
         # Handles files like "# Epic 16: Real-time Dashboard"
         if epic_num is None or title is None:
-            header_match = EPIC_TITLE_PATTERN.search(doc.content)
+            header_match = next(iter(_iter_real_epic_headers(doc.content)), None)
             if header_match:
                 if epic_num is None:
                     raw_num = header_match.group(1)
@@ -767,7 +776,7 @@ def parse_epic_file(path: str | Path) -> EpicDocument:
     # Parse story sections from content
     if is_multi_epic:
         # For multi-epic files, split by Epic headers to maintain context for fallback numbering
-        epic_headers = list(EPIC_TITLE_PATTERN.finditer(doc.content))
+        epic_headers = _iter_real_epic_headers(doc.content)
         all_stories: list[EpicStory] = []
 
         for i, header in enumerate(epic_headers):

@@ -13,6 +13,7 @@ from bmad_assist.core.config.models.features import (
     QAConfig,
     SynthesisConfig,
     TimeoutsConfig,
+    ToolGuardConfig,
 )
 from bmad_assist.core.config.models.loop import (
     DEFAULT_LOOP_CONFIG,
@@ -87,6 +88,7 @@ __all__ = [
     "CompilerConfig",
     "SynthesisConfig",
     "TimeoutsConfig",
+    "ToolGuardConfig",
     "BenchmarkingConfig",
     "PlaywrightServerConfig",
     "PlaywrightConfig",

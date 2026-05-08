@@ -135,7 +135,7 @@ instructions: "{installed_path}/instructions.xml"
 
             mock_compile.assert_called_once()
             call_args = mock_compile.call_args
-            assert call_args[0][0] == "testarch-nfr"
+            assert call_args[0][0] == "testarch-nfr-assess"
             assert result is not None
 
     def test_invoke_nfr_assess_workflow_calls_provider(

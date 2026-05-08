@@ -11,12 +11,14 @@ import pytest
 
 from bmad_assist.sprint.scanner import (
     CODE_REVIEW_PATTERN,
+    DOTTED_TEST_REVIEW_PATTERN,
     LEGACY_REVIEW_PATTERN,
     LEGACY_VALIDATION_PATTERN,
     NEW_VALIDATION_PATTERN,
     RETRO_PATTERN,
     STORY_FILENAME_PATTERN,
     SYNTHESIS_PATTERN,
+    TEST_REVIEW_PATTERN,
     ArtifactIndex,
     CodeReviewArtifact,
     RetrospectiveArtifact,
@@ -26,10 +28,15 @@ from bmad_assist.sprint.scanner import (
     _get_artifact_locations,
     _normalize_story_key,
     _parse_epic_id,
+    _parse_test_review_filename,
     _scan_code_reviews,
     _scan_retrospectives,
     _scan_stories,
+    _scan_test_reviews,
     _scan_validations,
+)
+from bmad_assist.sprint.scanner import (
+    TestReviewArtifact as ScannerTestReviewArtifact,
 )
 
 # ============================================================================
@@ -80,6 +87,13 @@ def temp_project(tmp_path: Path) -> Path:
     (retros_dir / "epic-12-retro-20260105.md").write_text("# Epic 12 Retrospective")
     (retros_dir / "epic-testarch-retro-20260105.md").write_text("# Testarch Retrospective")
 
+    # Test reviews
+    test_reviews_dir = new_base / "test-reviews"
+    test_reviews_dir.mkdir()
+    (test_reviews_dir / "test-review-20-1-20260107T130000Z.md").write_text(
+        "# Test Review\n\nQuality Score: 88/100\n"
+    )
+
     return tmp_path
 
 
@@ -104,6 +118,13 @@ def temp_project_legacy(tmp_path: Path) -> Path:
     validations_dir.mkdir()
     (validations_dir / "story-validation-1-1-master-20251209-151848.md").write_text(
         "# Legacy Validation"
+    )
+
+    # Test reviews
+    test_reviews_dir = legacy_base / "test-reviews"
+    test_reviews_dir.mkdir()
+    (test_reviews_dir / "test-review-1-1-20251210.md").write_text(
+        "# Test Review\n\nQuality Score: 90/100\n"
     )
 
     return tmp_path
@@ -282,6 +303,53 @@ class TestLegacyValidationPattern:
         assert match.group("reviewer") == "master"
 
 
+class TestTestReviewPattern:
+    """Tests for TEST_REVIEW_PATTERN regex."""
+
+    def test_matches_numeric_story(self) -> None:
+        """Test test-review filename with numeric epic/story."""
+        match = TEST_REVIEW_PATTERN.match("test-review-20-1-20260107T130000Z.md")
+        assert match is not None
+        assert match.group("epic") == "20"
+        assert match.group("story") == "1"
+        assert match.group("timestamp") == "20260107T130000Z"
+
+    def test_matches_named_epic_story(self) -> None:
+        """Test test-review filename with named epic."""
+        match = TEST_REVIEW_PATTERN.match("test-review-testarch-2-20260107.md")
+        assert match is not None
+        assert match.group("epic") == "testarch"
+        assert match.group("story") == "2"
+        assert match.group("timestamp") == "20260107"
+
+    def test_matches_without_timestamp(self) -> None:
+        """Test test-review filename without timestamp."""
+        match = TEST_REVIEW_PATTERN.match("test-review-20-4.md")
+        assert match is not None
+        assert match.group("epic") == "20"
+        assert match.group("story") == "4"
+        assert match.group("timestamp") is None
+
+    def test_matches_legacy_dotted_handler_output(self) -> None:
+        """Test legacy handler output that duplicated epic and dotted story."""
+        match = DOTTED_TEST_REVIEW_PATTERN.match("test-review-1-1.1-20260507_1433.md")
+        assert match is not None
+        assert match.group("epic") == "1"
+        assert match.group("story") == "1.1"
+        assert match.group("timestamp") == "20260507_1433"
+
+    def test_parse_legacy_dotted_handler_output_normalizes_story_key(self) -> None:
+        """Test legacy dotted handler output maps to the short story key."""
+        assert _parse_test_review_filename("test-review-1-1.1-20260507_1433.md") == (
+            "1-1",
+            "20260507_1433",
+        )
+
+    def test_parse_dotted_story_without_epic_prefix(self) -> None:
+        """Test dotted story id only maps to a normalized story key."""
+        assert _parse_test_review_filename("test-review-25.1.md") == ("25-1", None)
+
+
 class TestRetroPattern:
     """Tests for RETRO_PATTERN regex."""
 
@@ -404,14 +472,18 @@ class TestGetArtifactLocations:
         locations = _get_artifact_locations(temp_project)
         # 2 locations: stories/ subdirectory + base implementation-artifacts/
         assert len(locations["stories"]) == 2
+        assert len(locations["test_reviews"]) == 1
         assert "stories" in str(locations["stories"][0])
         assert "implementation-artifacts" in str(locations["stories"][1])
+        assert "test-reviews" in str(locations["test_reviews"][0])
 
     def test_legacy_location_only(self, temp_project_legacy: Path) -> None:
         """Test when only legacy location exists."""
         locations = _get_artifact_locations(temp_project_legacy)
         assert len(locations["stories"]) == 1
+        assert len(locations["test_reviews"]) == 1
         assert "sprint-artifacts" in str(locations["stories"][0])
+        assert "test-reviews" in str(locations["test_reviews"][0])
 
     def test_both_locations(self, temp_project_both: Path) -> None:
         """Test when both locations exist."""
@@ -423,6 +495,15 @@ class TestGetArtifactLocations:
         assert "stories" in str(locations["stories"][1])
         assert "implementation-artifacts" in str(locations["stories"][2])
 
+    def test_root_output_test_reviews_location(self, tmp_path: Path) -> None:
+        """Test root output_folder test-reviews are scanned."""
+        reviews_dir = tmp_path / "_bmad-output" / "test-reviews"
+        reviews_dir.mkdir(parents=True)
+
+        locations = _get_artifact_locations(tmp_path)
+
+        assert locations["test_reviews"] == [reviews_dir]
+
     def test_empty_project(self, tmp_path: Path) -> None:
         """Test with empty project."""
         locations = _get_artifact_locations(tmp_path)
@@ -430,6 +511,7 @@ class TestGetArtifactLocations:
         assert locations["code_reviews"] == []
         assert locations["validations"] == []
         assert locations["retrospectives"] == []
+        assert locations["test_reviews"] == []
 
 
 # ============================================================================
@@ -534,6 +616,57 @@ class TestScanRetrospectives:
         assert retros["12"].timestamp == "20260105"
 
 
+class TestScanTestReviews:
+    """Tests for _scan_test_reviews function."""
+
+    def test_scan_test_reviews(self, temp_project: Path) -> None:
+        """Test scanning test-review files."""
+        reviews_dir = temp_project / "_bmad-output" / "implementation-artifacts" / "test-reviews"
+        reviews = _scan_test_reviews([reviews_dir])
+
+        assert "20-1" in reviews
+        assert len(reviews["20-1"]) == 1
+        artifact = reviews["20-1"][0]
+        assert artifact.story_key == "20-1"
+        assert artifact.timestamp == "20260107T130000Z"
+        assert artifact.quality_score == 88
+        assert artifact.path.name == "test-review-20-1-20260107T130000Z.md"
+
+    def test_scan_legacy_test_reviews(self, temp_project_legacy: Path) -> None:
+        """Test scanning legacy test-review files."""
+        reviews_dir = temp_project_legacy / "docs" / "sprint-artifacts" / "test-reviews"
+        reviews = _scan_test_reviews([reviews_dir])
+
+        assert "1-1" in reviews
+        assert len(reviews["1-1"]) == 1
+        assert reviews["1-1"][0].quality_score == 90
+
+    def test_scan_legacy_dotted_handler_output(self, tmp_path: Path) -> None:
+        """Test scanning earlier handler output with duplicated dotted story id."""
+        reviews_dir = tmp_path / "test-reviews"
+        reviews_dir.mkdir()
+        (reviews_dir / "test-review-1-1.1-20260507_1433.md").write_text(
+            "# Test Review\n\nQuality Score: 91/100\n"
+        )
+
+        reviews = _scan_test_reviews([reviews_dir])
+
+        assert "1-1" in reviews
+        assert len(reviews["1-1"]) == 1
+        assert reviews["1-1"][0].quality_score == 91
+
+    def test_scan_empty_directory(self, tmp_path: Path) -> None:
+        """Test scanning an empty test-review directory."""
+        reviews_dir = tmp_path / "test-reviews"
+        reviews_dir.mkdir()
+
+        assert _scan_test_reviews([reviews_dir]) == {}
+
+    def test_scan_nonexistent_directory(self) -> None:
+        """Test scanning a nonexistent test-review directory."""
+        assert _scan_test_reviews([Path("/nonexistent/path")]) == {}
+
+
 # ============================================================================
 # Tests: ArtifactIndex
 # ============================================================================
@@ -550,6 +683,7 @@ class TestArtifactIndexScan:
         assert len(index.code_reviews) == 2
         assert len(index.validations) == 1
         assert len(index.retrospectives) == 2
+        assert len(index.test_reviews) == 1
         assert isinstance(index.scan_time, datetime)
 
     def test_new_location_takes_precedence(self, temp_project_both: Path) -> None:
@@ -567,6 +701,20 @@ class TestArtifactIndexScan:
         assert len(index.code_reviews) == 0
         assert len(index.validations) == 0
         assert len(index.retrospectives) == 0
+        assert len(index.test_reviews) == 0
+
+    def test_scan_root_output_test_reviews(self, tmp_path: Path) -> None:
+        """Test root output_folder test-reviews are included in the index."""
+        reviews_dir = tmp_path / "_bmad-output" / "test-reviews"
+        reviews_dir.mkdir(parents=True)
+        (reviews_dir / "test-review-1-1.1-20260507_1433.md").write_text(
+            "# Test Review\n\nQuality Score: 91/100\n"
+        )
+
+        index = ArtifactIndex.scan(tmp_path)
+
+        assert index.has_test_review("1-1") is True
+        assert index.get_test_reviews("1-1")[0].path.name == "test-review-1-1.1-20260507_1433.md"
 
 
 class TestArtifactIndexQueryMethods:
@@ -657,6 +805,20 @@ class TestArtifactIndexQueryMethods:
         retro_nonexistent = index.get_retrospective(99)
         assert retro_nonexistent is None
 
+    def test_has_test_review(self, index: ArtifactIndex) -> None:
+        """Test has_test_review query."""
+        assert index.has_test_review("20-1") is True
+        assert index.has_test_review("20-2") is False
+
+    def test_get_test_reviews(self, index: ArtifactIndex) -> None:
+        """Test get_test_reviews query."""
+        reviews = index.get_test_reviews("20-1")
+        assert len(reviews) == 1
+        assert reviews[0].quality_score == 88
+
+        reviews_nonexistent = index.get_test_reviews("20-2")
+        assert reviews_nonexistent == []
+
 
 class TestArtifactIndexRepr:
     """Tests for ArtifactIndex __repr__."""
@@ -671,6 +833,7 @@ class TestArtifactIndexRepr:
         assert "code_reviews=2" in repr_str
         assert "validations=1" in repr_str
         assert "retrospectives=2" in repr_str
+        assert "test_reviews=1" in repr_str
 
 
 # ============================================================================
@@ -841,3 +1004,14 @@ class TestDataclasses:
         )
         with pytest.raises(AttributeError):
             artifact.epic_id = 99  # type: ignore[misc]
+
+    def test_test_review_artifact_frozen(self) -> None:
+        """Test that TestReviewArtifact is frozen."""
+        artifact = ScannerTestReviewArtifact(
+            path=Path("/test/test-review.md"),
+            story_key="20-1",
+            timestamp="20260107",
+            quality_score=88,
+        )
+        with pytest.raises(AttributeError):
+            artifact.story_key = "20-2"  # type: ignore[misc]

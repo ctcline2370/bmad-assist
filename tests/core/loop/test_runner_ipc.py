@@ -24,7 +24,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-
 # =============================================================================
 # Shared fixtures (Task 1)
 # =============================================================================
@@ -135,44 +134,46 @@ class TestServerLifecycle:
             finally:
                 ipc_thread.stop(timeout=5.0)
 
-    def test_start_ipc_server_returns_none_on_path_too_long(
+    def test_start_ipc_server_uses_fallback_when_primary_path_too_long(
         self,
         project_root: Path,
         monkeypatch: pytest.MonkeyPatch,
         tmp_path: Path,
     ) -> None:
-        """AC #8: _start_ipc_server() returns None when socket path exceeds limit."""
+        """AC #8: _start_ipc_server() uses fallback socket path when primary is too long."""
         from bmad_assist.core.loop.runner import _start_ipc_server
 
         # Create a socket dir with a very deep path that causes the resulting
         # socket path (dir + 32-char hash + ".sock") to exceed 107 bytes.
         too_long = tmp_path / ("a" * 80) / "sockets"
-        monkeypatch.setattr(
-            "bmad_assist.ipc.server.get_socket_dir", lambda: too_long
-        )
-        monkeypatch.setattr(
-            "bmad_assist.ipc.protocol.get_socket_dir", lambda: too_long
-        )
+        with tempfile.TemporaryDirectory(prefix="ipc", dir="/tmp") as short_tmp:
+            fallback_dir = Path(short_tmp) / "fallback"
+            monkeypatch.setattr(
+                "bmad_assist.ipc.server.get_socket_dir", lambda: too_long
+            )
+            monkeypatch.setattr(
+                "bmad_assist.ipc.protocol.get_socket_dir", lambda: too_long
+            )
+            monkeypatch.setattr(
+                "bmad_assist.ipc.protocol._fallback_socket_dir_path",
+                lambda: fallback_dir,
+            )
 
-        result = _start_ipc_server(project_root)
-        assert result is None  # Graceful degradation, no crash
+            result = _start_ipc_server(project_root)
+            assert result is not None
+            try:
+                assert result._socket_path.parent == fallback_dir
+                assert result._socket_path.exists()
+            finally:
+                result.stop(timeout=5.0)
 
     def test_start_ipc_server_calls_clear_active_socket_on_failure(
         self,
         project_root: Path,
         monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
     ) -> None:
         """AC #8: clear_active_socket() is called when _start_ipc_server() fails."""
         from bmad_assist.core.loop.runner import _start_ipc_server
-
-        too_long = tmp_path / ("a" * 80) / "sockets"
-        monkeypatch.setattr(
-            "bmad_assist.ipc.server.get_socket_dir", lambda: too_long
-        )
-        monkeypatch.setattr(
-            "bmad_assist.ipc.protocol.get_socket_dir", lambda: too_long
-        )
 
         clear_called: list[bool] = []
         original_clear = None
@@ -186,6 +187,14 @@ class TestServerLifecycle:
 
         original_clear = cleanup.clear_active_socket
         monkeypatch.setattr("bmad_assist.ipc.cleanup.clear_active_socket", track_clear)
+
+        def fail_start(*args: Any, **kwargs: Any) -> None:
+            raise OSError("start failed")
+
+        monkeypatch.setattr(
+            "bmad_assist.ipc.server.IPCServerThread.start",
+            fail_start,
+        )
 
         result = _start_ipc_server(project_root)
         assert result is None

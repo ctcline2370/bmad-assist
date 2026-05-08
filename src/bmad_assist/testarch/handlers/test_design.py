@@ -43,6 +43,8 @@ class TestDesignHandler(TestarchBaseHandler):
 
     """
 
+    __test__ = False
+
     def __init__(self, config: Config, project_path: Path) -> None:
         """Initialize handler with config and project path.
 

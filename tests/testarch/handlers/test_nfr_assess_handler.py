@@ -350,7 +350,7 @@ class TestWorkflowInvocation:
             result = handler._invoke_nfr_assess_workflow(state_epic_25)
 
         mock_invoke.assert_called_once()
-        assert "testarch-nfr" in str(mock_invoke.call_args)
+        assert "testarch-nfr-assess" in str(mock_invoke.call_args)
 
 
 # =============================================================================

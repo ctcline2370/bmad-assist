@@ -96,7 +96,6 @@ def _sanitize_synthesis_input(content: str, *, label: str) -> str:
     read-only sandbox. The sanitizer is intentionally phrase-specific so it does
     not weaken actual reviewer or antipattern content.
     """
-
     sanitized = content
     for pattern in _CONTROL_PLANE_FIX_PATTERNS:
         sanitized = pattern.sub(_CONTROL_PLANE_FIX_REPLACEMENT, sanitized)
@@ -125,7 +124,6 @@ def _sanitize_synthesis_input(content: str, *, label: str) -> str:
 
 def _sanitize_antipattern_files(files: dict[str, str]) -> dict[str, str]:
     """Sanitize loaded antipattern documents before synthesis uses them."""
-
     return {
         path: _sanitize_synthesis_input(content, label=f"antipattern:{path}")
         for path, content in files.items()
@@ -134,7 +132,6 @@ def _sanitize_antipattern_files(files: dict[str, str]) -> dict[str, str]:
 
 def _sanitize_review_content(content: str, reviewer_id: str) -> str:
     """Sanitize reviewer content without dropping substantive findings."""
-
     return _sanitize_synthesis_input(content, label=f"review:{reviewer_id}")
 
 
