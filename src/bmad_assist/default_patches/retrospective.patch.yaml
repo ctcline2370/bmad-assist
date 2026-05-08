@@ -20,7 +20,7 @@ transforms:
   - "Remove party-mode dialogue format requirements - output is structured report only"
 
   # === SCOPE LIMITATION ===
-  - "Add CRITICAL instruction at workflow start: 'SCOPE LIMITATION: You are an AUTOMATED RETROSPECTIVE GENERATOR. Your ONLY output should be a structured retrospective report wrapped in extraction markers. Do NOT use party-mode dialogue. Do NOT wait for user input. Do NOT write files. Generate the complete retrospective in ONE response.'"
+  - "Add CRITICAL instruction at workflow start: 'SCOPE LIMITATION: You are an AUTOMATED RETROSPECTIVE GENERATOR. You MUST complete the upstream document feedback loop before producing the final structured retrospective report wrapped in extraction markers. Do NOT use party-mode dialogue. Do NOT wait for user input. Do NOT save the retrospective report file directly; BMAD-ASSIST persists the final report. You MAY edit upstream source documents and approved governance-candidate handoff files when retrospective findings require it.'"
 
   # === OUTPUT CONSOLIDATION ===
   - "Consolidate all output into step 11 as single retrospective document"
@@ -32,7 +32,7 @@ transforms:
   - "The retrospective document MUST be valid markdown starting with '# Epic {epic_number} Retrospective'"
 
   # === FILE OPERATIONS REMOVAL ===
-  - "Remove all file save actions - orchestrator handles persistence"
+  - "Remove retrospective report file save actions - orchestrator handles report persistence; upstream feedback-loop edits remain allowed when required"
   - "Remove folder creation actions - orchestrator handles directories"
   - "Remove sprint-status update actions - loop handler manages status"
 
@@ -118,11 +118,17 @@ post_process:
       ## Preparation for Next Epic
       [If next epic exists, list dependencies and preparation needed]
 
+      ## Document Feedback Matrix
+      | Finding | Disposition | Evidence | Owner | Blocked Downstream Work |
+      |---|---|---|---|---|
+      | [Finding or no-change rationale] | updated/governance-candidate/human-gated/no-change | [Changed path, candidate path, human gate evidence, or no-change rationale] | [Owner] | [Blocked downstream work or none] |
+
       <!-- RETROSPECTIVE_REPORT_END -->
 
       The orchestrator extracts ONLY content between these markers.
       Do NOT include party-mode dialogue in the report.
-      Do NOT save files - output to stdout only.</critical>
+      Do NOT save the retrospective report file directly; BMAD-ASSIST persists the final report.
+      Upstream source-document or approved governance-candidate updates are allowed when required by the feedback loop.</critical>
     flags: ""
 
   # === REMOVE FILE OPERATIONS ===

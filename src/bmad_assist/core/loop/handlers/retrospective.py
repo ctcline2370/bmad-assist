@@ -22,7 +22,13 @@ from bmad_assist.core.loop.handlers.base import BaseHandler
 from bmad_assist.core.loop.types import PhaseResult
 from bmad_assist.core.paths import get_paths
 from bmad_assist.core.state import State
-from bmad_assist.retrospective import extract_retrospective_report, save_retrospective_report
+from bmad_assist.retrospective import (
+    FeedbackSnapshot,
+    capture_feedback_snapshot,
+    extract_retrospective_report,
+    save_retrospective_report,
+    validate_retrospective_feedback_loop,
+)
 
 if TYPE_CHECKING:
     pass
@@ -73,21 +79,28 @@ class RetrospectiveHandler(BaseHandler):
             PhaseResult from retrospective execution, with report_file in outputs.
 
         """
+        feedback_snapshot = capture_feedback_snapshot(self.project_path)
+
         # Run parent's execute() for actual retrospective
         result = super().execute(state)
 
         # Retrospective completion is not trustworthy unless the report is
-        # durably persisted. Fail closed if persistence cannot be proven.
+        # durably persisted and upstream feedback is evidenced. Fail closed if
+        # either cannot be proven.
         if result.success and state.current_epic is not None:
-            save_error = self._save_retrospective_report(result, state)
+            save_error = self._save_retrospective_report(result, state, feedback_snapshot)
             if save_error is not None:
                 outputs = dict(result.outputs)
-                outputs["report_persistence_error"] = save_error
                 return PhaseResult(success=False, error=save_error, outputs=outputs)
 
         return result
 
-    def _save_retrospective_report(self, result: PhaseResult, state: State) -> str | None:
+    def _save_retrospective_report(
+        self,
+        result: PhaseResult,
+        state: State,
+        feedback_snapshot: FeedbackSnapshot,
+    ) -> str | None:
         """Extract and save retrospective report from LLM output.
 
         Bug Fix: Retrospective Report Persistence (AC #3)
@@ -95,6 +108,8 @@ class RetrospectiveHandler(BaseHandler):
         Args:
             result: Successful PhaseResult with response in outputs.
             state: Current loop state with epic information.
+            feedback_snapshot: Project document snapshot captured before the
+                retrospective provider ran.
 
         Returns:
             None on success, otherwise a blocking error message describing why
@@ -109,6 +124,7 @@ class RetrospectiveHandler(BaseHandler):
                     "response payload, so no durable report could be saved"
                 )
                 logger.error(error)
+                result.outputs["report_persistence_error"] = error
                 return error
 
             # Extract report using markers or fallback heuristics
@@ -135,11 +151,28 @@ class RetrospectiveHandler(BaseHandler):
             # entire dataclass. This is a deliberate design choice - see types.py.
             result.outputs["report_file"] = str(report_path)
 
+            validation = validate_retrospective_feedback_loop(
+                report_content=report_content,
+                project_root=self.project_path,
+                snapshot=feedback_snapshot,
+            )
+            if not validation.valid:
+                error = "Retrospective feedback-loop validation failed: " + "; ".join(
+                    validation.errors
+                )
+                logger.error(error)
+                result.outputs["feedback_loop_error"] = error
+                return error
+
+            result.outputs["feedback_loop_validated"] = True
+            result.outputs["feedback_loop_dispositions"] = list(validation.dispositions)
+
             logger.info("Retrospective report saved: %s", report_path)
             return None
 
         except Exception as e:
             error = f"Failed to save retrospective report for epic {state.current_epic}: {e}"
+            result.outputs["report_persistence_error"] = error
             logger.error(
                 error,
                 exc_info=True,  # Include traceback for debugging

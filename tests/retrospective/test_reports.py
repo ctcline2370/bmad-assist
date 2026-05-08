@@ -11,6 +11,13 @@ from bmad_assist.retrospective.reports import (
     save_retrospective_report,
 )
 
+FEEDBACK_MATRIX = """
+## Document Feedback Matrix
+| Finding | Disposition | Evidence | Owner | Blocked Downstream Work |
+|---|---|---|---|---|
+| No upstream document changes were required. | no-change | Reviewed PRD, architecture, epic, story, and readiness context; findings were already covered by existing source documents. | BMAD-ASSIST | none |
+"""
+
 
 class TestExtractRetrospectiveReport:
     """Tests for extract_retrospective_report() function."""
@@ -303,7 +310,7 @@ class TestRetrospectiveHandlerIntegration:
 
         from bmad_assist.core.loop.handlers.retrospective import RetrospectiveHandler
         from bmad_assist.core.loop.types import PhaseResult
-        from bmad_assist.core.paths import init_paths, _reset_paths
+        from bmad_assist.core.paths import _reset_paths, init_paths
         from bmad_assist.core.state import Phase, State
 
         # Setup paths singleton for test
@@ -329,7 +336,9 @@ class TestRetrospectiveHandlerIntegration:
 
 ## Summary
 Test content
+{feedback_matrix}
 <!-- RETROSPECTIVE_REPORT_END -->"""
+            llm_output = llm_output.format(feedback_matrix=FEEDBACK_MATRIX)
 
             # Mock the parent execute to return success with response
             parent_result = PhaseResult.ok({"response": llm_output})
@@ -350,6 +359,8 @@ Test content
             report_path = Path(result.outputs["report_file"])
             assert report_path.exists()
             assert "# Epic 21 Retrospective" in report_path.read_text()
+            assert result.outputs["feedback_loop_validated"] is True
+            assert result.outputs["feedback_loop_dispositions"] == ["no-change"]
         finally:
             _reset_paths()
 
@@ -359,7 +370,7 @@ Test content
 
         from bmad_assist.core.loop.handlers.retrospective import RetrospectiveHandler
         from bmad_assist.core.loop.types import PhaseResult
-        from bmad_assist.core.paths import init_paths, _reset_paths
+        from bmad_assist.core.paths import _reset_paths, init_paths
         from bmad_assist.core.state import Phase, State
 
         _reset_paths()
@@ -405,7 +416,7 @@ Test content
 
         from bmad_assist.core.loop.handlers.retrospective import RetrospectiveHandler
         from bmad_assist.core.loop.types import PhaseResult
-        from bmad_assist.core.paths import init_paths, _reset_paths
+        from bmad_assist.core.paths import _reset_paths, init_paths
         from bmad_assist.core.state import Phase, State
 
         _reset_paths()
@@ -436,5 +447,51 @@ Test content
             assert "did not produce a response payload" in result.error
             assert "report_file" not in result.outputs
             assert "report_persistence_error" in result.outputs
+        finally:
+            _reset_paths()
+
+    def test_handler_fails_when_feedback_loop_matrix_missing(self, tmp_path: Path):
+        """Handler fails closed when upstream document feedback is not evidenced."""
+        from unittest.mock import MagicMock, patch
+
+        from bmad_assist.core.loop.handlers.retrospective import RetrospectiveHandler
+        from bmad_assist.core.loop.types import PhaseResult
+        from bmad_assist.core.paths import _reset_paths, init_paths
+        from bmad_assist.core.state import Phase, State
+
+        _reset_paths()
+        init_paths(tmp_path)
+
+        try:
+            mock_config = MagicMock()
+            mock_config.testarch = MagicMock()
+            mock_config.testarch.trace_on_epic_complete = "off"
+
+            handler = RetrospectiveHandler(mock_config, tmp_path)
+            state = State(
+                current_epic=21,
+                current_story="21-5",
+                current_phase=Phase.RETROSPECTIVE,
+            )
+
+            llm_output = """<!-- RETROSPECTIVE_REPORT_START -->
+# Epic 21 Retrospective: Test
+
+## Summary
+Test content without feedback matrix.
+<!-- RETROSPECTIVE_REPORT_END -->"""
+            parent_result = PhaseResult.ok({"response": llm_output})
+
+            with patch(
+                "bmad_assist.core.loop.handlers.base.BaseHandler.execute",
+                return_value=parent_result,
+            ):
+                result = handler.execute(state)
+
+            assert not result.success
+            assert "Retrospective feedback-loop validation failed" in result.error
+            assert "feedback_loop_error" in result.outputs
+            assert "report_file" in result.outputs
+            assert Path(result.outputs["report_file"]).exists()
         finally:
             _reset_paths()

@@ -48,6 +48,60 @@ _RETROSPECTIVE_COMPACTION_NOTICE = (
     "operational token budget. Read the referenced source file directly if "
     "more detail is required. -->"
 )
+_RETROSPECTIVE_LEGACY_SCOPE_SENTENCE = (
+    "Your ONLY output should be a structured retrospective report wrapped in "
+    "extraction markers. Do NOT use party-mode dialogue. Do NOT wait for user "
+    "input. Do NOT write files. Generate the complete retrospective in ONE response."
+)
+_RETROSPECTIVE_FEEDBACK_SCOPE_SENTENCE = (
+    "You MUST complete the upstream document feedback loop before producing the "
+    "final structured retrospective report wrapped in extraction markers. Do NOT "
+    "use party-mode dialogue. Do NOT wait for user input. Do NOT save the "
+    "retrospective report file directly; BMAD-ASSIST persists the final report. "
+    "You MAY edit upstream source documents and approved governance-candidate "
+    "handoff files when retrospective findings require it."
+)
+_RETROSPECTIVE_LEGACY_SAVE_SENTENCE = "Do NOT save files - output to stdout only."
+_RETROSPECTIVE_FEEDBACK_SAVE_SENTENCE = (
+    "Do NOT save the retrospective report file directly; BMAD-ASSIST persists "
+    "the final report. Upstream source-document or approved governance-candidate "
+    "updates are allowed when required by the feedback loop."
+)
+_RETROSPECTIVE_FEEDBACK_LOOP_REQUIREMENTS = """
+
+<critical>RETROSPECTIVE FEEDBACK LOOP REQUIREMENTS:
+Before final output, classify every meaningful retrospective finding as one of:
+- updated
+- governance-candidate
+- human-gated
+- no-change
+
+Update upstream PRD, architecture, epic, story, backlog, and readiness docs first when
+findings change requirements, NFRs, assumptions, scope, success metrics, acceptance
+criteria, workflow behavior, rollout/support/operational assumptions, tenant isolation,
+authorization, API behavior, or AI automation.
+
+Governance canonical changes are draft-first only under
+.output/adr-control-plane/bmad-governance-candidates/. Do not write canonical
+governance files directly.
+
+The final retrospective report MUST include a markdown table under the exact heading:
+## Document Feedback Matrix
+
+The table MUST use these columns:
+Finding | Disposition | Evidence | Owner | Blocked Downstream Work
+
+Disposition evidence rules:
+- updated rows must list changed upstream source-document paths.
+- governance-candidate rows must list changed candidate handoff paths under
+  .output/adr-control-plane/bmad-governance-candidates/.
+- human-gated rows must include owner, evidence, and blocked downstream work.
+- no-change rows must include a concrete rationale explaining why no upstream change
+  was needed.
+
+BMAD-ASSIST validates this matrix and fails the retrospective if it is missing,
+unsupported, or unevidenced.</critical>
+"""
 
 
 class RetrospectiveCompiler:
@@ -220,6 +274,9 @@ class RetrospectiveCompiler:
 
             filtered_instructions = filter_instructions(workflow_ir)
             filtered_instructions = substitute_variables(filtered_instructions, resolved)
+            filtered_instructions = self._inject_feedback_loop_requirements(
+                filtered_instructions
+            )
 
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug("Filtered instructions: %d bytes", len(filtered_instructions))
@@ -263,6 +320,20 @@ class RetrospectiveCompiler:
                 output_template="",
                 token_estimate=estimate_tokens(final_xml),
             )
+
+    def _inject_feedback_loop_requirements(self, instructions: str) -> str:
+        """Require upstream document feedback evidence in retrospective prompts."""
+        hardened = instructions.replace(
+            _RETROSPECTIVE_LEGACY_SCOPE_SENTENCE,
+            _RETROSPECTIVE_FEEDBACK_SCOPE_SENTENCE,
+        )
+        hardened = hardened.replace(
+            _RETROSPECTIVE_LEGACY_SAVE_SENTENCE,
+            _RETROSPECTIVE_FEEDBACK_SAVE_SENTENCE,
+        )
+        if "RETROSPECTIVE FEEDBACK LOOP REQUIREMENTS" in hardened:
+            return hardened
+        return hardened.rstrip() + _RETROSPECTIVE_FEEDBACK_LOOP_REQUIREMENTS
 
     def _build_context_files(
         self,

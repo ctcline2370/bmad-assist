@@ -151,6 +151,38 @@ class TestRetrospectiveCompiler:
         ):
             assert compiler._get_context_token_cap() == expected
 
+    def test_compile_injects_feedback_loop_requirements(self, tmp_project: Path) -> None:
+        """Retrospective prompts require upstream document feedback evidence."""
+        from bmad_assist.compiler.workflows.retrospective import RetrospectiveCompiler
+
+        workflow_dir = (
+            tmp_project / "_bmad" / "bmm" / "workflows" / "4-implementation" / "retrospective"
+        )
+        workflow_dir.joinpath("instructions.xml").write_text(
+            """<workflow>
+  <critical>SCOPE LIMITATION: You are an AUTOMATED RETROSPECTIVE GENERATOR. Your ONLY output should be a structured retrospective report wrapped in extraction markers. Do NOT use party-mode dialogue. Do NOT wait for user input. Do NOT write files. Generate the complete retrospective in ONE response.</critical>
+  <step n="11" goal="Generate Retrospective Report with Extraction Markers">
+    <critical>Do NOT save files - output to stdout only.</critical>
+  </step>
+</workflow>
+"""
+        )
+        context = create_test_context(tmp_project)
+        compiler = RetrospectiveCompiler()
+
+        with patch(
+            "bmad_assist.compiler.workflows.retrospective.collect_tea_context",
+            return_value={},
+        ):
+            compiled = compiler.compile(context)
+
+        assert "RETROSPECTIVE FEEDBACK LOOP REQUIREMENTS" in compiled.context
+        assert "Document Feedback Matrix" in compiled.context
+        assert "Do NOT write files. Generate the complete retrospective in ONE response." not in (
+            compiled.context
+        )
+        assert "You MAY edit upstream source documents" in compiled.context
+
     def test_prune_context_files_drops_optional_sections_before_story_files(
         self,
         tmp_project: Path,

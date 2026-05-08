@@ -9,12 +9,22 @@ This module provides:
 Pattern follows validation/reports.py extraction strategy.
 """
 
+from bmad_assist.retrospective.feedback_loop import (
+    FeedbackLoopValidationResult,
+    FeedbackSnapshot,
+    capture_feedback_snapshot,
+    validate_retrospective_feedback_loop,
+)
 from bmad_assist.retrospective.reports import (
     extract_retrospective_report,
     save_retrospective_report,
 )
 
 __all__ = [
+    "FeedbackLoopValidationResult",
+    "FeedbackSnapshot",
+    "capture_feedback_snapshot",
     "extract_retrospective_report",
     "save_retrospective_report",
+    "validate_retrospective_feedback_loop",
 ]
