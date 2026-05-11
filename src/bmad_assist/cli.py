@@ -649,9 +649,7 @@ def run(
                 _error(f"--phase {phase_override} is a story-level phase and requires --story")
                 raise typer.Exit(code=EXIT_CONFIG_ERROR)
 
-        honor_done_story_for_explicit_phase = bool(
-            phase_override and story and not _is_epic_level_phase
-        )
+        honor_done_story_for_explicit_phase = bool(phase_override and story)
 
         if epic_scope_only:
             (
