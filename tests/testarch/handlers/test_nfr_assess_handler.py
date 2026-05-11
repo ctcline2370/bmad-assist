@@ -210,6 +210,50 @@ class TestAssessmentDetection:
         assert exists is False
         assert path is None
 
+    def test_ignores_assessments_for_other_epics(
+        self, mock_config: MagicMock, tmp_path: Path
+    ) -> None:
+        """Timestamped NFR assessment detection is scoped to the active epic."""
+        from bmad_assist.testarch.handlers import NFRAssessHandler
+
+        nfr_dir = tmp_path / "nfr-assessments"
+        nfr_dir.mkdir(parents=True)
+        (nfr_dir / "nfr-assessment-1-20260507_2215.md").write_text("# Epic 1 NFR")
+
+        handler = NFRAssessHandler(mock_config, tmp_path)
+
+        mock_paths = MagicMock()
+        mock_paths.output_folder = tmp_path
+
+        with patch("bmad_assist.testarch.handlers.nfr_assess.get_paths", return_value=mock_paths):
+            exists, path = handler._detect_existing_assessment(epic_id=11)
+
+        assert exists is False
+        assert path is None
+
+    def test_detects_assessment_for_current_epic(
+        self, mock_config: MagicMock, tmp_path: Path
+    ) -> None:
+        """Timestamped NFR assessment detection finds the active epic artifact."""
+        from bmad_assist.testarch.handlers import NFRAssessHandler
+
+        nfr_dir = tmp_path / "nfr-assessments"
+        nfr_dir.mkdir(parents=True)
+        expected = nfr_dir / "nfr-assessment-11-20260511_0915.md"
+        expected.write_text("# Epic 11 NFR")
+        (nfr_dir / "nfr-assessment-1-20260507_2215.md").write_text("# Epic 1 NFR")
+
+        handler = NFRAssessHandler(mock_config, tmp_path)
+
+        mock_paths = MagicMock()
+        mock_paths.output_folder = tmp_path
+
+        with patch("bmad_assist.testarch.handlers.nfr_assess.get_paths", return_value=mock_paths):
+            exists, path = handler._detect_existing_assessment(epic_id=11)
+
+        assert exists is True
+        assert path == expected
+
     def test_returns_false_when_paths_not_initialized(
         self, mock_config: MagicMock, tmp_path: Path
     ) -> None:

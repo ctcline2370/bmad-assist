@@ -544,6 +544,7 @@ def run_loop(
     *,
     lifecycle_epic_list: list[EpicId] | None = None,
     lifecycle_epic_stories_loader: Callable[[EpicId], list[str]] | None = None,
+    honor_done_story_on_resume: bool = False,
 ) -> LoopExitReason:
     """Execute the main BMAD development loop.
 
@@ -580,6 +581,8 @@ def run_loop(
         lifecycle_epic_stories_loader: Optional story loader for lifecycle
             validation and resume checks. Defaults to ``epic_stories_loader``
             when omitted.
+        honor_done_story_on_resume: If True, preserve the current story during
+            startup resume validation for explicit story-level phase reruns.
 
     Returns:
         LoopExitReason indicating how the loop exited:
@@ -703,6 +706,7 @@ def run_loop(
                     lifecycle_epic_list=lifecycle_epic_list,
                     lifecycle_epic_stories_loader=lifecycle_epic_stories_loader,
                     ipc_server=ipc_server,
+                    honor_done_story_on_resume=honor_done_story_on_resume,
                 )
                 # Update run_log with final status
                 run_log.status, run_log.exit_reason = _map_exit_reason_to_run_status(exit_reason)
@@ -794,6 +798,7 @@ def _run_loop_body(
     lifecycle_epic_list: list[EpicId] | None = None,
     lifecycle_epic_stories_loader: Callable[[EpicId], list[str]] | None = None,
     ipc_server: IPCServerThread | None = None,
+    honor_done_story_on_resume: bool = False,
 ) -> LoopExitReason:
     """Execute the main loop body with signal handling active.
 
@@ -814,6 +819,8 @@ def _run_loop_body(
             validation and resume checks. Defaults to ``epic_stories_loader``
             when omitted.
         ipc_server: Optional IPCServerThread for IPC event broadcasting.
+        honor_done_story_on_resume: If True, preserve the current story during
+            startup resume validation for explicit story-level phase reruns.
 
     Returns:
         LoopExitReason indicating how the loop exited.
@@ -990,6 +997,7 @@ def _run_loop_body(
         lifecycle_epic_list,
         lifecycle_epic_stories_loader,
         state_path,
+        honor_current_story=honor_done_story_on_resume,
     )
     if is_project_complete:
         logger.info("Project complete! All epics finished (detected on startup)")

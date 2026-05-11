@@ -143,6 +143,33 @@ def _load_epic_data(
     )
 
 
+def _scope_epic_data_to_requested_epic(
+    requested_epic: str,
+    stories_by_epic: dict[EpicId, list[str]],
+    lifecycle_epic_list: list[EpicId],
+    lifecycle_stories_by_epic: dict[EpicId, list[str]],
+) -> tuple[
+    list[EpicId],
+    dict[EpicId, list[str]],
+    list[EpicId],
+    dict[EpicId, list[str]],
+]:
+    """Limit active and lifecycle epic data to one explicitly requested epic."""
+    epic_id = parse_epic_id(requested_epic.strip())
+    lifecycle_stories = lifecycle_stories_by_epic.get(epic_id, [])
+    active_stories = stories_by_epic.get(epic_id, lifecycle_stories)
+
+    if epic_id not in lifecycle_epic_list or not lifecycle_stories:
+        raise StateError(f"Epic {epic_id} was not found in BMAD lifecycle scope.")
+
+    return (
+        [epic_id],
+        {epic_id: list(active_stories)},
+        [epic_id],
+        {epic_id: list(lifecycle_stories)},
+    )
+
+
 def _handle_debug_vars(config: Config, project_path: Path) -> None:
     """Display resolved variables for current phase without running LLM.
 
@@ -357,6 +384,12 @@ def run(
         False,
         "--no-ipc",
         help="Disable IPC socket server (no external client connections)",
+    ),
+    epic_scope_only: bool = typer.Option(
+        False,
+        "--epic-scope-only",
+        hidden=True,
+        help="Limit lifecycle validation and loop progression to the requested --epic.",
     ),
     plain: bool = typer.Option(
         False,
@@ -588,6 +621,10 @@ def run(
             _error("--story requires --epic")
             raise typer.Exit(code=EXIT_CONFIG_ERROR)
 
+        if epic_scope_only and not epic:
+            _error("--epic-scope-only requires --epic")
+            raise typer.Exit(code=EXIT_CONFIG_ERROR)
+
         # Validate --phase
         if phase_override and not epic:
             _error("--phase requires --epic")
@@ -612,6 +649,24 @@ def run(
                 _error(f"--phase {phase_override} is a story-level phase and requires --story")
                 raise typer.Exit(code=EXIT_CONFIG_ERROR)
 
+        honor_done_story_for_explicit_phase = bool(
+            phase_override and story and not _is_epic_level_phase
+        )
+
+        if epic_scope_only:
+            (
+                epic_list,
+                stories_by_epic,
+                lifecycle_epic_list,
+                lifecycle_stories_by_epic,
+            ) = _scope_epic_data_to_requested_epic(
+                epic,
+                stories_by_epic,
+                lifecycle_epic_list,
+                lifecycle_stories_by_epic,
+            )
+            _info(f"Epic scope only: lifecycle validation limited to epic {epic}")
+
         # Apply start point override if --epic specified
         if epic:
             # Use project_knowledge for BMAD files - same as _load_epic_data()
@@ -624,7 +679,8 @@ def run(
                 story,
                 lifecycle_epic_list,
                 lifecycle_stories_by_epic,
-                force,
+                force_restart=force,
+                honor_done_story=honor_done_story_for_explicit_phase,
             )
 
         # Apply phase override if --phase specified (overrides status-derived phase)
@@ -680,6 +736,7 @@ def run(
             lifecycle_epic_stories_loader=lifecycle_epic_stories_loader,
             ipc_enabled=not no_ipc,
             plain=plain,
+            honor_done_story_on_resume=honor_done_story_for_explicit_phase,
         )
 
         # Story 6.6: Handle exit reasons from run_loop

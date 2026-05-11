@@ -168,7 +168,11 @@ Current epic content.
             lambda context, resolved, max_stories=1: [previous_story],
         )
 
-        def fake_collect_files(self: SourceContextService, file_list_paths: list[str], diff_paths: list[str] | None) -> dict[str, str]:
+        def fake_collect_files(
+            self: SourceContextService,
+            file_list_paths: list[str],
+            diff_paths: list[str] | None,
+        ) -> dict[str, str]:
             captured_file_list_paths.extend(file_list_paths)
             assert diff_paths is None
             return {
@@ -240,3 +244,57 @@ Current epic content.
         )
 
         assert selected == ["src/observability/defaults.py"]
+
+    def test_build_context_files_caps_previous_story_source_budget(
+        self,
+        tmp_project: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Previous-story source carry-forward cannot consume the full create-story prompt budget."""
+        previous_story = tmp_project / "docs" / "sprint-artifacts" / "story-10.7.md"
+        previous_story.write_text(
+            """# Story 10.7: Previous Story
+
+## File List
+
+- `docs/api/contracts/sprint-2-foundation/endpoint-inventory.json`
+""",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(StrategicContextService, "collect", lambda self: {})
+        monkeypatch.setattr(
+            strategic_context_module,
+            "load_antipatterns",
+            lambda context, artifact_type: {},
+        )
+        monkeypatch.setattr(
+            create_story_module,
+            "find_previous_stories",
+            lambda context, resolved, max_stories=1: [previous_story],
+        )
+
+        captured_budget: list[int] = []
+
+        def fake_collect_files(self: SourceContextService, file_list_paths: list[str], diff_paths: list[str] | None) -> dict[str, str]:
+            captured_budget.append(self.budget)
+            assert file_list_paths == [
+                "docs/api/contracts/sprint-2-foundation/endpoint-inventory.json"
+            ]
+            assert diff_paths is None
+            return {}
+
+        monkeypatch.setattr(SourceContextService, "collect_files", fake_collect_files)
+
+        compiler = CreateStoryCompiler()
+        monkeypatch.setattr(compiler, "_find_epic_context_files", lambda context, resolved: [])
+
+        context = create_test_context(
+            tmp_project,
+            epic_num=10,
+            story_num=8,
+            story_title="Consistent Foundation Request and Response Conventions",
+        )
+        compiler._build_context_files(context, context.resolved_variables)
+
+        assert captured_budget == [6000]

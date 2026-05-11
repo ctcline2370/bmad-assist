@@ -23,6 +23,7 @@ from typer.testing import CliRunner
 from bmad_assist import __version__
 from bmad_assist.cli import (
     _config_exists,
+    _scope_epic_data_to_requested_epic,
     app,
 )
 from bmad_assist.cli_utils import (
@@ -60,6 +61,52 @@ def _mock_epic_data(
     resolved_epics = list(epic_list) if epic_list is not None else list(resolved_stories.keys())
     lifecycle_stories = {epic: list(stories) for epic, stories in resolved_stories.items()}
     return resolved_epics, resolved_stories, list(resolved_epics), lifecycle_stories
+
+
+class TestEpicScopeData:
+    """Tests for explicit epic-scoped lifecycle data handling."""
+
+    def test_scope_epic_data_to_requested_epic_preserves_requested_stories(self) -> None:
+        """Only the requested epic is retained for active and lifecycle scope."""
+        scoped_epics, scoped_stories, lifecycle_epics, lifecycle_stories = (
+            _scope_epic_data_to_requested_epic(
+                "11",
+                {2: ["2.1"], 11: ["11.1", "11.2"]},
+                [2, 11],
+                {2: ["2.1"], 11: ["11.1", "11.2"]},
+            )
+        )
+
+        assert scoped_epics == [11]
+        assert scoped_stories == {11: ["11.1", "11.2"]}
+        assert lifecycle_epics == [11]
+        assert lifecycle_stories == {11: ["11.1", "11.2"]}
+
+    def test_scope_epic_data_uses_lifecycle_stories_when_active_scope_is_empty(self) -> None:
+        """A completed epic can still run teardown from durable lifecycle scope."""
+        scoped_epics, scoped_stories, lifecycle_epics, lifecycle_stories = (
+            _scope_epic_data_to_requested_epic(
+                "11",
+                {},
+                [11],
+                {11: ["11.1", "11.2"]},
+            )
+        )
+
+        assert scoped_epics == [11]
+        assert scoped_stories == {11: ["11.1", "11.2"]}
+        assert lifecycle_epics == [11]
+        assert lifecycle_stories == {11: ["11.1", "11.2"]}
+
+    def test_scope_epic_data_rejects_unknown_epic(self) -> None:
+        """Scoped execution fails closed when the requested epic is unavailable."""
+        with pytest.raises(StateError, match="Epic 11 was not found"):
+            _scope_epic_data_to_requested_epic(
+                "11",
+                {2: ["2.1"]},
+                [2],
+                {2: ["2.1"]},
+            )
 
 
 # =============================================================================
@@ -519,6 +566,151 @@ class TestHelpOutput:
 
 class TestMainLoopDelegation:
     """Tests for main loop delegation (AC5)."""
+
+    def test_epic_scope_only_limits_run_loop_lifecycle_inputs(self, tmp_path: Path) -> None:
+        """Explicit scoped runs validate and advance only the requested epic."""
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+
+        sprint_dir = project_dir / "_bmad-output" / "implementation-artifacts"
+        sprint_dir.mkdir(parents=True)
+        (sprint_dir / "sprint-status.yaml").write_text("epics: []\n")
+
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+providers:
+  master:
+    provider: claude
+    model: opus_4
+"""
+        )
+
+        with (
+            patch("bmad_assist.cli.run_loop") as mock_run_loop,
+            patch("bmad_assist.cli.apply_start_point_override"),
+            patch(
+                "bmad_assist.cli._load_epic_data",
+                return_value=_mock_epic_data(
+                    epic_list=[2, 11, 12],
+                    stories_by_epic={2: ["2.1"], 11: ["11.1", "11.2"], 12: ["12.1"]},
+                ),
+            ),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "run",
+                    "--project",
+                    str(project_dir),
+                    "--config",
+                    str(config_file),
+                    "--epic",
+                    "11",
+                    "--epic-scope-only",
+                ],
+            )
+
+        assert result.exit_code == EXIT_SUCCESS
+        mock_run_loop.assert_called_once()
+        positional_args = mock_run_loop.call_args.args
+        keyword_args = mock_run_loop.call_args.kwargs
+        assert positional_args[2] == [11]
+        assert keyword_args["lifecycle_epic_list"] == [11]
+        assert positional_args[3](11) == ["11.1", "11.2"]
+        assert keyword_args["lifecycle_epic_stories_loader"](11) == ["11.1", "11.2"]
+
+    def test_explicit_story_phase_rerun_honors_done_story(self, tmp_path: Path) -> None:
+        """Explicit phase reruns keep a done story selected for remediation."""
+        from bmad_assist.core.state import State
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+
+        sprint_dir = project_dir / "_bmad-output" / "implementation-artifacts"
+        sprint_dir.mkdir(parents=True)
+        (sprint_dir / "sprint-status.yaml").write_text("epics: []\n")
+
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+providers:
+  master:
+    provider: claude
+    model: opus_4
+"""
+        )
+
+        with (
+            patch("bmad_assist.cli.run_loop") as mock_run_loop,
+            patch("bmad_assist.cli.apply_start_point_override") as mock_start_point,
+            patch(
+                "bmad_assist.cli._load_epic_data",
+                return_value=_mock_epic_data(
+                    epic_list=[11],
+                    stories_by_epic={11: ["11.1", "11.2"]},
+                ),
+            ),
+            patch("bmad_assist.cli.get_state_path", return_value=project_dir / "state.yaml"),
+            patch("bmad_assist.cli.load_state", return_value=State()),
+            patch("bmad_assist.cli.save_state"),
+        ):
+            result = runner.invoke(
+                app,
+                [
+                    "run",
+                    "--project",
+                    str(project_dir),
+                    "--config",
+                    str(config_file),
+                    "--epic",
+                    "11",
+                    "--story",
+                    "1",
+                    "--phase",
+                    "code_review",
+                    "--epic-scope-only",
+                ],
+            )
+
+        assert result.exit_code == EXIT_SUCCESS
+        assert mock_start_point.call_args.kwargs["honor_done_story"] is True
+        assert mock_run_loop.call_args.kwargs["honor_done_story_on_resume"] is True
+
+    def test_epic_scope_only_requires_epic(self, tmp_path: Path) -> None:
+        """Scoped lifecycle runs fail closed without an explicit epic."""
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+
+        sprint_dir = project_dir / "_bmad-output" / "implementation-artifacts"
+        sprint_dir.mkdir(parents=True)
+        (sprint_dir / "sprint-status.yaml").write_text("epics: []\n")
+
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            """
+providers:
+  master:
+    provider: claude
+    model: opus_4
+"""
+        )
+
+        with patch("bmad_assist.cli._load_epic_data", return_value=_mock_epic_data()):
+            result = runner.invoke(
+                app,
+                [
+                    "run",
+                    "--project",
+                    str(project_dir),
+                    "--config",
+                    str(config_file),
+                    "--epic-scope-only",
+                ],
+            )
+
+        assert result.exit_code == EXIT_CONFIG_ERROR
+        assert "--epic-scope-only requires --epic" in result.output
 
     def test_run_loop_called_with_config_and_path(self, tmp_path: Path) -> None:
         """AC5: run_loop receives Config and Path arguments."""
@@ -1333,6 +1525,101 @@ class TestApplyStartPointOverride:
 
             # Should not call save_state when epic_id is None
             mock_save.assert_not_called()
+
+    def test_done_story_can_be_honored_for_explicit_phase_rerun(
+        self, tmp_path: Path
+    ) -> None:
+        """Done stories are not auto-skipped when a caller opts into explicit reruns."""
+        from bmad_assist.bmad.state_reader import EpicStory, ProjectState
+        from bmad_assist.cli_start_point import apply_start_point_override
+        from bmad_assist.core.state import State
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+
+        mock_stories = [
+            EpicStory(number="22.1", title="Done Story", status="done"),
+            EpicStory(number="22.2", title="Backlog Story", status="backlog"),
+        ]
+        mock_project_state = ProjectState(
+            epics=[],
+            all_stories=mock_stories,
+            completed_stories=["22.1"],
+            current_epic=22,
+            current_story="22.2",
+            bmad_path=str(project_dir / "docs"),
+        )
+
+        mock_config = MagicMock()
+
+        with (
+            patch("bmad_assist.cli_start_point.read_project_state", return_value=mock_project_state),
+            patch("bmad_assist.cli_start_point.load_state", return_value=State()),
+            patch("bmad_assist.cli_start_point.get_state_path", return_value=project_dir / "state.yaml"),
+            patch("bmad_assist.cli_start_point.save_state") as mock_save,
+        ):
+            apply_start_point_override(
+                mock_config,
+                project_dir,
+                project_dir / "docs",
+                epic_id="22",
+                story_id="1",
+                epic_list=[22],
+                stories_by_epic={22: ["22.1", "22.2"]},
+                honor_done_story=True,
+            )
+
+        call_args = mock_save.call_args[0]
+        saved_state = call_args[0]
+        assert saved_state.current_story == "22.1"
+
+    def test_done_story_still_auto_skips_without_explicit_phase_rerun(
+        self, tmp_path: Path
+    ) -> None:
+        """Default non-interactive done-story handling still advances to next story."""
+        from bmad_assist.bmad.state_reader import EpicStory, ProjectState
+        from bmad_assist.cli_start_point import apply_start_point_override
+        from bmad_assist.core.state import Phase, State
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+
+        mock_stories = [
+            EpicStory(number="22.1", title="Done Story", status="done"),
+            EpicStory(number="22.2", title="Review Story", status="review"),
+        ]
+        mock_project_state = ProjectState(
+            epics=[],
+            all_stories=mock_stories,
+            completed_stories=["22.1"],
+            current_epic=22,
+            current_story="22.2",
+            bmad_path=str(project_dir / "docs"),
+        )
+
+        mock_config = MagicMock()
+
+        with (
+            patch("bmad_assist.cli_start_point.read_project_state", return_value=mock_project_state),
+            patch("bmad_assist.cli_start_point.is_non_interactive", return_value=True),
+            patch("bmad_assist.cli_start_point.load_state", return_value=State()),
+            patch("bmad_assist.cli_start_point.get_state_path", return_value=project_dir / "state.yaml"),
+            patch("bmad_assist.cli_start_point.save_state") as mock_save,
+        ):
+            apply_start_point_override(
+                mock_config,
+                project_dir,
+                project_dir / "docs",
+                epic_id="22",
+                story_id="1",
+                epic_list=[22],
+                stories_by_epic={22: ["22.1", "22.2"]},
+            )
+
+        call_args = mock_save.call_args[0]
+        saved_state = call_args[0]
+        assert saved_state.current_story == "22.2"
+        assert saved_state.current_phase == Phase.CODE_REVIEW
 
     def test_invalid_epic_exits_with_error(self, tmp_path: Path) -> None:
         """Invalid epic exits with EXIT_CONFIG_ERROR."""

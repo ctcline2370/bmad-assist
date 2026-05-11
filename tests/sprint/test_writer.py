@@ -437,6 +437,85 @@ class TestHeaderComment:
 
 
 # =============================================================================
+# Test: Whitespace Hygiene
+# =============================================================================
+
+
+class TestWhitespaceHygiene:
+    """Tests for deterministic sprint-status whitespace."""
+
+    def test_ruamel_write_does_not_wrap_long_entry_with_trailing_whitespace(
+        self,
+        tmp_path: Path,
+    ):
+        """Long status keys remain one-line entries without trailing blanks."""
+        target = tmp_path / "sprint-status.yaml"
+        long_key = (
+            "2-4-scaffold-conformance-checks-across-architecture-api-"
+            "authorization-audit-and-outbox-contracts"
+        )
+        status = SprintStatus(
+            metadata=SprintStatusMetadata(
+                generated=datetime(2026, 1, 7),
+                project="whitespace-test",
+            ),
+            entries={
+                long_key: SprintStatusEntry(
+                    key=long_key,
+                    status="backlog",
+                    entry_type=EntryType.EPIC_STORY,
+                )
+            },
+        )
+
+        write_sprint_status(status, target, preserve_comments=True)
+
+        content = target.read_text(encoding="utf-8")
+        trailing_lines = [
+            line_number
+            for line_number, line in enumerate(content.splitlines(), start=1)
+            if line.rstrip(" \t") != line
+        ]
+        assert trailing_lines == []
+        assert f"  {long_key}: backlog" in content
+
+    def test_pyyaml_write_does_not_wrap_long_entry_with_trailing_whitespace(
+        self,
+        tmp_path: Path,
+    ):
+        """The non-preserving writer route keeps the same whitespace contract."""
+        target = tmp_path / "sprint-status.yaml"
+        long_key = (
+            "2-4-scaffold-conformance-checks-across-architecture-api-"
+            "authorization-audit-and-outbox-contracts"
+        )
+        status = SprintStatus(
+            metadata=SprintStatusMetadata(
+                generated=datetime(2026, 1, 7),
+                project="whitespace-test",
+            ),
+            entries={
+                long_key: SprintStatusEntry(
+                    key=long_key,
+                    status="backlog",
+                    entry_type=EntryType.EPIC_STORY,
+                )
+            },
+        )
+
+        write_sprint_status(status, target, preserve_comments=False)
+
+        content = target.read_text(encoding="utf-8")
+        trailing_lines = [
+            line_number
+            for line_number, line in enumerate(content.splitlines(), start=1)
+            if line.rstrip(" \t") != line
+        ]
+        assert trailing_lines == []
+        assert f"  {long_key}: backlog" in content
+
+
+# =============================================================================
 # Test: PyYAML Fallback (AC6)
 # =============================================================================
 

@@ -50,6 +50,7 @@ _PREVIOUS_STORY_SECTION_HEADINGS = [
 ]
 _PREVIOUS_STORY_FILE_MATCH_LIMIT = 2
 _PREVIOUS_STORY_FILE_FALLBACK_LIMIT = 1
+_PREVIOUS_STORY_SOURCE_CONTEXT_BUDGET = 6000
 _STORY_TOPIC_STOPWORDS = {
     "and",
     "asset",
@@ -428,9 +429,14 @@ class CreateStoryCompiler:
             except (OSError, UnicodeDecodeError) as e:
                 logger.debug("Could not read story %s: %s", story_path, e)
 
-        # 4. Add source files from File List using SourceContextService
-        # create_story uses File List only (no git diff)
+        # 4. Add source files from File List using SourceContextService.
+        # Previous-story file bodies are continuity hints; reserve most of the
+        # create-story budget for the current story and epic requirements.
         source_service = SourceContextService(context, "create_story")
+        source_service.budget = min(
+            source_service.budget,
+            _PREVIOUS_STORY_SOURCE_CONTEXT_BUDGET,
+        )
         source_files = source_service.collect_files(file_list_paths, None)
         files.update(source_files)
 

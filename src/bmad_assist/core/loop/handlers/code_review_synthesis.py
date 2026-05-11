@@ -46,6 +46,12 @@ logger = logging.getLogger(__name__)
 _ACTION_ITEMS_CREATED_RE = re.compile(
     r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?Action Items Created(?:\*\*)?\s*:\s*(?:\*\*)?\s*(\d+)\b"
 )
+_EVIDENCE_VERDICT_RE = re.compile(
+    r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?Evidence Verdict(?:\*\*)?\s*:\s*(?:\*\*)?\s*([A-Z][A-Z _-]*)"
+)
+_REVIEW_OUTCOME_RE = re.compile(
+    r"(?im)^\s*(?:[-*]\s*)?(?:\*\*)?Review Outcome(?:\*\*)?\s*:\s*(?:\*\*)?\s*([A-Za-z][A-Za-z _-]*)"
+)
 _UNCHECKED_AI_REVIEW_TASK_RE = re.compile(
     r"(?im)^\s*[-*]\s+\[\s\]\s*(?:\[[^\]\r\n]+\]\s*)*\[AI-Review\](?=\s|\[|:)"
 )
@@ -76,6 +82,54 @@ def extract_unresolved_code_review_action_items(synthesis_content: str) -> int |
         return len(unchecked_review_tasks)
 
     return None
+
+
+def _normalize_code_review_synthesis_verdict(raw_value: str) -> str | None:
+    """Normalize a synthesis-level verdict or review outcome."""
+    value = raw_value.strip().strip("*").strip().replace("-", " ").replace("_", " ")
+    value = re.sub(r"\s+", " ", value).upper()
+
+    if value in {"PASS", "APPROVED", "APPROVE", "ACCEPT", "ACCEPTED", "EXCELLENT"}:
+        return "PASS"
+    if value in {"UNCERTAIN", "APPROVED WITH RESERVATIONS"}:
+        return "UNCERTAIN"
+    if value in {"REJECT", "REJECTED", "CHANGES REQUESTED"}:
+        return "REJECT"
+    if value == "MAJOR REWORK":
+        return "MAJOR_REWORK"
+
+    return None
+
+
+def extract_code_review_synthesis_verdict(
+    synthesis_content: str,
+    *,
+    fallback_verdict: str = "UNKNOWN",
+) -> str:
+    """Return the final synthesis verdict used for rework loop decisions.
+
+    The raw multi-review aggregate can be negative before the synthesizer fixes
+    or explicitly dismisses findings. When the synthesis report emits its final
+    outcome, that outcome is the durable lifecycle decision. If the report is
+    ambiguous, fall back to the pre-synthesis aggregate so the runner remains
+    fail-closed for older or malformed outputs.
+    """
+    if synthesis_content.strip():
+        evidence_matches = list(_EVIDENCE_VERDICT_RE.finditer(synthesis_content))
+        if evidence_matches:
+            verdict = _normalize_code_review_synthesis_verdict(
+                evidence_matches[-1].group(1)
+            )
+            if verdict is not None:
+                return verdict
+
+        outcome_matches = list(_REVIEW_OUTCOME_RE.finditer(synthesis_content))
+        if outcome_matches:
+            verdict = _normalize_code_review_synthesis_verdict(outcome_matches[-1].group(1))
+            if verdict is not None:
+                return verdict
+
+    return fallback_verdict
 
 
 def extract_latest_story_review_action_items(
@@ -891,12 +945,23 @@ class CodeReviewSynthesisHandler(BaseHandler):
                     reviewer_count=len(reviewers_used),
                 )
 
-                # Include evidence score verdict in outputs for rework loop decision
-                verdict = (
+                # Include final synthesis verdict in outputs for rework loop decision.
+                # Raw reviewer aggregates can be stale after synthesis applies fixes.
+                raw_verdict = (
                     evidence_score_data.get("verdict", "UNKNOWN")
                     if evidence_score_data
                     else "UNKNOWN"
                 )
+                verdict = extract_code_review_synthesis_verdict(
+                    extracted_synthesis,
+                    fallback_verdict=raw_verdict,
+                )
+                if verdict != raw_verdict:
+                    logger.info(
+                        "Code review synthesis outcome %s supersedes raw review verdict %s",
+                        verdict,
+                        raw_verdict,
+                    )
                 unresolved_action_items = extract_unresolved_code_review_action_items(
                     extracted_synthesis
                 )

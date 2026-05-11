@@ -161,6 +161,55 @@ Action Items Created: 4
             is None
         )
 
+    def test_extracts_approved_with_reservations_outcome_over_raw_rework_verdict(
+        self,
+    ) -> None:
+        """Final synthesis outcome should govern rework decisions when present."""
+        from bmad_assist.core.loop.handlers.code_review_synthesis import (
+            extract_code_review_synthesis_verdict,
+        )
+
+        content = """
+## Synthesis Summary
+
+The reviewers raised MAJOR_REWORK before remediation, but synthesis applied the
+blocking fixes and routed one medium follow-up.
+
+## Final Review Outcome
+- **Evidence Verdict:** UNCERTAIN
+- **Review Outcome:** Approved with Reservations
+- **Action Items Created:** 1
+"""
+
+        assert (
+            extract_code_review_synthesis_verdict(
+                content,
+                fallback_verdict="MAJOR_REWORK",
+            )
+            == "UNCERTAIN"
+        )
+
+    def test_extracts_changes_requested_outcome_as_reject(self) -> None:
+        """A final synthesis rejection must still drive strict rework handling."""
+        from bmad_assist.core.loop.handlers.code_review_synthesis import (
+            extract_code_review_synthesis_verdict,
+        )
+
+        content = """
+## Final Review Outcome
+- **Evidence Verdict:** REJECT
+- **Review Outcome:** Changes Requested
+- **Action Items Created:** 3
+"""
+
+        assert (
+            extract_code_review_synthesis_verdict(
+                content,
+                fallback_verdict="PASS",
+            )
+            == "REJECT"
+        )
+
 
 # =============================================================================
 # Fixtures
@@ -482,6 +531,58 @@ class TestCodeReviewSynthesisHandler:
 
         assert result.success
         assert result.outputs["unresolved_code_review_action_items"] == 0
+
+    def test_execute_uses_final_synthesis_outcome_over_raw_review_verdict(
+        self,
+        synthesis_config: Config,
+        project_with_story: Path,
+        state_for_synthesis: State,
+        cached_reviews: str,
+    ) -> None:
+        """A remediated synthesis outcome should not inherit stale raw rework verdicts."""
+        from bmad_assist.core.loop.handlers.code_review_synthesis import (
+            CodeReviewSynthesisHandler,
+        )
+
+        cache_file = (
+            project_with_story
+            / ".bmad-assist"
+            / "cache"
+            / f"code-reviews-{cached_reviews}.json"
+        )
+        cached_payload = json.loads(cache_file.read_text(encoding="utf-8"))
+        cached_payload["evidence_score"]["verdict"] = "MAJOR_REWORK"
+        cache_file.write_text(json.dumps(cached_payload), encoding="utf-8")
+
+        handler = CodeReviewSynthesisHandler(synthesis_config, project_with_story)
+        synthesis_output = (
+            _MOCK_SYNTHESIS_OUTPUT
+            + "\n## Final Review Outcome\n\n"
+            + "- **Evidence Verdict:** UNCERTAIN\n"
+            + "- **Review Outcome:** Approved with Reservations\n"
+            + "- **Action Items Created:** 1\n"
+        )
+
+        with (
+            patch.object(handler, "render_prompt") as mock_render,
+            patch.object(handler, "invoke_provider") as mock_invoke,
+            patch("bmad_assist.core.debug_logger.save_prompt"),
+        ):
+            mock_render.return_value = "<compiled>test synthesis prompt</compiled>"
+            mock_invoke.return_value = ProviderResult(
+                stdout=synthesis_output,
+                stderr="",
+                exit_code=0,
+                duration_ms=5000,
+                model="opus-4",
+                command=("claude", "--print"),
+            )
+
+            result = handler.execute(state_for_synthesis)
+
+        assert result.success
+        assert result.outputs["verdict"] == "UNCERTAIN"
+        assert result.outputs["unresolved_code_review_action_items"] == 1
 
     def test_execute_recovers_action_item_count_from_story_review_section(
         self,

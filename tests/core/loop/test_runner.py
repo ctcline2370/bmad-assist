@@ -1256,6 +1256,36 @@ class TestRunLoopRunTracking:
             }
         )
 
+    def test_run_loop_body_forwards_explicit_done_story_resume_override(
+        self, tmp_path: Path, config: Config
+    ) -> None:
+        """Explicit story phase reruns should preserve done-story resume intent."""
+        from bmad_assist.core.loop.runner import _run_loop_body
+        from bmad_assist.core.loop.types import LoopExitReason
+        from bmad_assist.core.state import Phase, State
+
+        state = State(current_epic=11, current_story="11.1", current_phase=Phase.CODE_REVIEW)
+
+        with patch("bmad_assist.core.loop.runner.load_state", return_value=state):
+            with patch(
+                "bmad_assist.core.config.get_loop_config",
+                return_value=MagicMock(story=["code_review"]),
+            ):
+                with patch(
+                    "bmad_assist.core.loop.runner._validate_resume_against_sprint",
+                    return_value=(state, True),
+                ) as mock_validate:
+                    result = _run_loop_body(
+                        config,
+                        tmp_path,
+                        [11],
+                        lambda _epic: ["11.1"],
+                        honor_done_story_on_resume=True,
+                    )
+
+        assert result == LoopExitReason.COMPLETED
+        assert mock_validate.call_args.kwargs["honor_current_story"] is True
+
     @pytest.mark.parametrize(
         ("exit_reason", "expected_status"),
         [

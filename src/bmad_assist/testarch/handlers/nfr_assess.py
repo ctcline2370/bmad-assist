@@ -70,7 +70,7 @@ class NFRAssessHandler(TestarchBaseHandler):
         """
         return self._build_common_context(state)
 
-    def _detect_existing_assessment(self) -> tuple[bool, Path | None]:
+    def _detect_existing_assessment(self, epic_id: object | None = None) -> tuple[bool, Path | None]:
         """Check if NFR assessment already exists for current epic.
 
         Checks for {output_folder}/nfr-assessments/nfr-assessment.md or
@@ -92,8 +92,15 @@ class NFRAssessHandler(TestarchBaseHandler):
                 logger.debug("Detected existing NFR assessment: %s", simple_path)
                 return True, simple_path
 
-            # Also check for timestamped files: nfr-assessment-{epic_id}-*.md
-            matches = sorted(report_dir.glob("nfr-assessment-*.md"))
+            # Also check for timestamped files: nfr-assessment-{epic_id}-*.md.
+            # Keep this scoped to the active epic so an earlier epic's NFR report
+            # does not suppress the current epic's assessment.
+            pattern = (
+                f"nfr-assessment-{epic_id}-*.md"
+                if epic_id is not None
+                else "nfr-assessment-*.md"
+            )
+            matches = sorted(report_dir.glob(pattern))
             if matches:
                 logger.debug("Detected existing NFR assessment: %s", matches[-1])
                 return True, matches[-1]
@@ -192,7 +199,7 @@ class NFRAssessHandler(TestarchBaseHandler):
             return self._make_engagement_skip_result(skip_reason or "engagement_model disabled")
 
         # Check if assessment already exists
-        exists, assessment_path = self._detect_existing_assessment()
+        exists, assessment_path = self._detect_existing_assessment(epic_id=state.current_epic)
         if exists:
             logger.info("NFR assessment already exists, skipping")
             return PhaseResult.ok(

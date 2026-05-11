@@ -50,6 +50,7 @@ def apply_start_point_override(
     epic_list: list[EpicId],
     stories_by_epic: dict[EpicId, list[str]],
     force_restart: bool = False,
+    honor_done_story: bool = False,
 ) -> None:
     """Override state.yaml with specified epic/story starting point.
 
@@ -65,6 +66,7 @@ def apply_start_point_override(
         epic_list: List of available epics.
         stories_by_epic: Mapping of epic to story IDs.
         force_restart: If True, force restart even if story is done.
+        honor_done_story: If True, preserve an explicitly selected done story.
 
     Raises:
         typer.Exit: With EXIT_CONFIG_ERROR if epic/story not found.
@@ -89,7 +91,13 @@ def apply_start_point_override(
 
     # Determine story_key and status
     if story_id is not None:
-        story_key, status = _handle_story_specified(epic, story_id, epic_stories, force_restart)
+        story_key, status = _handle_story_specified(
+            epic,
+            story_id,
+            epic_stories,
+            force_restart,
+            honor_done_story=honor_done_story,
+        )
     else:
         result = _handle_epic_only(
             epic, epic_stories, config, project_path, project_state, force_restart
@@ -119,6 +127,7 @@ def _handle_story_specified(
     story_id: str,
     epic_stories: list[EpicStory],
     force_restart: bool,
+    honor_done_story: bool = False,
 ) -> tuple[str, str | None]:
     """Handle case when both epic and story are specified.
 
@@ -147,6 +156,8 @@ def _handle_story_specified(
 
     # Handle done stories with user interaction
     if status == "done":
+        if honor_done_story:
+            return story_key, status
         story_key, status = _handle_done_story(story_key, epic, epic_stories, force_restart)
 
     return story_key, status

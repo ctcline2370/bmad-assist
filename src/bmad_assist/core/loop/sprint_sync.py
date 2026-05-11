@@ -60,6 +60,8 @@ def _validate_resume_against_sprint(
     epic_list: list[EpicId],
     epic_stories_loader: Callable[[EpicId], list[str]],
     state_path: Path,
+    *,
+    honor_current_story: bool = False,
 ) -> tuple[LoopState, bool]:
     """Validate and advance state based on sprint-status on resume.
 
@@ -78,6 +80,8 @@ def _validate_resume_against_sprint(
         epic_list: Ordered list of epic IDs.
         epic_stories_loader: Function to get stories for an epic.
         state_path: Path to state file for persistence.
+        honor_current_story: Preserve the selected story when an explicit
+            story-level phase rerun has intentionally targeted a done story.
 
     Returns:
         Tuple of (updated_state, is_project_complete).
@@ -100,6 +104,7 @@ def _validate_resume_against_sprint(
             require_completion_artifacts_for_done=True,
             require_test_review_for_done=_requires_test_review_for_done(),
             epic_teardown_phases=_get_epic_teardown_phases(),
+            honor_current_story=honor_current_story,
         )
 
         if result.project_complete:

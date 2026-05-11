@@ -331,6 +331,7 @@ def validate_resume_state(
     require_completion_artifacts_for_done: bool = False,
     require_test_review_for_done: bool = False,
     epic_teardown_phases: Sequence[str | Phase] | None = None,
+    honor_current_story: bool = False,
 ) -> ResumeValidationResult:
     """Validate and advance state based on sprint-status.
 
@@ -353,6 +354,8 @@ def validate_resume_state(
             before skipping done stories. Implies code-review completion evidence.
         epic_teardown_phases: Configured epic teardown phases that must execute
             even when sprint-status already marks every story in the epic done.
+        honor_current_story: Preserve the selected story when an explicit
+            story-level phase rerun has intentionally targeted a done story.
 
     Returns:
         ResumeValidationResult with potentially advanced state.
@@ -467,7 +470,9 @@ def validate_resume_state(
             break
 
         # Check if current epic is durably done (sprint-status plus artifact)
-        if _is_epic_durably_done(current_epic, sprint_status, project_path):
+        if not honor_current_story and _is_epic_durably_done(
+            current_epic, sprint_status, project_path
+        ):
             # Epic is done - add to completed_epics if not already there
             if current_epic not in current_state.completed_epics:
                 logger.info(
@@ -560,6 +565,13 @@ def validate_resume_state(
             artifact_index=artifact_index,
         )
         if not story_completion_gaps:
+            if honor_current_story:
+                logger.info(
+                    "Sprint-status shows story %s is done; preserving it for explicit rerun",
+                    current_story,
+                )
+                break
+
             # Story is done but epic is not - need to advance to next story
             logger.info(
                 "Sprint-status shows story %s is done, advancing",

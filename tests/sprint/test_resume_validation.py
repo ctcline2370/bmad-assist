@@ -399,6 +399,32 @@ class TestValidateResumeState:
         assert result.state.current_phase == Phase.CREATE_STORY
         assert "2.1" in result.state.completed_stories
 
+    def test_preserves_done_story_when_explicit_phase_rerun_requested(
+        self, tmp_path, state_at_epic_2_story_1, epic_stories_loader, basic_sprint_status_yaml
+    ):
+        """Explicit story phase reruns do not auto-advance away from a done story."""
+        _write_sprint_status(tmp_path, basic_sprint_status_yaml)
+        _write_retro_artifact(tmp_path, 1)
+        _write_story_completion_artifacts(tmp_path, "2.1", include_test_review=True)
+        state = state_at_epic_2_story_1.model_copy(
+            update={"current_phase": Phase.CODE_REVIEW}
+        )
+
+        result = validate_resume_state(
+            state,
+            tmp_path,
+            [1, 2, 3],
+            epic_stories_loader,
+            require_completion_artifacts_for_done=True,
+            require_test_review_for_done=True,
+            honor_current_story=True,
+        )
+
+        assert result.advanced is False
+        assert result.stories_skipped == []
+        assert result.state.current_story == "2.1"
+        assert result.state.current_phase == Phase.CODE_REVIEW
+
     def test_done_story_without_synthesis_raises_when_completion_artifacts_required(
         self,
         tmp_path,
