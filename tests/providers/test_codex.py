@@ -17,6 +17,7 @@ Tests cover:
 - AC12: Settings file handling
 """
 
+import json
 import logging
 import signal
 import threading
@@ -31,7 +32,13 @@ from bmad_assist.core.exceptions import (
     ProviderTimeoutError,
 )
 from bmad_assist.providers import BaseProvider, CodexProvider, ProviderResult
-from bmad_assist.providers.codex import DEFAULT_TIMEOUT, _idle_progress_interval
+from bmad_assist.providers.codex import (
+    DEFAULT_TIMEOUT,
+    _collect_codex_stream_error_messages,
+    _format_codex_failure_diagnostic,
+    _head_tail_excerpt,
+    _idle_progress_interval,
+)
 
 from .conftest import create_codex_mock_process
 
@@ -589,6 +596,40 @@ class TestCodexProviderErrors:
                 "o3-mini",
             )
 
+    def test_invoke_nonzero_exit_prioritizes_stdout_auth_error(
+        self,
+        provider: CodexProvider,
+    ) -> None:
+        """Auth failures from Codex JSON events are not hidden by stderr warnings."""
+        stdout_content = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "thread-auth"}),
+                json.dumps(
+                    {
+                        "type": "error",
+                        "message": "unexpected status 401 Unauthorized: Missing bearer or basic authentication in header",
+                    }
+                ),
+            ]
+        )
+
+        with patch("bmad_assist.providers.codex.Popen") as mock_popen:
+            mock_popen.return_value = create_codex_mock_process(
+                stdout_content=f"{stdout_content}\n",
+                stderr_content="Warning: plugin canva@openai-curated not found",
+                returncode=1,
+            )
+
+            with pytest.raises(ProviderExitCodeError) as exc_info:
+                provider.invoke("Hello")
+
+            error_msg = str(exc_info.value)
+            assert "Codex CLI authentication failed" in error_msg
+            assert "Missing bearer or basic authentication" in error_msg
+            assert "stdout error events" in error_msg
+            assert "plugin canva" in error_msg
+            assert "Missing bearer or basic authentication" in exc_info.value.stderr
+
     def test_invoke_raises_providererror_when_cli_not_found(self, provider: CodexProvider) -> None:
         """Test AC9: invoke() raises ProviderError on FileNotFoundError."""
         with patch("bmad_assist.providers.codex.Popen") as mock_popen:
@@ -881,11 +922,56 @@ class TestConstants:
         """Test DEFAULT_TIMEOUT is 300 seconds (5 minutes)."""
         assert DEFAULT_TIMEOUT == 300
 
+    def test_head_tail_excerpt_preserves_late_failure(self) -> None:
+        """Provider diagnostics include early warnings and late fatal evidence."""
+        text = f"plugin warning\n{'x' * 200}late fatal error"
+
+        excerpt = _head_tail_excerpt(text, limit=80)
+
+        assert "plugin warning" in excerpt
+        assert "late fatal error" in excerpt
+        assert "truncated" in excerpt
+
     def test_idle_progress_interval_is_bounded(self) -> None:
         """Provider idle warnings stay useful without flooding logs."""
         assert _idle_progress_interval(4) == 5.0
         assert _idle_progress_interval(20) == 5.0
         assert _idle_progress_interval(3600) == 60.0
+
+    def test_collect_codex_stream_error_messages_reads_error_events(self) -> None:
+        """Codex stdout JSON errors are available for exit diagnostics."""
+        raw_lines = [
+            json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+            json.dumps({"type": "error", "message": "first failure"}),
+            json.dumps({"type": "turn.failed", "error": {"message": "second failure"}}),
+            "not json",
+        ]
+
+        assert _collect_codex_stream_error_messages(raw_lines) == [
+            "first failure",
+            "second failure",
+        ]
+
+    def test_failure_diagnostic_prioritizes_auth_over_stderr_noise(self) -> None:
+        """Authentication failures are surfaced before plugin startup warnings."""
+        raw_lines = [
+            json.dumps(
+                {
+                    "type": "error",
+                    "message": "unexpected status 401 Unauthorized: Missing bearer or basic authentication in header",
+                }
+            )
+        ]
+
+        diagnostic = _format_codex_failure_diagnostic(
+            "Warning: missing optional plugin\n",
+            raw_lines,
+            limit=500,
+        )
+
+        assert diagnostic.startswith("Codex CLI authentication failed")
+        assert "Missing bearer or basic authentication" in diagnostic
+        assert "stderr excerpt" in diagnostic
 
 
 class TestDocstringsExist:

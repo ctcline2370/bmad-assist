@@ -67,8 +67,12 @@ logger = logging.getLogger(__name__)
 # Default timeout in seconds (5 minutes)
 DEFAULT_TIMEOUT: int = 300
 
-# Maximum stderr length in error messages before truncation
-STDERR_TRUNCATE_LENGTH: int = 500
+# Maximum provider diagnostic length in error messages before truncation.
+#
+# Codex CLI can write plugin warnings to stderr while fatal Responses API
+# failures arrive later or on stdout JSON events. Keep enough head and tail
+# evidence to preserve the real root cause for autonomous run diagnostics.
+STDERR_TRUNCATE_LENGTH: int = 4000
 
 # Long-running Codex turns can be silent for many minutes. Emit metadata-only
 # progress so autonomous runs can see liveness before the hard timeout path.
@@ -99,6 +103,122 @@ def _format_timeout_message(
     if thread_id:
         details.append(f"thread_id={thread_id}")
     return f"Codex CLI timeout after {timeout_seconds}s ({', '.join(details)})"
+
+
+def _head_tail_excerpt(text: str, limit: int = STDERR_TRUNCATE_LENGTH) -> str:
+    """Return a bounded head-plus-tail excerpt for provider diagnostics."""
+    if not text:
+        return "(empty)"
+    if len(text) <= limit:
+        return text
+    if limit <= 0:
+        return ""
+
+    head_len = max(limit // 2, 1)
+    tail_len = max(limit - head_len, 0)
+    omitted = len(text) - limit
+    tail = text[-tail_len:] if tail_len else ""
+    return f"{text[:head_len]}\n... [truncated {omitted} chars] ...\n{tail}"
+
+
+def _extract_message_text(value: Any) -> str | None:
+    """Extract a human-readable message from a Codex JSON value."""
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    if not isinstance(value, dict):
+        return None
+
+    for key in ("message", "error", "details", "reason"):
+        nested = _extract_message_text(value.get(key))
+        if nested:
+            return nested
+    return None
+
+
+def _collect_codex_stream_error_messages(raw_stdout_lines: list[str]) -> list[str]:
+    """Collect error messages emitted by Codex --json on stdout."""
+    messages: list[str] = []
+    seen: set[str] = set()
+
+    for line in raw_stdout_lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        try:
+            event = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+
+        event_type = str(event.get("type", ""))
+        is_error_event = "error" in event_type or "failed" in event_type
+        if not is_error_event and "error" not in event:
+            continue
+
+        message = _extract_message_text(event)
+        if message and message not in seen:
+            messages.append(message)
+            seen.add(message)
+
+    return messages
+
+
+_AUTH_FAILURE_MARKERS: tuple[str, ...] = (
+    "401 unauthorized",
+    "missing bearer or basic authentication",
+    "authentication required",
+    "not authenticated",
+    "api key",
+    "bearer",
+    "basic authentication",
+)
+
+
+def _find_codex_auth_failure_message(messages: list[str]) -> str | None:
+    """Return the first message that looks like a Codex auth failure."""
+    for message in messages:
+        lower = message.lower()
+        if any(marker in lower for marker in _AUTH_FAILURE_MARKERS):
+            return message
+    return None
+
+
+def _format_codex_failure_diagnostic(
+    stderr_content: str,
+    raw_stdout_lines: list[str],
+    *,
+    limit: int = STDERR_TRUNCATE_LENGTH,
+) -> str:
+    """Build a concise non-zero-exit diagnostic from stderr and JSON events."""
+    stdout_error_messages = _collect_codex_stream_error_messages(raw_stdout_lines)
+    diagnostic_parts: list[str] = []
+
+    auth_message = _find_codex_auth_failure_message(
+        [stderr_content, *stdout_error_messages]
+    )
+    if auth_message:
+        diagnostic_parts.append(
+            "Codex CLI authentication failed: "
+            f"{_head_tail_excerpt(auth_message, min(limit, 1000))}"
+        )
+
+    if stdout_error_messages:
+        stdout_errors = "\n".join(f"- {message}" for message in stdout_error_messages)
+        diagnostic_parts.append(
+            "stdout error events:\n"
+            f"{_head_tail_excerpt(stdout_errors, limit)}"
+        )
+
+    if stderr_content:
+        diagnostic_parts.append(
+            "stderr excerpt:\n"
+            f"{_head_tail_excerpt(stderr_content, limit)}"
+        )
+
+    if not diagnostic_parts:
+        return "(empty)"
+    return "\n\n".join(diagnostic_parts)
 
 
 class CodexProvider(BaseProvider):
@@ -709,42 +829,51 @@ class CodexProvider(BaseProvider):
 
         if returncode != 0:
             exit_status = ExitStatus.from_code(returncode)
-            stderr_truncated = (
-                stderr_content[:STDERR_TRUNCATE_LENGTH] if stderr_content else "(empty)"
+            failure_diagnostic = _format_codex_failure_diagnostic(
+                stderr_content,
+                raw_stdout_lines,
             )
+            diagnostic_stream = stderr_content
+            stdout_error_messages = _collect_codex_stream_error_messages(raw_stdout_lines)
+            if stdout_error_messages:
+                stdout_error_text = "\n".join(stdout_error_messages)
+                diagnostic_stream = (
+                    f"{stderr_content}\n\nCodex stdout error events:\n"
+                    f"{stdout_error_text}"
+                ).strip()
 
             logger.error(
-                "Codex CLI failed: exit_code=%d, status=%s, model=%s, stderr=%s",
+                "Codex CLI failed: exit_code=%d, status=%s, model=%s, diagnostic=%s",
                 returncode,
                 exit_status.name,
                 effective_model,
-                stderr_truncated,
+                failure_diagnostic,
             )
 
             if exit_status == ExitStatus.SIGNAL:
                 signal_num = ExitStatus.get_signal_number(returncode)
                 message = (
                     f"Codex CLI failed with exit code {returncode} "
-                    f"(signal {signal_num}): {stderr_truncated}"
+                    f"(signal {signal_num}): {failure_diagnostic}"
                 )
             elif exit_status == ExitStatus.NOT_FOUND:
                 message = (
                     f"Codex CLI failed with exit code {returncode} "
-                    f"(command not found - check PATH): {stderr_truncated}"
+                    f"(command not found - check PATH): {failure_diagnostic}"
                 )
             elif exit_status == ExitStatus.CANNOT_EXECUTE:
                 message = (
                     f"Codex CLI failed with exit code {returncode} "
-                    f"(permission denied): {stderr_truncated}"
+                    f"(permission denied): {failure_diagnostic}"
                 )
             else:
-                message = f"Codex CLI failed with exit code {returncode}: {stderr_truncated}"
+                message = f"Codex CLI failed with exit code {returncode}: {failure_diagnostic}"
 
             raise ProviderExitCodeError(
                 message,
                 exit_code=returncode,
                 exit_status=exit_status,
-                stderr=stderr_content,
+                stderr=diagnostic_stream,
                 command=original_command,
             )
 

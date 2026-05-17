@@ -58,9 +58,13 @@ class TestRunLoopStub:
         # Story 6.5 update: run_loop now requires epic_list and epic_stories_loader
         with patch("bmad_assist.core.loop.runner.load_state", return_value=State()):
             with patch("bmad_assist.core.loop.runner.execute_phase", return_value=PhaseResult.ok()):
-                with patch("bmad_assist.core.loop.epic_phases.execute_phase", return_value=PhaseResult.ok()):
+                with patch(
+                    "bmad_assist.core.loop.epic_phases.execute_phase", return_value=PhaseResult.ok()
+                ):
                     with patch("bmad_assist.core.loop.runner.save_state"):
-                        with patch("bmad_assist.core.loop.runner.handle_epic_completion") as mock_epic:
+                        with patch(
+                            "bmad_assist.core.loop.runner.handle_epic_completion"
+                        ) as mock_epic:
                             mock_epic.return_value = (State(), True)
 
                             run_loop(valid_config, tmp_path, [1], lambda x: ["1.1"])
@@ -74,9 +78,13 @@ class TestRunLoopStub:
         # Story 6.6 update: run_loop returns LoopExitReason instead of None
         with patch("bmad_assist.core.loop.runner.load_state", return_value=State()):
             with patch("bmad_assist.core.loop.runner.execute_phase", return_value=PhaseResult.ok()):
-                with patch("bmad_assist.core.loop.epic_phases.execute_phase", return_value=PhaseResult.ok()):
+                with patch(
+                    "bmad_assist.core.loop.epic_phases.execute_phase", return_value=PhaseResult.ok()
+                ):
                     with patch("bmad_assist.core.loop.runner.save_state"):
-                        with patch("bmad_assist.core.loop.runner.handle_epic_completion") as mock_epic:
+                        with patch(
+                            "bmad_assist.core.loop.runner.handle_epic_completion"
+                        ) as mock_epic:
                             mock_epic.return_value = (State(), True)
 
                             result = run_loop(valid_config, tmp_path, [1], lambda x: ["1.1"])
@@ -93,9 +101,13 @@ class TestRunLoopStub:
         # Story 6.5 update: run_loop now requires epic_list and epic_stories_loader
         with patch("bmad_assist.core.loop.runner.load_state", return_value=State()):
             with patch("bmad_assist.core.loop.runner.execute_phase", return_value=PhaseResult.ok()):
-                with patch("bmad_assist.core.loop.epic_phases.execute_phase", return_value=PhaseResult.ok()):
+                with patch(
+                    "bmad_assist.core.loop.epic_phases.execute_phase", return_value=PhaseResult.ok()
+                ):
                     with patch("bmad_assist.core.loop.runner.save_state"):
-                        with patch("bmad_assist.core.loop.runner.handle_epic_completion") as mock_epic:
+                        with patch(
+                            "bmad_assist.core.loop.runner.handle_epic_completion"
+                        ) as mock_epic:
                             mock_epic.return_value = (State(), True)
 
                             with caplog.at_level(logging.DEBUG):
@@ -134,7 +146,9 @@ class TestRunLoopIntegration:
         # - epic_phases.py: from dispatch import execute_phase (for teardown phases)
         # Python imports create separate references, so we must patch both
         with patch("bmad_assist.core.loop.runner.execute_phase", return_value=PhaseResult.ok()):
-            with patch("bmad_assist.core.loop.epic_phases.execute_phase", return_value=PhaseResult.ok()):
+            with patch(
+                "bmad_assist.core.loop.epic_phases.execute_phase", return_value=PhaseResult.ok()
+            ):
                 with patch("bmad_assist.core.loop.runner.handle_epic_completion") as mock_epic:
                     mock_epic.return_value = (State(), True)
 
@@ -167,7 +181,9 @@ class TestRunLoopIntegration:
 
             # Must patch execute_phase in BOTH modules (each imports it separately)
             with patch("bmad_assist.core.loop.runner.execute_phase", return_value=PhaseResult.ok()):
-                with patch("bmad_assist.core.loop.epic_phases.execute_phase", return_value=PhaseResult.ok()):
+                with patch(
+                    "bmad_assist.core.loop.epic_phases.execute_phase", return_value=PhaseResult.ok()
+                ):
                     with patch("bmad_assist.core.loop.runner.handle_epic_completion") as mock_epic:
                         mock_epic.return_value = (State(), True)
 
@@ -405,7 +421,10 @@ class TestRunLoopStoryCompletion:
             patch("bmad_assist.core.loop.runner.execute_phase", side_effect=controlled_execute),
             patch("bmad_assist.core.loop.runner.save_state"),
             patch("bmad_assist.core.loop.runner._invoke_sprint_sync"),
-            patch("bmad_assist.core.loop.runner._validate_resume_against_sprint", return_value=(state, False)),
+            patch(
+                "bmad_assist.core.loop.runner._validate_resume_against_sprint",
+                return_value=(state, False),
+            ),
             patch("bmad_assist.core.loop.runner.is_skip_story_prompts", return_value=True),
             patch("bmad_assist.core.loop.runner.handle_story_completion") as mock_story,
         ):
@@ -423,6 +442,76 @@ class TestRunLoopStoryCompletion:
         assert result == LoopExitReason.COMPLETED
         assert executed_phases == [Phase.TEST_REVIEW]
         mock_story.assert_called_once()
+
+    def test_run_loop_can_hold_completed_story_boundary_before_next_story(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """One-story automation can mark done without activating the next story."""
+        from bmad_assist.core.config import load_config
+        from bmad_assist.core.loop import LoopExitReason, PhaseResult, run_loop
+        from bmad_assist.core.state import Phase, State
+
+        config = load_config(
+            {
+                "providers": {"master": {"provider": "claude", "model": "opus_4"}},
+                "state_path": str(tmp_path / "state.yaml"),
+            }
+        )
+        state = State(
+            current_epic=1,
+            current_story="1.1",
+            current_phase=Phase.TEST_REVIEW,
+            epic_setup_complete=True,
+        )
+        saved_states: list[State] = []
+        executed_phases: list[Phase] = []
+
+        def capture_save(next_state: State, _path: Path) -> None:
+            saved_states.append(next_state)
+
+        def controlled_execute(next_state: State) -> PhaseResult:
+            executed_phases.append(next_state.current_phase)
+            return PhaseResult.ok()
+
+        monkeypatch.setenv("BMAD_ASSIST_STOP_AFTER_PHASE", "1")
+        monkeypatch.setenv("BMAD_ASSIST_HOLD_COMPLETED_STORY_BOUNDARY", "1")
+
+        with (
+            patch("bmad_assist.core.loop.runner.load_state", return_value=state),
+            patch("bmad_assist.core.loop.runner.execute_phase", side_effect=controlled_execute),
+            patch("bmad_assist.core.loop.runner.save_state", side_effect=capture_save),
+            patch("bmad_assist.core.loop.runner._invoke_sprint_sync") as mock_sync,
+            patch(
+                "bmad_assist.core.loop.runner._validate_resume_against_sprint",
+                return_value=(state, False),
+            ),
+            patch("bmad_assist.core.loop.runner.is_skip_story_prompts", return_value=True),
+            patch("bmad_assist.core.loop.runner.handle_story_completion") as mock_story,
+        ):
+            result = run_loop(
+                config,
+                tmp_path,
+                [1],
+                lambda _epic: ["1.1", "1.2"],
+                skip_signal_handlers=True,
+                ipc_enabled=False,
+                plain=True,
+            )
+
+        assert result == LoopExitReason.COMPLETED
+        assert executed_phases == [Phase.TEST_REVIEW]
+        mock_story.assert_not_called()
+        completed_saves = [
+            saved
+            for saved in saved_states
+            if saved.current_story == "1.1" and "1.1" in saved.completed_stories
+        ]
+        assert completed_saves
+        assert completed_saves[-1].current_phase == Phase.TEST_REVIEW
+        assert mock_sync.call_args_list[-1].args[0].current_story == "1.1"
+        assert mock_sync.call_args_list[-1].args[0].current_phase == Phase.TEST_REVIEW
 
     def test_stop_after_phase_uses_lifecycle_story_order_for_forced_done_story(
         self,
@@ -699,10 +788,16 @@ class TestRunLoopStoryCompletion:
             patch("bmad_assist.core.loop.runner.execute_phase", side_effect=controlled_execute),
             patch("bmad_assist.core.loop.runner.save_state"),
             patch("bmad_assist.core.loop.runner._invoke_sprint_sync"),
-            patch("bmad_assist.core.loop.runner._validate_resume_against_sprint", return_value=(state, False)),
+            patch(
+                "bmad_assist.core.loop.runner._validate_resume_against_sprint",
+                return_value=(state, False),
+            ),
             patch("bmad_assist.core.loop.runner.is_skip_story_prompts", return_value=True),
             patch("bmad_assist.core.loop.runner.handle_story_completion") as mock_story,
-            patch("bmad_assist.core.loop.runner.guardian_check_anomaly", return_value=GuardianDecision.HALT),
+            patch(
+                "bmad_assist.core.loop.runner.guardian_check_anomaly",
+                return_value=GuardianDecision.HALT,
+            ),
         ):
             mock_story.return_value = (next_state, False)
             result = run_loop(
@@ -758,10 +853,16 @@ class TestRunLoopStoryCompletion:
             patch("bmad_assist.core.loop.runner.load_state", return_value=state),
             patch("bmad_assist.core.loop.runner.execute_phase", side_effect=controlled_execute),
             patch("bmad_assist.core.loop.runner.save_state", side_effect=track_save),
-            patch("bmad_assist.core.loop.runner._validate_resume_against_sprint", return_value=(state, False)),
+            patch(
+                "bmad_assist.core.loop.runner._validate_resume_against_sprint",
+                return_value=(state, False),
+            ),
             patch("bmad_assist.core.loop.runner._run_archive_artifacts"),
             patch("bmad_assist.core.loop.runner.handle_story_completion") as mock_story,
-            patch("bmad_assist.core.loop.runner.guardian_check_anomaly", return_value=GuardianDecision.HALT),
+            patch(
+                "bmad_assist.core.loop.runner.guardian_check_anomaly",
+                return_value=GuardianDecision.HALT,
+            ),
         ):
             result = run_loop(
                 config,
@@ -813,15 +914,14 @@ class TestRunLoopStoryCompletion:
                 raise StateError("Breaking loop for test")
             return PhaseResult.ok()
 
-        with patch("bmad_assist.core.loop.runner.load_state", return_value=state), patch(
-            "bmad_assist.core.loop.runner.execute_phase", side_effect=controlled_execute
-        ), patch("bmad_assist.core.loop.runner.save_state"), patch(
-            "bmad_assist.core.loop.runner.handle_story_completion"
-        ) as mock_story:
+        with (
+            patch("bmad_assist.core.loop.runner.load_state", return_value=state),
+            patch("bmad_assist.core.loop.runner.execute_phase", side_effect=controlled_execute),
+            patch("bmad_assist.core.loop.runner.save_state"),
+            patch("bmad_assist.core.loop.runner.handle_story_completion") as mock_story,
+        ):
             mock_story.return_value = (next_state, False)
-            with patch(
-                "bmad_assist.core.loop.runner.handle_epic_completion"
-            ) as mock_epic:
+            with patch("bmad_assist.core.loop.runner.handle_epic_completion") as mock_epic:
                 mock_epic.return_value = (next_state, True)
 
                 try:
@@ -930,9 +1030,11 @@ class TestRunLoopEpicCompletion:
                 raise StateError("Breaking loop for test")
             return PhaseResult.ok()
 
-        with patch("bmad_assist.core.loop.runner.load_state", return_value=state), patch(
-            "bmad_assist.core.loop.runner.execute_phase", side_effect=controlled_execute
-        ), patch("bmad_assist.core.loop.runner.save_state"):
+        with (
+            patch("bmad_assist.core.loop.runner.load_state", return_value=state),
+            patch("bmad_assist.core.loop.runner.execute_phase", side_effect=controlled_execute),
+            patch("bmad_assist.core.loop.runner.save_state"),
+        ):
             with patch("bmad_assist.core.loop.runner.handle_epic_completion") as mock_epic:
                 # First call: not complete, second: complete to break loop
                 mock_epic.side_effect = [
@@ -1007,9 +1109,7 @@ class TestRunLoopEpicCompletion:
                 config,
                 tmp_path,
                 [1, 2],
-                lambda epic: ["1.1", "1.2", "1.3", "1.4", "1.5"]
-                if epic == 1
-                else ["2.1"],
+                lambda epic: ["1.1", "1.2", "1.3", "1.4", "1.5"] if epic == 1 else ["2.1"],
                 skip_signal_handlers=True,
                 ipc_enabled=False,
                 plain=True,
@@ -1018,8 +1118,7 @@ class TestRunLoopEpicCompletion:
         assert result == LoopExitReason.COMPLETED
         assert executed_phases == [Phase.RETROSPECTIVE]
         assert any(
-            saved.current_epic == 1 and saved.completed_epics == [1]
-            for saved in saved_states
+            saved.current_epic == 1 and saved.completed_epics == [1] for saved in saved_states
         )
         assert all(saved.current_epic != 2 for saved in saved_states)
         assert all(synced.current_epic != 2 for synced in synced_states)
@@ -1151,14 +1250,16 @@ class TestRunLoopFailureHandling:
                 return PhaseResult.fail("Error")
             return PhaseResult.ok()
 
-        with patch("bmad_assist.core.loop.runner.load_state", return_value=state), patch(
-            "bmad_assist.core.loop.runner.execute_phase", side_effect=failing_then_success
-        ), patch("bmad_assist.core.loop.runner.save_state", side_effect=track_save), patch(
-            "bmad_assist.core.loop.runner.guardian_check_anomaly",
-            side_effect=track_guardian,
-        ), patch(
-            "bmad_assist.core.loop.runner.handle_epic_completion"
-        ) as mock_epic:
+        with (
+            patch("bmad_assist.core.loop.runner.load_state", return_value=state),
+            patch("bmad_assist.core.loop.runner.execute_phase", side_effect=failing_then_success),
+            patch("bmad_assist.core.loop.runner.save_state", side_effect=track_save),
+            patch(
+                "bmad_assist.core.loop.runner.guardian_check_anomaly",
+                side_effect=track_guardian,
+            ),
+            patch("bmad_assist.core.loop.runner.handle_epic_completion") as mock_epic,
+        ):
             mock_epic.return_value = (state, True)
 
             run_loop(config, tmp_path, [1], lambda x: ["1.1"])
@@ -1189,13 +1290,19 @@ class TestRunLoopFailureHandling:
             current_phase=Phase.CREATE_STORY,
         )
 
-        with patch("bmad_assist.core.loop.runner.load_state", return_value=state), patch(
-            "bmad_assist.core.loop.runner.execute_phase",
-            return_value=PhaseResult.fail("Error"),
-        ), patch("bmad_assist.core.loop.runner.save_state"), patch(
-            "bmad_assist.core.loop.runner.guardian_check_anomaly",
-            return_value=GuardianDecision.HALT,
-        ), caplog.at_level(logging.DEBUG):
+        with (
+            patch("bmad_assist.core.loop.runner.load_state", return_value=state),
+            patch(
+                "bmad_assist.core.loop.runner.execute_phase",
+                return_value=PhaseResult.fail("Error"),
+            ),
+            patch("bmad_assist.core.loop.runner.save_state"),
+            patch(
+                "bmad_assist.core.loop.runner.guardian_check_anomaly",
+                return_value=GuardianDecision.HALT,
+            ),
+            caplog.at_level(logging.DEBUG),
+        ):
             # Should return normally (not exception)
             result = run_loop(config, tmp_path, [1], lambda x: ["1.1"])
 
@@ -1315,10 +1422,13 @@ class TestRunLoopRunTracking:
             saved_logs.append(deepcopy(run_log))
             return tmp_path / ".bmad-assist" / "runs" / "dummy.yaml"
 
-        with patch(
-            "bmad_assist.core.config.load_loop_config",
-            return_value=MagicMock(epic_setup=[], story=[], epic_teardown=[]),
-        ), patch("bmad_assist.core.config.set_loop_config"):
+        with (
+            patch(
+                "bmad_assist.core.config.load_loop_config",
+                return_value=MagicMock(epic_setup=[], story=[], epic_teardown=[]),
+            ),
+            patch("bmad_assist.core.config.set_loop_config"),
+        ):
             with patch("bmad_assist.core.loop.runner.init_handlers"):
                 with patch("bmad_assist.core.loop.runner._ensure_sprint_sync_callback"):
                     with patch(
@@ -1364,10 +1474,14 @@ class TestRunLoopRunTracking:
             saved_logs.append(deepcopy(run_log))
             return tmp_path / ".bmad-assist" / "runs" / "dummy.yaml"
 
-        with pytest.raises(RuntimeError, match="boom"), patch(
-            "bmad_assist.core.config.load_loop_config",
-            return_value=MagicMock(epic_setup=[], story=[], epic_teardown=[]),
-        ), patch("bmad_assist.core.config.set_loop_config"):
+        with (
+            pytest.raises(RuntimeError, match="boom"),
+            patch(
+                "bmad_assist.core.config.load_loop_config",
+                return_value=MagicMock(epic_setup=[], story=[], epic_teardown=[]),
+            ),
+            patch("bmad_assist.core.config.set_loop_config"),
+        ):
             with patch("bmad_assist.core.loop.runner.init_handlers"):
                 with patch("bmad_assist.core.loop.runner._ensure_sprint_sync_callback"):
                     with patch(
@@ -1402,10 +1516,14 @@ class TestRunLoopRunTracking:
         """run_loop should not create a RUNNING log if the process lock is denied."""
         from bmad_assist.core.loop.runner import run_loop
 
-        with pytest.raises(StateError, match="already running"), patch(
-            "bmad_assist.core.config.load_loop_config",
-            return_value=MagicMock(epic_setup=[], story=[], epic_teardown=[]),
-        ), patch("bmad_assist.core.config.set_loop_config"):
+        with (
+            pytest.raises(StateError, match="already running"),
+            patch(
+                "bmad_assist.core.config.load_loop_config",
+                return_value=MagicMock(epic_setup=[], story=[], epic_teardown=[]),
+            ),
+            patch("bmad_assist.core.config.set_loop_config"),
+        ):
             with patch("bmad_assist.core.loop.runner.init_handlers"):
                 with patch("bmad_assist.core.loop.runner._ensure_sprint_sync_callback"):
                     with patch(
@@ -1445,10 +1563,13 @@ class TestRunLoopRunTracking:
             events.append(f"save:{run_log.status.value}")
             return tmp_path / ".bmad-assist" / "runs" / "dummy.yaml"
 
-        with patch(
-            "bmad_assist.core.config.load_loop_config",
-            return_value=MagicMock(epic_setup=[], story=[], epic_teardown=[]),
-        ), patch("bmad_assist.core.config.set_loop_config"):
+        with (
+            patch(
+                "bmad_assist.core.config.load_loop_config",
+                return_value=MagicMock(epic_setup=[], story=[], epic_teardown=[]),
+            ),
+            patch("bmad_assist.core.config.set_loop_config"),
+        ):
             with patch("bmad_assist.core.loop.runner.init_handlers"):
                 with patch("bmad_assist.core.loop.runner._ensure_sprint_sync_callback"):
                     with patch(
@@ -1507,10 +1628,14 @@ class TestRunLoopRunTracking:
             captured_callback["fn"](signal.SIGTERM)
             raise SystemExit(143)
 
-        with pytest.raises(SystemExit) as exc_info, patch(
-            "bmad_assist.core.config.load_loop_config",
-            return_value=MagicMock(epic_setup=[], story=[], epic_teardown=[]),
-        ), patch("bmad_assist.core.config.set_loop_config"):
+        with (
+            pytest.raises(SystemExit) as exc_info,
+            patch(
+                "bmad_assist.core.config.load_loop_config",
+                return_value=MagicMock(epic_setup=[], story=[], epic_teardown=[]),
+            ),
+            patch("bmad_assist.core.config.set_loop_config"),
+        ):
             with patch("bmad_assist.core.loop.runner.init_handlers"):
                 with patch("bmad_assist.core.loop.runner._ensure_sprint_sync_callback"):
                     with patch(
@@ -1762,9 +1887,7 @@ class TestCodeReviewReworkPolicy:
             patch("bmad_assist.git.auto_commit_phase"),
             patch("bmad_assist.core.loop.runner.save_state"),
             patch("bmad_assist.core.loop.runner._run_archive_artifacts"),
-            patch(
-                "bmad_assist.core.loop.runner.handle_story_completion"
-            ) as mock_story_completion,
+            patch("bmad_assist.core.loop.runner.handle_story_completion") as mock_story_completion,
             patch("bmad_assist.core.loop.runner.handle_epic_completion") as mock_epic_completion,
             caplog.at_level(logging.INFO),
         ):
@@ -1837,9 +1960,7 @@ class TestCodeReviewReworkPolicy:
                 side_effect=capture_state,
             ),
             patch("bmad_assist.core.loop.runner._run_archive_artifacts") as mock_archive,
-            patch(
-                "bmad_assist.core.loop.runner.handle_story_completion"
-            ) as mock_story_completion,
+            patch("bmad_assist.core.loop.runner.handle_story_completion") as mock_story_completion,
         ):
             result = run_loop(config, tmp_path, [1], lambda x: ["1.1"])
 
@@ -1853,9 +1974,7 @@ class TestCodeReviewReworkPolicy:
         mock_archive.assert_not_called()
         mock_story_completion.assert_not_called()
 
-    def test_run_loop_stops_when_negative_verdict_remains_unresolved(
-        self, tmp_path: Path
-    ) -> None:
+    def test_run_loop_stops_when_negative_verdict_remains_unresolved(self, tmp_path: Path) -> None:
         """Runner fails closed after exhausting rework attempts by default."""
         from bmad_assist.core.config import LoopConfig
         from bmad_assist.core.loop import PhaseResult, run_loop
@@ -1984,8 +2103,7 @@ class TestCodeReviewReworkPolicy:
 
         assert result == LoopExitReason.COMPLETED
         assert (
-            "continuing because loop.fail_on_unresolved_negative_code_review=false"
-            in caplog.text
+            "continuing because loop.fail_on_unresolved_negative_code_review=false" in caplog.text
         )
         mock_archive.assert_called_once()
         mock_story_completion.assert_called_once()
@@ -2033,15 +2151,19 @@ class TestPhaseTimingReset:
             call_sequence.append(f"execute_{execute_count[0]}")
             return PhaseResult.ok()
 
-        with patch("bmad_assist.core.loop.runner.load_state", return_value=state), patch(
-            "bmad_assist.core.loop.runner.start_phase_timing",
-            side_effect=track_start_phase_timing,
-        ), patch(
-            "bmad_assist.core.loop.runner.execute_phase",
-            side_effect=track_execute_phase,
-        ), patch("bmad_assist.core.loop.runner.save_state"), patch(
-            "bmad_assist.core.loop.runner.handle_epic_completion"
-        ) as mock_epic:
+        with (
+            patch("bmad_assist.core.loop.runner.load_state", return_value=state),
+            patch(
+                "bmad_assist.core.loop.runner.start_phase_timing",
+                side_effect=track_start_phase_timing,
+            ),
+            patch(
+                "bmad_assist.core.loop.runner.execute_phase",
+                side_effect=track_execute_phase,
+            ),
+            patch("bmad_assist.core.loop.runner.save_state"),
+            patch("bmad_assist.core.loop.runner.handle_epic_completion") as mock_epic,
+        ):
             mock_epic.return_value = (state, True)
 
             run_loop(config, tmp_path, [1], lambda x: ["1.1"])

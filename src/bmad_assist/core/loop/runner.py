@@ -90,7 +90,7 @@ from bmad_assist.core.loop.sprint_sync import (
     _trigger_interactive_repair,
     _validate_resume_against_sprint,
 )
-from bmad_assist.core.loop.story_transitions import handle_story_completion
+from bmad_assist.core.loop.story_transitions import complete_story, handle_story_completion
 from bmad_assist.core.loop.types import GuardianDecision, LoopExitReason
 from bmad_assist.core.state import (
     Phase,
@@ -140,6 +140,11 @@ def _should_stop_after_successful_phase() -> bool:
     return os.environ.get("BMAD_ASSIST_STOP_AFTER_PHASE") == "1"
 
 
+def _should_hold_completed_story_boundary() -> bool:
+    """Return true when a one-story run must not activate the next story."""
+    return os.environ.get("BMAD_ASSIST_HOLD_COMPLETED_STORY_BOUNDARY") == "1"
+
+
 def _log_stop_after_successful_phase(completed_phase: Phase | None) -> None:
     """Log a consistent stop-after-phase boundary message."""
     logger.info(
@@ -170,9 +175,7 @@ def _load_story_completion_order(
     try:
         active_stories = epic_stories_loader(state.current_epic)
     except Exception as e:
-        raise StateError(
-            f"Failed to load active stories for epic {state.current_epic}: {e}"
-        ) from e
+        raise StateError(f"Failed to load active stories for epic {state.current_epic}: {e}") from e
 
     if state.current_story in active_stories:
         logger.warning(
@@ -223,6 +226,24 @@ def _complete_epic_boundary_for_stop_after_phase(
     completed_state = complete_epic(state)
     save_state(completed_state, state_path)
     _invoke_sprint_sync(completed_state, project_path)
+    return completed_state
+
+
+def _hold_completed_story_boundary(
+    state: State,
+    state_path: Path,
+    project_path: Path,
+) -> State:
+    """Persist a completed story without moving to the next story or teardown."""
+    completed_state = complete_story(state)
+    save_state(completed_state, state_path)
+    _invoke_sprint_sync(completed_state, project_path)
+    logger.info(
+        "Holding completed story %s at phase %s because "
+        "BMAD_ASSIST_HOLD_COMPLETED_STORY_BOUNDARY=1",
+        completed_state.current_story,
+        completed_state.current_phase.name if completed_state.current_phase else "None",
+    )
     return completed_state
 
 
@@ -511,7 +532,9 @@ def _start_ipc_server(
         logger.info("IPC server started on %s", socket_path)
         from bmad_assist.cli_utils import console
 
-        console.print("[dim]TUI available: run [bold]bmad-assist tui[/bold] in another terminal[/dim]")
+        console.print(
+            "[dim]TUI available: run [bold]bmad-assist tui[/bold] in another terminal[/dim]"
+        )
         console.print(f"[dim]  Socket: {socket_path}[/dim]")
         return ipc_thread
     except (StateError, OSError, TimeoutError, _IPCError) as e:
@@ -1080,33 +1103,41 @@ def _run_loop_body(
                 override = config.phase_models[phase_name]
                 multi_list = override if isinstance(override, list) else [override]  # type: ignore[list-item]
                 for mc in multi_list:
-                    details.append({
-                        "provider": mc.provider,
-                        "model": mc.display_model,
-                        "phase": phase_name,
-                        "role": "multi",
-                    })
+                    details.append(
+                        {
+                            "provider": mc.provider,
+                            "model": mc.display_model,
+                            "phase": phase_name,
+                            "role": "multi",
+                        }
+                    )
             else:
                 for mc in config.providers.multi:
-                    details.append({
-                        "provider": mc.provider,
-                        "model": mc.display_model,
+                    details.append(
+                        {
+                            "provider": mc.provider,
+                            "model": mc.display_model,
+                            "phase": phase_name,
+                            "role": "multi",
+                        }
+                    )
+                details.append(
+                    {
+                        "provider": config.providers.master.provider,
+                        "model": config.providers.master.display_model,
                         "phase": phase_name,
-                        "role": "multi",
-                    })
-                details.append({
+                        "role": "master",
+                    }
+                )
+        else:
+            details.append(
+                {
                     "provider": config.providers.master.provider,
                     "model": config.providers.master.display_model,
                     "phase": phase_name,
                     "role": "master",
-                })
-        else:
-            details.append({
-                "provider": config.providers.master.provider,
-                "model": config.providers.master.display_model,
-                "phase": phase_name,
-                "role": "master",
-            })
+                }
+            )
 
         return details
 
@@ -1135,7 +1166,9 @@ def _run_loop_body(
             "current_epic": state.current_epic,
             "current_story": state.current_story,
             "current_phase": state.current_phase.name if state.current_phase else None,
-            "phase_started_at": state.phase_started_at.isoformat() if state.phase_started_at else None,
+            "phase_started_at": state.phase_started_at.isoformat()
+            if state.phase_started_at
+            else None,
             "session_details": _ipc_session_details(),
         }
 
@@ -1146,7 +1179,6 @@ def _run_loop_body(
     saved_phase: Phase | None = None
 
     try:  # IPC cleanup in finally block at the end of _run_loop_body
-
         # Epic setup: run before first story if not already complete
         # Per ADR-007: This also handles resume-after-setup-crash by restarting all setup phases
         if not state.epic_setup_complete and loop_config.epic_setup:
@@ -1155,7 +1187,9 @@ def _run_loop_body(
             saved_phase = state.current_phase
             logger.info("Running epic setup phases for epic %s", state.current_epic)
             state, setup_success = _execute_epic_setup(
-                state, state_path, project_path,
+                state,
+                state_path,
+                project_path,
             )
         if not setup_success:
             logger.error("Epic setup failed, halting loop")
@@ -1210,15 +1244,20 @@ def _run_loop_body(
                 epic_id=state.current_epic,
                 story_id=str(state.current_story) if state.current_story else None,
             )
-            emitter.update_state(RunnerState.RUNNING, {
-                "current_epic": state.current_epic,
-                "current_story": state.current_story,
-                "current_phase": _phase_name_ipc,
-                "elapsed_seconds": get_project_duration_ms(state) / 1000.0,
-                "llm_sessions": _ipc_llm_count(),
-                "phase_started_at": state.phase_started_at.isoformat() if state.phase_started_at else None,
-                "session_details": _ipc_session_details(),
-            })
+            emitter.update_state(
+                RunnerState.RUNNING,
+                {
+                    "current_epic": state.current_epic,
+                    "current_story": state.current_story,
+                    "current_phase": _phase_name_ipc,
+                    "elapsed_seconds": get_project_duration_ms(state) / 1000.0,
+                    "llm_sessions": _ipc_llm_count(),
+                    "phase_started_at": state.phase_started_at.isoformat()
+                    if state.phase_started_at
+                    else None,
+                    "session_details": _ipc_session_details(),
+                },
+            )
 
             # CLI Observability: Record phase START in run log (crash diagnostics)
             if run_log is not None:
@@ -1292,7 +1331,9 @@ def _run_loop_body(
                     MULTI_LLM_PHASES as _MULTI_PHASES,
                 )
 
-                _pcount = (len(config.providers.multi) + 1) if phase_name.lower() in _MULTI_PHASES else 1
+                _pcount = (
+                    (len(config.providers.multi) + 1) if phase_name.lower() in _MULTI_PHASES else 1
+                )
                 run_log.phases.append(
                     PhaseInvocation(
                         phase=phase_name,
@@ -1459,7 +1500,9 @@ def _run_loop_body(
 
                     # Wait for resume (pause.flag cleared) or stop request
                     # shutdown_requested() is checked inside wait_for_resume (Story 22.10)
-                    resumed = wait_for_resume(project_path, stop_event=None, pause_timeout_minutes=60)
+                    resumed = wait_for_resume(
+                        project_path, stop_event=None, pause_timeout_minutes=60
+                    )
 
                     if not resumed:
                         # Stop requested while paused or timeout
@@ -1506,15 +1549,14 @@ def _run_loop_body(
             if current_phase in (Phase.CODE_REVIEW_SYNTHESIS, Phase.TEST_REVIEW) and result.success:
                 # Rework loop: If verdict requires rework and feature is enabled, loop back to DEV_STORY
                 if current_phase == Phase.CODE_REVIEW_SYNTHESIS:
-                    verdict = result.outputs.get("verdict", "UNKNOWN") if result.outputs else "UNKNOWN"
+                    verdict = (
+                        result.outputs.get("verdict", "UNKNOWN") if result.outputs else "UNKNOWN"
+                    )
                     unresolved_action_items = _get_unresolved_code_review_action_items(
                         result.outputs
                     )
                     rework_verdicts = {"REJECT", "MAJOR_REWORK"}
-                    if (
-                        verdict in rework_verdicts
-                        and unresolved_action_items == 0
-                    ):
+                    if verdict in rework_verdicts and unresolved_action_items == 0:
                         logger.info(
                             "Code review %s produced zero unresolved synthesis action items; "
                             "completing story without rework",
@@ -1663,7 +1705,15 @@ def _run_loop_body(
                         story_title=story_title,
                     )
 
-                new_state, is_epic_complete = handle_story_completion(state, epic_stories, state_path)
+                if _should_hold_completed_story_boundary():
+                    state = _hold_completed_story_boundary(state, state_path, project_path)
+                    if _should_stop_after_successful_phase():
+                        _log_stop_after_successful_phase(current_phase)
+                    return LoopExitReason.COMPLETED
+
+                new_state, is_epic_complete = handle_story_completion(
+                    state, epic_stories, state_path
+                )
 
                 if is_epic_complete:
                     if _should_stop_after_successful_phase():
@@ -1673,7 +1723,9 @@ def _run_loop_body(
                         return LoopExitReason.COMPLETED
 
                     # Run all epic teardown phases (retrospective, qa_plan_*, etc.)
-                    logger.info("Epic %s stories complete, running teardown phases", state.current_epic)
+                    logger.info(
+                        "Epic %s stories complete, running teardown phases", state.current_epic
+                    )
                     state, teardown_success, teardown_result = _execute_epic_teardown(
                         new_state, state_path, project_path
                     )
@@ -1759,7 +1811,9 @@ def _run_loop_body(
                     if is_project_complete:
                         # Story standalone-03 AC7: Dispatch project_completed event
                         project_duration_ms = get_project_duration_ms(state)
-                        total_stories = len(state.completed_stories) if state.completed_stories else 0
+                        total_stories = (
+                            len(state.completed_stories) if state.completed_stories else 0
+                        )
                         _dispatch_event(
                             "project_completed",
                             project_path,
@@ -1819,7 +1873,9 @@ def _run_loop_body(
                         except ValueError:
                             # Fallback for standalone stories or non-standard IDs
                             # Use current_epic directly as EpicId (supports string epics)
-                            parsed_epic = state.current_epic if state.current_epic is not None else 1
+                            parsed_epic = (
+                                state.current_epic if state.current_epic is not None else 1
+                            )
                             parsed_story = 1
 
                         # Get story title from story file or use default
@@ -1842,7 +1898,9 @@ def _run_loop_body(
                             sequence_id=sequence_id,
                             epic_num=parsed_epic,
                             story_id=story_id_str,
-                            phase=state.current_phase.name if state.current_phase else "CREATE_STORY",
+                            phase=state.current_phase.name
+                            if state.current_phase
+                            else "CREATE_STORY",
                             phase_status="in-progress",
                         )
 
@@ -2054,7 +2112,9 @@ def _run_loop_body(
 
                     if is_project_complete:
                         project_duration_ms = get_project_duration_ms(state)
-                        total_stories = len(state.completed_stories) if state.completed_stories else 0
+                        total_stories = (
+                            len(state.completed_stories) if state.completed_stories else 0
+                        )
                         _dispatch_event(
                             "project_completed",
                             project_path,
