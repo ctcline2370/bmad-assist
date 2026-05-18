@@ -183,21 +183,39 @@ class TestCodexProviderInvoke:
             "o3-mini",
         ]
 
-    def test_invoke_sets_repo_local_codex_home_when_present(
+    def test_invoke_sets_repo_local_codex_home_when_auth_present(
         self,
         provider: CodexProvider,
         mock_popen_success: MagicMock,
         tmp_path: Path,
     ) -> None:
-        """Repo-local .codex is used as CODEX_HOME when no env override exists."""
+        """Repo-local .codex is used as CODEX_HOME when it has auth material."""
         repo_codex_home = tmp_path / ".codex"
         repo_codex_home.mkdir()
+        (repo_codex_home / "auth.json").write_text("{}", encoding="utf-8")
 
         with patch.dict("bmad_assist.providers.codex.os.environ", {}, clear=True):
             provider.invoke("Review code", cwd=tmp_path)
 
         env = mock_popen_success.call_args.kwargs["env"]
         assert env["CODEX_HOME"] == str(repo_codex_home)
+
+    def test_invoke_does_not_set_repo_local_codex_home_without_auth(
+        self,
+        provider: CodexProvider,
+        mock_popen_success: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Repo-local config without auth should not shadow user-level auth."""
+        repo_codex_home = tmp_path / ".codex"
+        repo_codex_home.mkdir()
+        (repo_codex_home / "config.toml").write_text('model = "gpt-5.5"\n', encoding="utf-8")
+
+        with patch.dict("bmad_assist.providers.codex.os.environ", {}, clear=True):
+            provider.invoke("Review code", cwd=tmp_path)
+
+        env = mock_popen_success.call_args.kwargs["env"]
+        assert "CODEX_HOME" not in env
 
     def test_invoke_preserves_existing_codex_home(
         self,

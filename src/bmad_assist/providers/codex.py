@@ -577,7 +577,7 @@ class CodexProvider(BaseProvider):
         child_env = os.environ.copy()
         if cwd is not None and "CODEX_HOME" not in child_env:
             repo_codex_home = Path(cwd) / ".codex"
-            if repo_codex_home.is_dir():
+            if (repo_codex_home / "auth.json").is_file():
                 child_env["CODEX_HOME"] = str(repo_codex_home)
 
         try:
