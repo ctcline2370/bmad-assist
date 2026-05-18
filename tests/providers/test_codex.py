@@ -35,6 +35,7 @@ from bmad_assist.providers import BaseProvider, CodexProvider, ProviderResult
 from bmad_assist.providers.codex import (
     DEFAULT_TIMEOUT,
     _collect_codex_stream_error_messages,
+    _collect_process_snapshot,
     _format_codex_failure_diagnostic,
     _head_tail_excerpt,
     _idle_progress_interval,
@@ -476,6 +477,39 @@ class TestCodexProviderErrors:
             register_mock.assert_called_once_with(4321)
             killpg_mock.assert_called_once_with(4321, signal.SIGKILL)
             unregister_mock.assert_called_once_with(4321)
+
+    def test_timeout_partial_result_includes_process_snapshot(
+        self, provider: CodexProvider, accelerated_time: None
+    ) -> None:
+        """Timeout artifacts include process context for stuck child commands."""
+        with (
+            patch("bmad_assist.providers.codex.Popen") as mock_popen,
+            patch("bmad_assist.providers.codex.os.getpgid", return_value=4321),
+            patch("bmad_assist.providers.codex.os.killpg"),
+            patch("bmad_assist.providers.codex.run") as run_mock,
+        ):
+            mock_process = create_codex_mock_process(never_finish=True)
+            mock_process.pid = 123
+            mock_popen.return_value = mock_process
+            run_mock.return_value = MagicMock(
+                stdout=(
+                    "  123     1  4321 S      00:10 codex exec --json\n"
+                    "  124   123  4321 S      00:08 dotnet test tests/Example.csproj\n"
+                )
+            )
+
+            with pytest.raises(ProviderTimeoutError) as exc_info:
+                provider.invoke("Hello", timeout=5)
+
+        partial = exc_info.value.partial_result
+        assert partial is not None
+        assert "## Codex Process Snapshot At Timeout" in partial.stderr
+        assert "codex exec --json" in partial.stderr
+        assert "dotnet test tests/Example.csproj" in partial.stderr
+
+    def test_collect_process_snapshot_handles_missing_process_ids(self) -> None:
+        """Process snapshots degrade gracefully when pid data is unavailable."""
+        assert "unavailable" in _collect_process_snapshot(None, None).lower()
 
     def test_timeout_uses_wall_clock_when_perf_counter_stalls(
         self, provider: CodexProvider

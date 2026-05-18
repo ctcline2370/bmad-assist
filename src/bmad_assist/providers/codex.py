@@ -34,7 +34,7 @@ import signal
 import threading
 import time
 from pathlib import Path
-from subprocess import PIPE, Popen, TimeoutExpired
+from subprocess import PIPE, Popen, TimeoutExpired, run
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -78,6 +78,7 @@ STDERR_TRUNCATE_LENGTH: int = 4000
 # progress so autonomous runs can see liveness before the hard timeout path.
 IDLE_PROGRESS_MAX_INTERVAL_SECONDS: float = 60.0
 IDLE_PROGRESS_MIN_INTERVAL_SECONDS: float = 5.0
+PROCESS_SNAPSHOT_MAX_LINES: int = 80
 
 
 def _idle_progress_interval(timeout_seconds: int) -> float:
@@ -103,6 +104,91 @@ def _format_timeout_message(
     if thread_id:
         details.append(f"thread_id={thread_id}")
     return f"Codex CLI timeout after {timeout_seconds}s ({', '.join(details)})"
+
+
+def _safe_process_id(value: object) -> int | None:
+    """Return a positive process id, excluding mocks and invalid values."""
+    return value if isinstance(value, int) and value > 0 else None
+
+
+def _parse_ps_row(line: str) -> tuple[int, int, int, str] | None:
+    """Parse a ps row into pid, ppid, pgid, and the original line."""
+    parts = line.strip().split(None, 5)
+    if len(parts) < 5:
+        return None
+
+    try:
+        pid = int(parts[0])
+        ppid = int(parts[1])
+        pgid = int(parts[2])
+    except ValueError:
+        return None
+
+    return pid, ppid, pgid, line.rstrip()
+
+
+def _collect_process_snapshot(process_id: int | None, process_group_id: int | None) -> str:
+    """Collect a bounded process snapshot for timeout diagnostics."""
+    if process_id is None and process_group_id is None:
+        return "Process snapshot unavailable: no process id or process group id."
+
+    try:
+        snapshot = run(
+            ["ps", "-axo", "pid=,ppid=,pgid=,stat=,etime=,command="],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2,
+            check=False,
+        )
+    except (OSError, TimeoutExpired) as error:
+        return f"Process snapshot unavailable: ps failed with {type(error).__name__}: {error}"
+
+    rows: list[tuple[int, int, int, str]] = []
+    children_by_parent: dict[int, list[int]] = {}
+    row_by_pid: dict[int, tuple[int, int, int, str]] = {}
+    for line in snapshot.stdout.splitlines():
+        parsed = _parse_ps_row(line)
+        if parsed is None:
+            continue
+        pid, ppid, _pgid, _raw_line = parsed
+        rows.append(parsed)
+        row_by_pid[pid] = parsed
+        children_by_parent.setdefault(ppid, []).append(pid)
+
+    selected: set[int] = set()
+    if process_id is not None:
+        selected.add(process_id)
+    if process_group_id is not None:
+        selected.update(pid for pid, _ppid, pgid, _line in rows if pgid == process_group_id)
+
+    pending = list(selected)
+    while pending:
+        parent = pending.pop()
+        for child in children_by_parent.get(parent, []):
+            if child not in selected:
+                selected.add(child)
+                pending.append(child)
+
+    if not selected:
+        return (
+            "Process snapshot captured, but no matching processes were found "
+            f"(pid={process_id or '-'}, pgid={process_group_id or '-'})."
+        )
+
+    lines = ["PID PPID PGID STAT ELAPSED COMMAND"]
+    for pid in sorted(selected):
+        row = row_by_pid.get(pid)
+        if row is not None:
+            lines.append(row[3])
+        if len(lines) >= PROCESS_SNAPSHOT_MAX_LINES:
+            omitted = len(selected) - (PROCESS_SNAPSHOT_MAX_LINES - 1)
+            if omitted > 0:
+                lines.append(f"... omitted {omitted} matching process rows ...")
+            break
+
+    return "\n".join(lines)
 
 
 def _head_tail_excerpt(text: str, limit: int = STDERR_TRUNCATE_LENGTH) -> str:
@@ -719,6 +805,14 @@ class CodexProvider(BaseProvider):
                     break
 
                 if now >= deadline or wall_now >= wall_deadline:
+                    process_snapshot = _collect_process_snapshot(
+                        _safe_process_id(getattr(process, "pid", None)),
+                        child_pgid,
+                    )
+                    stderr_chunks.append(
+                        "\n\n## Codex Process Snapshot At Timeout\n"
+                        f"{process_snapshot}\n"
+                    )
                     if child_pgid is not None:
                         with contextlib.suppress(
                             ProcessLookupError,
