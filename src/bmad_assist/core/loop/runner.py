@@ -140,9 +140,9 @@ def _should_stop_after_successful_phase() -> bool:
     return os.environ.get("BMAD_ASSIST_STOP_AFTER_PHASE") == "1"
 
 
-def _should_hold_completed_story_boundary() -> bool:
+def _should_hold_completed_story_boundary(force: bool = False) -> bool:
     """Return true when a one-story run must not activate the next story."""
-    return os.environ.get("BMAD_ASSIST_HOLD_COMPLETED_STORY_BOUNDARY") == "1"
+    return force or os.environ.get("BMAD_ASSIST_HOLD_COMPLETED_STORY_BOUNDARY") == "1"
 
 
 def _log_stop_after_successful_phase(completed_phase: Phase | None) -> None:
@@ -568,6 +568,7 @@ def run_loop(
     lifecycle_epic_list: list[EpicId] | None = None,
     lifecycle_epic_stories_loader: Callable[[EpicId], list[str]] | None = None,
     honor_done_story_on_resume: bool = False,
+    hold_completed_story_boundary: bool = False,
 ) -> LoopExitReason:
     """Execute the main BMAD development loop.
 
@@ -606,6 +607,8 @@ def run_loop(
             when omitted.
         honor_done_story_on_resume: If True, preserve the current story during
             startup resume validation for explicit story-level phase reruns.
+        hold_completed_story_boundary: If True, complete the active story
+            without activating the next story. Used by story-targeted CLI runs.
 
     Returns:
         LoopExitReason indicating how the loop exited:
@@ -730,6 +733,7 @@ def run_loop(
                     lifecycle_epic_stories_loader=lifecycle_epic_stories_loader,
                     ipc_server=ipc_server,
                     honor_done_story_on_resume=honor_done_story_on_resume,
+                    hold_completed_story_boundary=hold_completed_story_boundary,
                 )
                 # Update run_log with final status
                 run_log.status, run_log.exit_reason = _map_exit_reason_to_run_status(exit_reason)
@@ -822,6 +826,7 @@ def _run_loop_body(
     lifecycle_epic_stories_loader: Callable[[EpicId], list[str]] | None = None,
     ipc_server: IPCServerThread | None = None,
     honor_done_story_on_resume: bool = False,
+    hold_completed_story_boundary: bool = False,
 ) -> LoopExitReason:
     """Execute the main loop body with signal handling active.
 
@@ -844,6 +849,8 @@ def _run_loop_body(
         ipc_server: Optional IPCServerThread for IPC event broadcasting.
         honor_done_story_on_resume: If True, preserve the current story during
             startup resume validation for explicit story-level phase reruns.
+        hold_completed_story_boundary: If True, persist completion without
+            moving to a later story in the same epic.
 
     Returns:
         LoopExitReason indicating how the loop exited.
@@ -1705,7 +1712,7 @@ def _run_loop_body(
                         story_title=story_title,
                     )
 
-                if _should_hold_completed_story_boundary():
+                if _should_hold_completed_story_boundary(hold_completed_story_boundary):
                     state = _hold_completed_story_boundary(state, state_path, project_path)
                     if _should_stop_after_successful_phase():
                         _log_stop_after_successful_phase(current_phase)

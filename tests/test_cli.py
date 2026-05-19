@@ -676,6 +676,7 @@ providers:
         assert result.exit_code == EXIT_SUCCESS
         assert mock_start_point.call_args.kwargs["honor_done_story"] is True
         assert mock_run_loop.call_args.kwargs["honor_done_story_on_resume"] is True
+        assert mock_run_loop.call_args.kwargs["hold_completed_story_boundary"] is True
 
     def test_explicit_epic_level_phase_rerun_honors_done_story(self, tmp_path: Path) -> None:
         """Explicit epic-level phase reruns keep the requested done story boundary."""

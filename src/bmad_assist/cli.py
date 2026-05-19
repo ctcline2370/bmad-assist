@@ -649,7 +649,8 @@ def run(
                 _error(f"--phase {phase_override} is a story-level phase and requires --story")
                 raise typer.Exit(code=EXIT_CONFIG_ERROR)
 
-        honor_done_story_for_explicit_phase = bool(phase_override and story)
+        story_targeted_phase_run = bool(phase_override and story)
+        honor_done_story_for_explicit_phase = story_targeted_phase_run
 
         if epic_scope_only:
             (
@@ -735,6 +736,7 @@ def run(
             ipc_enabled=not no_ipc,
             plain=plain,
             honor_done_story_on_resume=honor_done_story_for_explicit_phase,
+            hold_completed_story_boundary=story_targeted_phase_run,
         )
 
         # Story 6.6: Handle exit reasons from run_loop

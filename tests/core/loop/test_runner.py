@@ -513,6 +513,66 @@ class TestRunLoopStoryCompletion:
         assert mock_sync.call_args_list[-1].args[0].current_story == "1.1"
         assert mock_sync.call_args_list[-1].args[0].current_phase == Phase.TEST_REVIEW
 
+    def test_run_loop_can_hold_completed_story_boundary_from_parameter(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Story-targeted runs can finish without relying on ambient env vars."""
+        from bmad_assist.core.config import load_config
+        from bmad_assist.core.loop import LoopExitReason, PhaseResult, run_loop
+        from bmad_assist.core.state import Phase, State
+
+        config = load_config(
+            {
+                "providers": {"master": {"provider": "claude", "model": "opus_4"}},
+                "state_path": str(tmp_path / "state.yaml"),
+            }
+        )
+        state = State(
+            current_epic=1,
+            current_story="1.1",
+            current_phase=Phase.TEST_REVIEW,
+            epic_setup_complete=True,
+        )
+        saved_states: list[State] = []
+
+        def capture_save(next_state: State, _path: Path) -> None:
+            saved_states.append(next_state)
+
+        with (
+            patch("bmad_assist.core.loop.runner.load_state", return_value=state),
+            patch("bmad_assist.core.loop.runner.execute_phase", return_value=PhaseResult.ok()),
+            patch("bmad_assist.core.loop.runner.save_state", side_effect=capture_save),
+            patch("bmad_assist.core.loop.runner._invoke_sprint_sync") as mock_sync,
+            patch(
+                "bmad_assist.core.loop.runner._validate_resume_against_sprint",
+                return_value=(state, False),
+            ),
+            patch("bmad_assist.core.loop.runner.is_skip_story_prompts", return_value=True),
+            patch("bmad_assist.core.loop.runner.handle_story_completion") as mock_story,
+        ):
+            result = run_loop(
+                config,
+                tmp_path,
+                [1],
+                lambda _epic: ["1.1", "1.2"],
+                skip_signal_handlers=True,
+                ipc_enabled=False,
+                plain=True,
+                hold_completed_story_boundary=True,
+            )
+
+        assert result == LoopExitReason.COMPLETED
+        mock_story.assert_not_called()
+        completed_saves = [
+            saved
+            for saved in saved_states
+            if saved.current_story == "1.1" and "1.1" in saved.completed_stories
+        ]
+        assert completed_saves
+        assert completed_saves[-1].current_phase == Phase.TEST_REVIEW
+        assert mock_sync.call_args_list[-1].args[0].current_story == "1.1"
+
     def test_stop_after_phase_uses_lifecycle_story_order_for_forced_done_story(
         self,
         tmp_path: Path,
