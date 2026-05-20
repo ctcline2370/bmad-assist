@@ -693,9 +693,24 @@ def sync_bundled_cache(
                 f"\n  [yellow]{len(differing)} cached template(s) differ "
                 f"from bundled: {names}[/yellow]"
             )
-            response = console.input(
-                "  Overwrite with bundled? [a]ll / [s]kip (default): "
-            ).strip().lower()
+            if not sys.stdin.isatty():
+                console.print(
+                    f"  [dim]Non-interactive mode: skipped {len(differing)} "
+                    "differing cache file(s)[/dim]"
+                )
+                return installed
+
+            try:
+                response = console.input(
+                    "  Overwrite with bundled? [a]ll / [s]kip (default): "
+                ).strip().lower()
+            except EOFError:
+                console.print(
+                    f"  [dim]No input available: skipped {len(differing)} "
+                    "differing cache file(s)[/dim]"
+                )
+                return installed
+
             if response == "a":
                 for wf_name, tpl_content, meta_content in differing:
                     tpl_path = cache_dir / f"{wf_name}.tpl.xml"

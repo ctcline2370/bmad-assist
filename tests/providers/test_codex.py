@@ -236,6 +236,118 @@ class TestCodexProviderInvoke:
         env = mock_popen_success.call_args.kwargs["env"]
         assert env["CODEX_HOME"] == "/custom/codex-home"
 
+    def test_invoke_falls_back_to_user_codex_home_when_project_home_lacks_auth(
+        self,
+        provider: CodexProvider,
+        mock_popen_success: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Inherited repo-local CODEX_HOME without auth must not shadow user auth."""
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+        repo_codex_home = project_root / ".codex"
+        repo_codex_home.mkdir()
+        (repo_codex_home / "config.toml").write_text('model = "gpt-5.5"\n', encoding="utf-8")
+
+        user_home = tmp_path / "home"
+        user_codex_home = user_home / ".codex"
+        user_codex_home.mkdir(parents=True)
+        (user_codex_home / "auth.json").write_text("{}", encoding="utf-8")
+
+        with (
+            patch.dict(
+                "bmad_assist.providers.codex.os.environ",
+                {"CODEX_HOME": str(repo_codex_home)},
+                clear=True,
+            ),
+            patch("bmad_assist.providers.codex.Path.home", return_value=user_home),
+        ):
+            provider.invoke("Review code", cwd=project_root)
+
+        env = mock_popen_success.call_args.kwargs["env"]
+        command = mock_popen_success.call_args[0][0]
+        assert "bmad-assist-codex-home-" in env["CODEX_HOME"]
+        assert env["CODEX_HOME"] != str(user_codex_home)
+        assert "--ignore-user-config" in command
+        assert "--ephemeral" in command
+        assert command.count("--disable") == 3
+        assert "plugins" in command
+        assert "sqlite" in command
+        assert "shell_snapshot" in command
+
+    def test_invoke_keeps_project_codex_home_when_api_key_auth_present(
+        self,
+        provider: CodexProvider,
+        mock_popen_success: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """API-key auth makes repo-local CODEX_HOME usable without auth.json."""
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+        repo_codex_home = project_root / ".codex"
+        repo_codex_home.mkdir()
+        (repo_codex_home / "config.toml").write_text('model = "gpt-5.5"\n', encoding="utf-8")
+
+        user_home = tmp_path / "home"
+        user_codex_home = user_home / ".codex"
+        user_codex_home.mkdir(parents=True)
+        (user_codex_home / "auth.json").write_text("{}", encoding="utf-8")
+
+        with (
+            patch.dict(
+                "bmad_assist.providers.codex.os.environ",
+                {
+                    "CODEX_HOME": str(repo_codex_home),
+                    "OPENAI_API_KEY": "test-api-key",
+                },
+                clear=True,
+            ),
+            patch("bmad_assist.providers.codex.Path.home", return_value=user_home),
+        ):
+            provider.invoke("Review code", cwd=project_root)
+
+        env = mock_popen_success.call_args.kwargs["env"]
+        command = mock_popen_success.call_args[0][0]
+        assert env["CODEX_HOME"] == str(repo_codex_home)
+        assert env["OPENAI_API_KEY"] == "test-api-key"
+        assert "--ignore-user-config" not in command
+
+    def test_invoke_falls_back_when_cwd_is_implicit(
+        self,
+        provider: CodexProvider,
+        mock_popen_success: MagicMock,
+        tmp_path: Path,
+    ) -> None:
+        """Fallback also applies when BMAD Assist relies on process cwd."""
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+        repo_codex_home = project_root / ".codex"
+        repo_codex_home.mkdir()
+        (repo_codex_home / "config.toml").write_text('model = "gpt-5.5"\n', encoding="utf-8")
+
+        user_home = tmp_path / "home"
+        user_codex_home = user_home / ".codex"
+        user_codex_home.mkdir(parents=True)
+        (user_codex_home / "auth.json").write_text("{}", encoding="utf-8")
+
+        with (
+            patch.dict(
+                "bmad_assist.providers.codex.os.environ",
+                {"CODEX_HOME": str(repo_codex_home)},
+                clear=True,
+            ),
+            patch("bmad_assist.providers.codex.Path.cwd", return_value=project_root),
+            patch("bmad_assist.providers.codex.Path.home", return_value=user_home),
+        ):
+            provider.invoke("Review code")
+
+        env = mock_popen_success.call_args.kwargs["env"]
+        command = mock_popen_success.call_args[0][0]
+        assert "bmad-assist-codex-home-" in env["CODEX_HOME"]
+        assert env["CODEX_HOME"] != str(user_codex_home)
+        assert "--ignore-user-config" in command
+        assert "--ephemeral" in command
+
     def test_invoke_writes_prompt_to_stdin(
         self, provider: CodexProvider, mock_popen_success: MagicMock
     ) -> None:

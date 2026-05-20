@@ -30,7 +30,9 @@ import contextlib
 import json
 import logging
 import os
+import shutil
 import signal
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -259,6 +261,83 @@ _AUTH_FAILURE_MARKERS: tuple[str, ...] = (
     "bearer",
     "basic authentication",
 )
+
+
+_CODEX_API_KEY_ENV_VARS: tuple[str, ...] = ("OPENAI_API_KEY", "CODEX_API_KEY")
+_CODEX_ISOLATED_FALLBACK_DISABLED_FEATURES: tuple[str, ...] = (
+    "plugins",
+    "sqlite",
+    "shell_snapshot",
+)
+
+
+def _has_codex_auth_material(codex_home: Path) -> bool:
+    """Return true when a Codex home has local authentication material."""
+    return (codex_home / "auth.json").is_file()
+
+
+def _has_codex_api_key(child_env: dict[str, str]) -> bool:
+    """Return true when the child process already has API-key auth."""
+    return any(child_env.get(name, "").strip() for name in _CODEX_API_KEY_ENV_VARS)
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    """Compare paths after non-strict resolution."""
+    try:
+        return left.expanduser().resolve(strict=False) == right.expanduser().resolve(strict=False)
+    except OSError:
+        return left.expanduser().absolute() == right.expanduser().absolute()
+
+
+def _link_or_copy_codex_auth(auth_source: Path, auth_destination: Path) -> None:
+    """Materialize auth in an isolated Codex home without duplicating config."""
+    try:
+        auth_destination.symlink_to(auth_source)
+    except (NotImplementedError, OSError):
+        shutil.copy2(auth_source, auth_destination)
+
+
+def _apply_codex_home_auth_fallback(child_env: dict[str, str], cwd: Path | None) -> Path | None:
+    """Choose a Codex home that will not hide usable auth from Codex CLI.
+
+    Smartgistics and similar projects may set CODEX_HOME to a repo-local
+    .codex directory so Codex sees project configuration. If that inherited
+    project-local home has no auth material, it can shadow the authenticated
+    user Codex home and make non-interactive BMAD runs fail with 401 responses.
+    In that narrow case, use the authenticated user Codex home for the child
+    Codex process. Explicit non-project CODEX_HOME values and API-key auth are
+    left untouched.
+
+    Returns:
+        The authenticated user Codex home when fallback auth is required.
+
+    """
+    effective_cwd = Path(cwd) if cwd is not None else Path.cwd()
+    repo_codex_home = effective_cwd / ".codex"
+    inherited_codex_home = child_env.get("CODEX_HOME")
+    if inherited_codex_home:
+        inherited_path = Path(inherited_codex_home)
+        if (
+            _same_path(inherited_path, repo_codex_home)
+            and not _has_codex_auth_material(inherited_path)
+            and not _has_codex_api_key(child_env)
+        ):
+            user_codex_home = Path.home() / ".codex"
+            if _has_codex_auth_material(user_codex_home):
+                child_env["CODEX_HOME"] = str(user_codex_home)
+                logger.warning(
+                    "Inherited project-local CODEX_HOME lacks auth material; "
+                    "using authenticated user Codex home for Codex CLI subprocess. "
+                    "project_codex_home=%s user_codex_home=%s",
+                    inherited_path,
+                    user_codex_home,
+                )
+                return user_codex_home
+        return None
+
+    if _has_codex_auth_material(repo_codex_home):
+        child_env["CODEX_HOME"] = str(repo_codex_home)
+    return None
 
 
 def _find_codex_auth_failure_message(messages: list[str]) -> str | None:
@@ -552,6 +631,23 @@ class CodexProvider(BaseProvider):
         if reasoning_effort is not None:
             command.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
 
+        child_env = os.environ.copy()
+        fallback_codex_home = _apply_codex_home_auth_fallback(child_env, cwd)
+        codex_home_tempdir: tempfile.TemporaryDirectory | None = None
+        if fallback_codex_home is not None:
+            codex_home_tempdir = tempfile.TemporaryDirectory(
+                prefix="bmad-assist-codex-home-"
+            )
+            isolated_codex_home = Path(codex_home_tempdir.name)
+            _link_or_copy_codex_auth(
+                fallback_codex_home / "auth.json",
+                isolated_codex_home / "auth.json",
+            )
+            child_env["CODEX_HOME"] = str(isolated_codex_home)
+            command.extend(["--ignore-user-config", "--ephemeral"])
+            for feature in _CODEX_ISOLATED_FALLBACK_DISABLED_FEATURES:
+                command.extend(["--disable", feature])
+
         # Persist the actual executed argv. The prompt is written via stdin and
         # must never be reintroduced into ProviderResult metadata.
         original_command: tuple[str, ...] = tuple(command)
@@ -574,11 +670,6 @@ class CodexProvider(BaseProvider):
         start_time = time.perf_counter()
         wall_start_time = time.time()
         child_pgid: int | None = None
-        child_env = os.environ.copy()
-        if cwd is not None and "CODEX_HOME" not in child_env:
-            repo_codex_home = Path(cwd) / ".codex"
-            if (repo_codex_home / "auth.json").is_file():
-                child_env["CODEX_HOME"] = str(repo_codex_home)
 
         try:
             process = Popen(
@@ -911,6 +1002,8 @@ class CodexProvider(BaseProvider):
             if child_pgid is not None:
                 unregister_child_pgid(child_pgid)
             debug_json_logger.close()
+            if codex_home_tempdir is not None:
+                codex_home_tempdir.cleanup()
 
         duration_ms = int(
             max(
