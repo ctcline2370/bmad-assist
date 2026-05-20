@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING
 
 from bmad_assist.core.retrospective_artifacts import has_durable_retrospective_artifact
 from bmad_assist.core.state import Phase
+from bmad_assist.sprint.classifier import EntryType
 from bmad_assist.sprint.models import SprintStatus, SprintStatusEntry, ValidStatus
 from bmad_assist.sprint.scanner import ArtifactIndex
 
@@ -344,6 +345,29 @@ def _find_epic_key(
     return epic_key if epic_key in entries else None
 
 
+def _epic_has_open_story_entries(
+    epic_id: int | str,
+    entries: dict[str, SprintStatusEntry],
+) -> bool:
+    """Return True when sprint-status still contains open stories for an epic."""
+    prefix_pattern = re.compile(rf"^{re.escape(str(epic_id))}-(\d+)(?:-|$)")
+
+    for key, entry in entries.items():
+        if (
+            entry.entry_type in (EntryType.EPIC_STORY, EntryType.MODULE_STORY)
+            and prefix_pattern.match(key)
+            and entry.status not in ("done", "deferred")
+        ):
+            logger.debug(
+                "Epic %s remains open because story %s has status '%s'",
+                epic_id,
+                key,
+                entry.status,
+            )
+            return True
+    return False
+
+
 # =============================================================================
 # Core Sync Function (AC1-AC5, AC7)
 # =============================================================================
@@ -388,7 +412,7 @@ def sync_state_to_sprint(
     Updates:
     1. Current story status based on current_phase (via PHASE_TO_STATUS)
     2. All completed_stories marked as "done"
-    3. All completed_epics marked as "done"
+    3. Completed epics marked as "done" only when no open planned stories remain
     4. Completed epic retrospectives marked as "done" only when backed by a
        durable retrospective artifact.
 
@@ -513,6 +537,21 @@ def sync_state_to_sprint(
         epic_key = _find_epic_key(epic_id, new_entries)
         if epic_key is not None:
             entry = new_entries[epic_key]
+            if _epic_has_open_story_entries(epic_id, new_entries):
+                if entry.status != "in-progress":
+                    new_entries[epic_key] = SprintStatusEntry(
+                        key=entry.key,
+                        status="in-progress",
+                        entry_type=entry.entry_type,
+                        source=entry.source,
+                        comment=entry.comment,
+                    )
+                    logger.debug(
+                        "Downgraded stale completed epic %s to in-progress because open stories remain",
+                        epic_key,
+                    )
+                    synced_epics += 1
+                continue
             if entry.status != "done":
                 new_entries[epic_key] = SprintStatusEntry(
                     key=entry.key,

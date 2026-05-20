@@ -446,13 +446,14 @@ def infer_epic_status(
         Tuple of (inferred_status, confidence_level).
 
     Epic Inference Rules (in priority order):
-        1. Retrospective exists → 'done' (STRONG)
-        2. Empty story list → 'backlog' (NONE)
-        3. All stories 'done' → 'done' (MEDIUM)
-        4. Any story 'done' (partial completion) → 'in-progress' (MEDIUM)
-        5. Any story 'in-progress' or 'review' → 'in-progress' (MEDIUM)
-        6. Any story 'ready-for-dev' → 'backlog' (WEAK)
-        7. Default → 'backlog' (NONE)
+        1. Retrospective plus all known stories 'done' → 'done' (STRONG)
+        2. Retrospective with no story evidence → 'done' (STRONG, legacy evidence)
+        3. Empty story list → 'backlog' (NONE)
+        4. All stories 'done' → 'done' (MEDIUM)
+        5. Any story 'done' (partial completion) → 'in-progress' (MEDIUM)
+        6. Any story 'in-progress', 'review', or 'blocked' → 'in-progress' (MEDIUM)
+        7. Any story 'ready-for-dev' → 'backlog' (WEAK)
+        8. Default → 'backlog' (NONE)
 
     Examples:
         >>> status, confidence = infer_epic_status(12, index)
@@ -462,13 +463,7 @@ def infer_epic_status(
         InferenceConfidence.STRONG
 
     """
-    # Priority 1: Retrospective exists → epic is done
-    if index.has_retrospective(epic_id):
-        logger.debug(
-            "Epic %s: STRONG confidence 'done' - retrospective exists",
-            epic_id,
-        )
-        return "done", InferenceConfidence.STRONG
+    has_retrospective = index.has_retrospective(epic_id)
 
     # Get or compute story statuses
     if story_statuses is None:
@@ -483,8 +478,14 @@ def infer_epic_status(
             for key in story_keys
         }
 
-    # Priority 2: Empty story list → backlog
+    # Priority 2: Empty story list → backlog unless retrospective is the only evidence.
     if not story_statuses:
+        if has_retrospective:
+            logger.debug(
+                "Epic %s: STRONG confidence 'done' - retrospective exists with no story evidence",
+                epic_id,
+            )
+            return "done", InferenceConfidence.STRONG
         logger.debug(
             "Epic %s: NONE confidence 'backlog' - no stories found",
             epic_id,
@@ -495,8 +496,17 @@ def infer_epic_status(
     status_values = list(story_statuses.values())
     all_done = all(s == "done" for s in status_values)
     any_done = any(s == "done" for s in status_values)
-    any_active = any(s in ("in-progress", "review") for s in status_values)
+    any_active = any(s in ("in-progress", "review", "blocked") for s in status_values)
     any_ready = any(s == "ready-for-dev" for s in status_values)
+
+    # Priority 1: Retrospective closes the epic only when all known stories are done.
+    if has_retrospective and all_done:
+        logger.debug(
+            "Epic %s: STRONG confidence 'done' - retrospective exists and all %d stories done",
+            epic_id,
+            len(story_statuses),
+        )
+        return "done", InferenceConfidence.STRONG
 
     # Priority 3: All stories done → epic done
     if all_done:

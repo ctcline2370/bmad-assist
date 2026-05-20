@@ -375,16 +375,57 @@ class TestSyncStateToSprint:
         self,
         sample_sprint_status: SprintStatus,
     ):
-        """Completed epics are marked as done."""
+        """Completed epics are marked as done when no open planned stories remain."""
+        entries = dict(sample_sprint_status.entries)
+        for key in ("20-2-feature", "20-9-sync"):
+            entry = entries[key]
+            entries[key] = SprintStatusEntry(
+                key=entry.key,
+                status="done",
+                entry_type=entry.entry_type,
+                source=entry.source,
+                comment=entry.comment,
+            )
+        sprint_status = SprintStatus(
+            metadata=sample_sprint_status.metadata,
+            entries=entries,
+        )
         state = State(
             current_epic=21,
             current_story=None,
             current_phase=None,
             completed_epics=[20],
         )
-        updated, result = sync_state_to_sprint(state, sample_sprint_status)
+        updated, result = sync_state_to_sprint(state, sprint_status)
 
         assert updated.entries["epic-20"].status == "done"
+        assert result.synced_epics == 1
+
+    def test_sync_downgrades_stale_completed_epic_with_open_stories(
+        self,
+        sample_sprint_status: SprintStatus,
+    ):
+        """Stale completed_epics cannot keep an epic done while stories remain open."""
+        entries = dict(sample_sprint_status.entries)
+        entries["epic-20"] = SprintStatusEntry(
+            key="epic-20",
+            status="done",
+            entry_type=EntryType.EPIC_META,
+        )
+        sprint_status = SprintStatus(
+            metadata=sample_sprint_status.metadata,
+            entries=entries,
+        )
+        state = State(
+            current_epic=21,
+            current_story=None,
+            current_phase=None,
+            completed_epics=[20],
+        )
+
+        updated, result = sync_state_to_sprint(state, sprint_status)
+
+        assert updated.entries["epic-20"].status == "in-progress"
         assert result.synced_epics == 1
 
     def test_sync_does_not_complete_retrospective_from_completed_epics(

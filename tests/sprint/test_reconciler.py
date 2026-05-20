@@ -1089,6 +1089,51 @@ class TestRecalculateEpicMetaHelper:
         # Partial completion → in-progress
         assert entry.status == "in-progress"
 
+    def test_done_epic_with_retrospective_and_open_generated_stories_downgrades(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Test partial retrospectives do not preserve stale done epic status."""
+        retros_dir = tmp_path / "_bmad-output" / "implementation-artifacts" / "retrospectives"
+        retros_dir.mkdir(parents=True)
+        (retros_dir / "epic-11-retro-20260520.md").write_text("# Epic 11 Retrospective")
+        index = ArtifactIndex.scan(tmp_path)
+
+        result_entries = {
+            "11-5-concurrency-aware-foundation-operations": SprintStatusEntry(
+                key="11-5-concurrency-aware-foundation-operations",
+                status="done",
+                entry_type=EntryType.EPIC_STORY,
+            ),
+            "11-6-backend-validation-and-handoff-examples": SprintStatusEntry(
+                key="11-6-backend-validation-and-handoff-examples",
+                status="backlog",
+                entry_type=EntryType.EPIC_STORY,
+            ),
+            "11-7-health-readiness-and-protected-diagnostic-status": SprintStatusEntry(
+                key="11-7-health-readiness-and-protected-diagnostic-status",
+                status="backlog",
+                entry_type=EntryType.EPIC_STORY,
+            ),
+        }
+        existing_entry = SprintStatusEntry(
+            key="epic-11",
+            status="done",
+            entry_type=EntryType.EPIC_META,
+        )
+
+        entry, change = _recalculate_epic_meta(
+            11,
+            result_entries,
+            index,
+            existing_entry,
+        )
+
+        assert entry.status == "in-progress"
+        assert change is not None
+        assert change.old_status == "done"
+        assert change.new_status == "in-progress"
+
 
 # ============================================================================
 # Tests: Integration

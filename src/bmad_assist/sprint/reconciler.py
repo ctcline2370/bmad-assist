@@ -586,6 +586,41 @@ def _has_explicit_non_done_stories(
     return False
 
 
+def _has_known_open_stories(
+    epic_id: str | int,
+    result_entries: dict[str, SprintStatusEntry],
+) -> bool:
+    """Check whether the current sprint inventory contains open stories.
+
+    Generated sprint entries are enough to prevent a retrospective artifact from
+    closing an epic when future or unstarted stories remain visible in the epic
+    plan. Deferred stories are treated as intentionally out of scope.
+
+    Args:
+        epic_id: Epic identifier (int or str).
+        result_entries: Current result entries dict for story status lookup.
+
+    Returns:
+        True if any non-deferred story for the epic is not done.
+
+    """
+    prefix_pattern = re.compile(rf"^{re.escape(str(epic_id))}-(\d+)(?:-|$)")
+
+    for key, entry in result_entries.items():
+        if (
+            entry.entry_type in (EntryType.EPIC_STORY, EntryType.MODULE_STORY)
+            and prefix_pattern.match(key)
+            and entry.status not in ("done", "deferred")
+        ):
+            logger.debug(
+                "Story %s has known open status '%s' - epic should remain open",
+                key,
+                entry.status,
+            )
+            return True
+    return False
+
+
 def _recalculate_epic_meta(
     epic_id: str | int,
     result_entries: dict[str, SprintStatusEntry],
@@ -595,7 +630,7 @@ def _recalculate_epic_meta(
     """Recalculate epic meta entry status from story statuses.
 
     Uses infer_epic_status() to determine the overall epic status based on:
-    1. Retrospective exists → done (STRONG)
+    1. Retrospective exists and all known stories are done → done (STRONG)
     2. All stories done → done (MEDIUM)
     3. Any story done → in-progress (MEDIUM)
     4. Any active stories → in-progress (MEDIUM)
@@ -635,14 +670,21 @@ def _recalculate_epic_meta(
     # - Missing artifact evidence during merge-only operations
     # - Story status discrepancies that don't indicate actual regression
     #
-    # EXCEPTION: If any story has EXPLICIT non-done status (from Status: field),
-    # allow the downgrade. This handles cases where sprint-planning or correct-course
-    # has identified stories that are legitimately not done.
+    # EXCEPTIONS:
+    # - If any story has EXPLICIT non-done status (from Status: field), allow the downgrade.
+    # - If a retrospective exists but generated sprint inventory still has open stories,
+    #   treat the retrospective as partial evidence and keep the epic open.
     if old_status == "done" and new_status != "done" and confidence < InferenceConfidence.STRONG:
-        # Check for explicit non-done story statuses
         if _has_explicit_non_done_stories(epic_id, result_entries, index):
             logger.debug(
                 "Allowing epic %s downgrade to '%s' - explicit non-done stories found",
+                epic_id,
+                new_status,
+            )
+            # Keep the inferred status (don't preserve as done)
+        elif index.has_retrospective(epic_id) and _has_known_open_stories(epic_id, result_entries):
+            logger.debug(
+                "Allowing epic %s downgrade to '%s' - retrospective has open planned stories",
                 epic_id,
                 new_status,
             )
@@ -670,7 +712,11 @@ def _recalculate_epic_meta(
     if old_status != new_status or existing_entry is None:
         reason = "recalculated_from_stories"
         if index.has_retrospective(epic_id):
-            reason = "retrospective_exists"
+            reason = (
+                "retrospective_exists"
+                if new_status == "done"
+                else "retrospective_with_open_stories"
+            )
         change = StatusChange(
             key=epic_key,
             old_status=old_status,

@@ -709,9 +709,8 @@ def run(
         if debug_vars:
             state_path = get_state_path(loaded_config, project_root=project_path)
             state = load_state(state_path)
-            require_test_review_for_done = (
-                Phase.TEST_REVIEW.value in load_loop_config(project_path).story
-            )
+            debug_loop_config = load_loop_config(project_path)
+            require_test_review_for_done = Phase.TEST_REVIEW.value in debug_loop_config.story
             validation = validate_resume_state(
                 state,
                 project_path,
@@ -719,6 +718,7 @@ def run(
                 lifecycle_epic_stories_loader,
                 require_completion_artifacts_for_done=True,
                 require_test_review_for_done=require_test_review_for_done,
+                epic_teardown_phases=debug_loop_config.epic_teardown,
             )
             if validation.advanced:
                 save_state(validation.state, state_path)

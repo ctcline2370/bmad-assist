@@ -499,11 +499,14 @@ class TestInferEpicStatus:
         assert status == "done"
         assert confidence == InferenceConfidence.STRONG
 
-    def test_retrospective_string_epic(self, index: ArtifactIndex) -> None:
-        """Test string epic with retrospective → done."""
+    def test_retrospective_string_epic_with_open_story_is_in_progress(
+        self,
+        index: ArtifactIndex,
+    ) -> None:
+        """Test string epic retrospective does not override an open story."""
         status, confidence = infer_epic_status("testarch", index)
-        assert status == "done"
-        assert confidence == InferenceConfidence.STRONG
+        assert status == "in-progress"
+        assert confidence == InferenceConfidence.MEDIUM
 
     def test_empty_story_list(self, index: ArtifactIndex) -> None:
         """Test epic with no stories → backlog (NONE)."""
@@ -533,6 +536,15 @@ class TestInferEpicStatus:
     def test_active_stories(self, index: ArtifactIndex) -> None:
         """Test active stories (in-progress/review) → in-progress."""
         status, confidence = infer_epic_status(31, index)
+        assert status == "in-progress"
+        assert confidence == InferenceConfidence.MEDIUM
+
+    def test_blocked_stories_are_active(self, index: ArtifactIndex) -> None:
+        """Test blocked stories keep the epic in-progress."""
+        story_statuses = {
+            "33-1-blocked": "blocked",
+        }
+        status, confidence = infer_epic_status(33, index, story_statuses)
         assert status == "in-progress"
         assert confidence == InferenceConfidence.MEDIUM
 
@@ -623,12 +635,18 @@ class TestEdgeCases:
         # Both should find the same story
         assert status1 == status2
 
-    def test_epic_status_respects_retrospective_over_stories(self, index: ArtifactIndex) -> None:
-        """Test that retrospective takes precedence over story statuses."""
-        # Epic 12 has retrospective → should be done regardless of story statuses
-        status, confidence = infer_epic_status(12, index)
-        assert status == "done"
-        assert confidence == InferenceConfidence.STRONG
+    def test_epic_status_does_not_let_retrospective_overrule_open_stories(
+        self,
+        index: ArtifactIndex,
+    ) -> None:
+        """Test that retrospective evidence cannot close known open stories."""
+        story_statuses = {
+            "12-1-completed": "done",
+            "12-2-completed": "backlog",
+        }
+        status, confidence = infer_epic_status(12, index, story_statuses)
+        assert status == "in-progress"
+        assert confidence == InferenceConfidence.MEDIUM
 
 
 # ============================================================================

@@ -762,6 +762,16 @@ def sprint_validate(
         "-p",
         help="Path to project directory",
     ),
+    epic: str | None = typer.Option(
+        None,
+        "--epic",
+        help="Limit lifecycle-state validation to one epic",
+    ),
+    epic_scope_only: bool = typer.Option(
+        False,
+        "--epic-scope-only",
+        help="Require --epic and ignore unrelated prior epics during lifecycle-state validation",
+    ),
     verbose: bool = typer.Option(
         False,
         "--verbose",
@@ -804,6 +814,10 @@ def sprint_validate(
         _error(f"Invalid --format: {format_}. Use 'plain' or 'json'.")
         raise typer.Exit(code=EXIT_ERROR)
 
+    if epic_scope_only and not epic:
+        _error("--epic-scope-only requires --epic")
+        raise typer.Exit(code=EXIT_ERROR)
+
     # Load sprint-status
     if not sprint_path.exists():
         _error(f"Sprint-status not found: {sprint_path}")
@@ -839,13 +853,32 @@ def sprint_validate(
             def lifecycle_epic_stories_loader(epic_id: EpicId) -> list[str]:
                 return list(lifecycle_stories_by_epic.get(epic_id, []))
 
+            scoped_epic: EpicId | None = None
+            if epic:
+                scoped_epic = parse_epic_id(epic.strip())
+                scoped_stories = lifecycle_stories_by_epic.get(scoped_epic)
+                if not scoped_stories:
+                    raise StateError(
+                        f"Epic {scoped_epic} was not found in BMAD lifecycle scope."
+                    )
+                lifecycle_epic_list = [scoped_epic]
+                lifecycle_stories_by_epic = {scoped_epic: list(scoped_stories)}
+
+            state = load_state(state_path)
+            if scoped_epic is not None and state.current_epic != scoped_epic:
+                raise StateError(
+                    f"State current epic {state.current_epic} does not match scoped epic "
+                    f"{scoped_epic}."
+                )
+
             validate_resume_state(
-                load_state(state_path),
+                state,
                 project_root,
                 lifecycle_epic_list,
                 lifecycle_epic_stories_loader,
                 require_completion_artifacts_for_done=True,
                 require_test_review_for_done=require_test_review_for_done,
+                epic_teardown_phases=loop_config.epic_teardown,
             )
         except StateError as exc:
             discrepancies.append(
